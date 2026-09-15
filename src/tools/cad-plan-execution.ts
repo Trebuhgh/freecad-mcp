@@ -417,6 +417,11 @@ try:
         add_issue(features[-1]["id"], features[-1]["type"], "body_tip", actual_snapshot["expected_body_tip"], actual_snapshot["body_tip"], "Body.Tip is not the final resolved feature.")
     if actual_snapshot["recompute_errors"]:
         add_issue(None, None, "recompute_errors", [], actual_snapshot["recompute_errors"], "One or more Body objects report recompute or feature errors.")
+    expected_total_holes = sum(len(item["centers"]) for item in expected_holes)
+    if len(actual_snapshot["holes"]) != expected_total_holes:
+        add_issue(None, "hole_pattern", "hole_count", expected_total_holes, len(actual_snapshot["holes"]), "The total number of through-hole cylindrical surfaces does not match all resolved hole patterns.")
+    all_expected_hole_centers = [center for item in expected_holes for center in item["centers"]]
+    unassigned_actual_holes = [item for item in actual_snapshot["holes"] if not any(abs(item["x"] - center["x"]) <= LINEAR_TOLERANCE_MM and abs(item["y"] - center["y"]) <= LINEAR_TOLERANCE_MM for center in all_expected_hole_centers)]
 
     verification_features = []
     for feature_plan, feature_result in zip(features, feature_results):
@@ -463,7 +468,11 @@ try:
         elif feature_type == "hole_pattern":
             expected_centers = [{"x": float(center["x"]), "y": float(center["y"])} for center in feature_plan["centers"]]
             expected_radius = float(feature_plan["diameter"]) / 2.0
-            observed = actual_snapshot["holes"]
+            observed = []
+            for expected_center in expected_centers:
+                candidates = [item for item in actual_snapshot["holes"] if abs(item["x"] - expected_center["x"]) <= LINEAR_TOLERANCE_MM and abs(item["y"] - expected_center["y"]) <= LINEAR_TOLERANCE_MM]
+                if len(candidates) == 1 and not any(existing is candidates[0] for existing in observed):
+                    observed.append(candidates[0])
             entry["expected_count"] = len(expected_centers)
             entry["actual_count"] = len(observed)
             entry["expected_radius"] = expected_radius
@@ -476,6 +485,10 @@ try:
                 add_issue(feature_id, feature_type, "hole_count", len(expected_centers), len(observed), "The number of through-hole cylindrical surfaces does not match the resolved plan.")
             for expected_center in expected_centers:
                 nearest = min(observed, key=lambda item: (item["x"] - expected_center["x"]) ** 2 + (item["y"] - expected_center["y"]) ** 2) if observed else None
+                if nearest is None or abs(nearest["x"] - expected_center["x"]) > LINEAR_TOLERANCE_MM or abs(nearest["y"] - expected_center["y"]) > LINEAR_TOLERANCE_MM:
+                    nearest = min(unassigned_actual_holes, key=lambda item: (item["x"] - expected_center["x"]) ** 2 + (item["y"] - expected_center["y"]) ** 2) if unassigned_actual_holes else nearest
+                    if nearest in unassigned_actual_holes:
+                        unassigned_actual_holes.remove(nearest)
                 actual_center = None if nearest is None else {"x": nearest["x"], "y": nearest["y"]}
                 center_passed = nearest is not None and abs(nearest["x"] - expected_center["x"]) <= LINEAR_TOLERANCE_MM and abs(nearest["y"] - expected_center["y"]) <= LINEAR_TOLERANCE_MM
                 radius_passed = nearest is not None and abs(nearest["radius"] - expected_radius) <= LINEAR_TOLERANCE_MM

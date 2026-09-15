@@ -231,7 +231,7 @@ else:
                         body = feature.getParentGeoFeatureGroup()
                         profile_value = feature.Profile
                         profile_object = profile_value[0] if isinstance(profile_value, tuple) else profile_value
-                        if body is None or sketch not in body.Group or feature not in body.Group or profile_object != sketch or (feature_type == "hole_pattern" and body.Tip != feature):
+                        if body is None or sketch not in body.Group or feature not in body.Group or profile_object != sketch:
                             fail("invalid", "FEATURE_BINDING_INVALID", "target_feature_id", "The bound Sketch is not the profile of the bound Pad in the same Body.")
                         else:
                             binding_valid = False
@@ -314,6 +314,7 @@ parameter_indices = {}
 diameter_constraint_names = []
 source_geometry_signature = None
 source_holes = []
+source_target_holes = []
 base_sketch = None
 base_feature = None
 base_parameter_indices = {}
@@ -368,7 +369,7 @@ try:
     require(body is not None and body.TypeId == "PartDesign::Body", "BOUND_BODY_NOT_FOUND")
     profile_value = feature.Profile
     profile_object = profile_value[0] if isinstance(profile_value, tuple) else profile_value
-    require(feature in body.Group and sketch in body.Group and profile_object == sketch and body.Tip == feature, "FEATURE_CHAIN_MISMATCH")
+    require(feature in body.Group and sketch in body.Group and profile_object == sketch and (feature_type == "hole_pattern" or body.Tip == feature), "FEATURE_CHAIN_MISMATCH")
     parameter_bindings = binding["parameters"]
     if feature_type == "rectangular_pad":
         require(all(name in parameter_bindings for name in ("width", "height", "length")), "FEATURE_BINDING_MISSING")
@@ -427,10 +428,12 @@ try:
     source_holes = inspect_holes(source_geometry_signature)
     if feature_type == "hole_pattern":
         expected_centers = source_feature["centers"]
-        require(len(source_holes) == len(expected_centers), "MODEL_STATE_CHANGED_AFTER_VALIDATION")
+        all_source_hole_count = sum(len(item["centers"]) for item in source_plan["features"] if item["type"] == "hole_pattern")
+        require(len(source_holes) == all_source_hole_count, "MODEL_STATE_CHANGED_AFTER_VALIDATION")
         for center in expected_centers:
             matches_for_center = [hole for hole in source_holes if abs(hole["x"] - float(center["x"])) <= LINEAR_TOLERANCE_MM and abs(hole["y"] - float(center["y"])) <= LINEAR_TOLERANCE_MM and abs(hole["radius"] * 2.0 - float(source_feature["diameter"])) <= LINEAR_TOLERANCE_MM]
             require(len(matches_for_center) == 1, "MODEL_STATE_CHANGED_AFTER_VALIDATION")
+            source_target_holes.append(matches_for_center[0])
 
     doc.openTransaction("cad_execute_edit_plan_r" + str(edit["model_revision"]))
     transaction_open = True
@@ -456,7 +459,7 @@ try:
         "solid_count": geometry_signature["solid_count"], "shape_valid": geometry_signature["shape_valid"],
         "bounding_box": geometry_signature["bounding_box"], "volume": geometry_signature["volume"],
         "body_tip": body.Tip.Name if body.Tip is not None else None,
-        "feature_chain_complete": feature in body.Group and sketch in body.Group and profile_object == sketch and body.Tip == feature,
+        "feature_chain_complete": feature in body.Group and sketch in body.Group and profile_object == sketch and all(doc.getObject(bindings[item["id"]].get("feature_object", "")) in body.Group for item in source_plan["features"] if item["id"] in bindings),
         "binding_valid": doc.getObject(binding["feature_object"]) == feature and doc.getObject(binding["sketch_object"]) == sketch,
         "recompute_errors": recompute_errors,
     }
@@ -478,27 +481,49 @@ try:
             checks["parameter_" + name] = {"expected": float(expected_feature[name]), "actual": actual_snapshot[name], "passed": abs(actual_snapshot[name] - float(expected_feature[name])) <= LINEAR_TOLERANCE_MM}
     else:
         actual_holes = actual_snapshot["holes"]
-        expected_centers = sorted([{"x": float(center["x"]), "y": float(center["y"])} for center in expected_feature["centers"]], key=lambda item: (item["x"], item["y"]))
-        actual_centers = [{"x": hole["x"], "y": hole["y"]} for hole in actual_holes]
+        expected_hole_features = [item for item in expected_plan["features"] if item["type"] == "hole_pattern"]
+        expected_specs = [{"feature_id": item["id"], "x": float(center["x"]), "y": float(center["y"]), "diameter": float(item["diameter"])} for item in expected_hole_features for center in item["centers"]]
+        matched_holes = []
+        group_results = {}
+        used_actual = set()
+        for item in expected_hole_features:
+            group_actual = []
+            for center in item["centers"]:
+                candidates = [(index, hole) for index, hole in enumerate(actual_holes) if index not in used_actual and abs(hole["x"] - float(center["x"])) <= LINEAR_TOLERANCE_MM and abs(hole["y"] - float(center["y"])) <= LINEAR_TOLERANCE_MM]
+                if len(candidates) == 1:
+                    used_actual.add(candidates[0][0])
+                    matched_holes.append(candidates[0][1])
+                    group_actual.append(candidates[0][1])
+            group_results[item["id"]] = {"expected_diameter": float(item["diameter"]), "actual_diameters": [hole["radius"] * 2.0 for hole in group_actual], "expected_count": len(item["centers"]), "actual_count": len(group_actual)}
+        expected_centers = sorted([{"x": item["x"], "y": item["y"]} for item in expected_specs], key=lambda item: (item["x"], item["y"]))
+        actual_centers = sorted([{"x": hole["x"], "y": hole["y"]} for hole in actual_holes], key=lambda item: (item["x"], item["y"]))
         centers_passed = len(actual_centers) == len(expected_centers) and all(abs(actual_centers[index]["x"] - expected_centers[index]["x"]) <= LINEAR_TOLERANCE_MM and abs(actual_centers[index]["y"] - expected_centers[index]["y"]) <= LINEAR_TOLERANCE_MM for index in range(len(expected_centers)))
-        diameters = [hole["radius"] * 2.0 for hole in actual_holes]
-        diameters_passed = len(diameters) == len(expected_centers) and all(abs(value - float(expected_feature["diameter"])) <= LINEAR_TOLERANCE_MM for value in diameters)
-        axes_passed = len(actual_holes) == len(source_holes) and all(all(abs(actual_holes[index]["axis"][axis] - source_holes[index]["axis"][axis]) <= LINEAR_TOLERANCE_MM for axis in range(3)) and abs(actual_holes[index]["axis_material_length"] - source_holes[index]["axis_material_length"]) <= LINEAR_TOLERANCE_MM for index in range(len(source_holes)))
-        expected_volume = base_values_before["width"] * base_values_before["height"] * base_values_before["length"] - len(expected_centers) * math.pi * (float(expected_feature["diameter"]) / 2.0) ** 2 * base_values_before["length"]
+        groups_passed = len(matched_holes) == len(expected_specs) and all(result["actual_count"] == result["expected_count"] and all(abs(value - result["expected_diameter"]) <= LINEAR_TOLERANCE_MM for value in result["actual_diameters"]) for result in group_results.values())
+        axes_passed = len(actual_holes) == len(source_holes)
+        if axes_passed:
+            for actual in actual_holes:
+                previous = [hole for hole in source_holes if abs(hole["x"] - actual["x"]) <= LINEAR_TOLERANCE_MM and abs(hole["y"] - actual["y"]) <= LINEAR_TOLERANCE_MM]
+                if len(previous) != 1 or any(abs(actual["axis"][axis] - previous[0]["axis"][axis]) > LINEAR_TOLERANCE_MM for axis in range(3)) or abs(actual["axis_material_length"] - previous[0]["axis_material_length"]) > LINEAR_TOLERANCE_MM:
+                    axes_passed = False
+                    break
+        expected_volume = base_values_before["width"] * base_values_before["height"] * base_values_before["length"] - sum(math.pi * (item["diameter"] / 2.0) ** 2 * base_values_before["length"] for item in expected_specs)
+        target_actual_diameters = group_results[expected_feature["id"]]["actual_diameters"]
+        target_diameter_passed = len(target_actual_diameters) == len(expected_feature["centers"]) and all(abs(value - float(expected_feature["diameter"])) <= LINEAR_TOLERANCE_MM for value in target_actual_diameters)
         checks = {
             "solid_count": {"expected": 1, "actual": actual_snapshot["solid_count"], "passed": actual_snapshot["solid_count"] == 1},
             "shape_valid": {"expected": True, "actual": actual_snapshot["shape_valid"], "passed": actual_snapshot["shape_valid"] is True},
             "bounding_box": {"expected": source_geometry_signature["bounding_box"], "actual": actual_snapshot["bounding_box"], "passed": all(abs(float(actual_snapshot["bounding_box"][axis]) - float(source_geometry_signature["bounding_box"][axis])) <= LINEAR_TOLERANCE_MM for axis in ("x", "y", "z"))},
             "volume": {"expected": expected_volume, "actual": actual_snapshot["volume"], "passed": abs(float(actual_snapshot["volume"]) - expected_volume) <= VOLUME_TOLERANCE_MM3},
-            "hole_count": {"expected": len(expected_centers), "actual": len(actual_holes), "passed": len(actual_holes) == len(expected_centers)},
+            "hole_count": {"expected": len(expected_specs), "actual": len(actual_holes), "passed": len(actual_holes) == len(expected_specs)},
             "hole_centers": {"expected": expected_centers, "actual": actual_centers, "passed": centers_passed},
-            "hole_diameter": {"expected": float(expected_feature["diameter"]), "actual": diameters, "passed": diameters_passed},
+            "hole_diameter": {"expected": float(expected_feature["diameter"]), "actual": target_actual_diameters, "passed": target_diameter_passed},
+            "hole_groups": {"expected": {item["id"]: {"diameter": float(item["diameter"]), "count": len(item["centers"])} for item in expected_hole_features}, "actual": group_results, "passed": groups_passed},
             "hole_axes": {"expected": [{"axis": hole["axis"], "axis_material_length": hole["axis_material_length"]} for hole in source_holes], "actual": [{"axis": hole["axis"], "axis_material_length": hole["axis_material_length"]} for hole in actual_holes], "passed": axes_passed},
             "parameter_diameter": {"expected": float(expected_feature["diameter"]), "actual": actual_snapshot["diameter"], "passed": actual_snapshot["diameter"] is not None and abs(actual_snapshot["diameter"] - float(expected_feature["diameter"])) <= LINEAR_TOLERANCE_MM},
             "base_dimensions": {"expected": base_values_before, "actual": actual_snapshot["base_dimensions"], "passed": all(abs(actual_snapshot["base_dimensions"][name] - base_values_before[name]) <= LINEAR_TOLERANCE_MM for name in base_values_before)},
         }
     checks.update({
-        "body_tip": {"expected": feature.Name, "actual": actual_snapshot["body_tip"], "passed": actual_snapshot["body_tip"] == feature.Name},
+        "body_tip": {"expected": bindings[source_plan["features"][-1]["id"]]["feature_object"], "actual": actual_snapshot["body_tip"], "passed": actual_snapshot["body_tip"] == bindings[source_plan["features"][-1]["id"]]["feature_object"]},
         "feature_chain_complete": {"expected": True, "actual": actual_snapshot["feature_chain_complete"], "passed": actual_snapshot["feature_chain_complete"] is True},
         "binding_valid": {"expected": True, "actual": actual_snapshot["binding_valid"], "passed": actual_snapshot["binding_valid"] is True},
         "recompute_errors": {"expected": [], "actual": actual_snapshot["recompute_errors"], "passed": len(actual_snapshot["recompute_errors"]) == 0},

@@ -135,6 +135,17 @@ const simpleHolesSchema = {
   additionalProperties: false,
 };
 
+const simpleHoleGroupSchema = {
+  type: 'object',
+  description: 'One semantically named hole group. Uses the same placement forms as holes.',
+  properties: {
+    id: { type: ['string', 'null'], description: 'Required stable semantic feature ID.' },
+    ...simpleHolesSchema.properties,
+  },
+  required: ['id'],
+  additionalProperties: false,
+};
+
 const simplePlanSchema = {
   title: 'Preferred Simple Intent Plan',
   type: 'object',
@@ -147,6 +158,7 @@ const simplePlanSchema = {
     thickness: { type: ['number', 'null'], exclusiveMinimum: 0, description: 'For shape:"profile": extrusion length in +Z.' },
     unit: { type: ['string', 'null'], enum: ['mm', null], description: 'Currently mm.' },
     holes: simpleHolesSchema,
+    hole_groups: { type: ['array', 'null'], minItems: 1, items: simpleHoleGroupSchema, description: 'Named independent hole_pattern features. Do not combine with holes.' },
     fillet: { type: ['object', 'null'], properties: { radius: { type: ['number', 'null'], exclusiveMinimum: 0 }, edges: { type: ['string', 'object', 'null'] } }, additionalProperties: false, description: 'Include only when the user explicitly requests a fillet.' },
     chamfer: { type: ['object', 'null'], properties: { size: { type: ['number', 'null'], exclusiveMinimum: 0 }, edges: { type: ['string', 'object', 'null'] } }, additionalProperties: false, description: 'Include only when the user explicitly requests a chamfer.' },
   },
@@ -598,10 +610,43 @@ function simpleTuple(value: unknown, path: string, positive: boolean, integer: b
   return value as number[];
 }
 
+function appendSimpleHoleFeature(
+  holes: Record<string, unknown>, path: string, requireId: boolean,
+  features: Record<string, unknown>[], paths: string[], issues: InternalIssue[],
+): void {
+  const allowed = ['diameter', 'grid', 'start', 'spacing', 'centers', 'edge_offset', 'reference', ...(requireId ? ['id'] : [])];
+  for (const key of Object.keys(holes)) {
+    if (!allowed.includes(key)) issues.push({ kind: 'invalid', code: 'UNKNOWN_SIMPLE_FIELD', path: `${path}.${key}`, message: `Unknown Simple Intent hole field "${key}".` });
+  }
+  if (requireId && (holes.id === undefined || holes.id === null || holes.id === '')) addMissing(issues, `${path}.id`, 'Hole group ID');
+  const placementKeys = ['grid', 'centers', 'edge_offset'].filter((key) => Object.hasOwn(holes, key) && holes[key] !== undefined);
+  if (placementKeys.length > 1) issues.push({ kind: 'invalid', code: 'CONFLICTING_HOLE_PLACEMENT', path, message: `Specify exactly one hole placement form, not ${placementKeys.join(' + ')}.` });
+  let placement: Record<string, unknown> | undefined;
+  if (placementKeys.length === 0) addMissing(issues, path, `One of ${path}.grid, ${path}.centers, or ${path}.edge_offset`);
+  else if (placementKeys.length === 1 && placementKeys[0] === 'grid') {
+    const grid = simpleTuple(holes.grid, `${path}.grid`, true, true, issues);
+    const start = simpleTuple(holes.start, `${path}.start`, false, false, issues);
+    const spacing = simpleTuple(holes.spacing, `${path}.spacing`, true, false, issues);
+    if (grid !== undefined && start !== undefined && spacing !== undefined) placement = { type: 'rectangular_grid', columns: grid[0], rows: grid[1], origin: { x: start[0], y: start[1] }, spacing_x: spacing[0], spacing_y: spacing[1] };
+  } else if (placementKeys.length === 1 && placementKeys[0] === 'centers') {
+    if (!Array.isArray(holes.centers) || holes.centers.length === 0) issues.push({ kind: 'invalid', code: 'EMPTY_HOLE_CENTERS', path: `${path}.centers`, message: 'centers must be a non-empty array.' });
+    else {
+      const centers: Point2D[] = [];
+      holes.centers.forEach((center, index) => {
+        if (!Array.isArray(center) || center.length !== 2 || center.some((item) => typeof item !== 'number' || !Number.isFinite(item))) issues.push({ kind: 'invalid', code: 'INVALID_HOLE_CENTER', path: `${path}.centers.${index}`, message: 'Each center must be exactly [x,y] with finite coordinates.' });
+        else centers.push({ x: center[0] as number, y: center[1] as number });
+      });
+      if (centers.length === holes.centers.length) placement = { type: 'explicit', centers };
+    }
+  } else if (placementKeys.length === 1) placement = { type: 'edge_offset', distance: holes.edge_offset, reference: holes.reference };
+  features.push({ ...(requireId ? { id: holes.id } : {}), type: 'hole_pattern', diameter: holes.diameter, placement });
+  paths.push(path);
+}
+
 function normalizeSimplePlan(value: Record<string, unknown>): NormalizedFeaturePlan {
   const issues: InternalIssue[] = [];
   for (const key of Object.keys(value)) {
-    if (!['shape', 'size', 'profile', 'segments', 'thickness', 'unit', 'holes', 'fillet', 'chamfer'].includes(key)) issues.push({ kind: 'invalid', code: 'UNKNOWN_SIMPLE_FIELD', path: key, message: `Unknown Simple Intent field "${key}".` });
+    if (!['shape', 'size', 'profile', 'segments', 'thickness', 'unit', 'holes', 'hole_groups', 'fillet', 'chamfer'].includes(key)) issues.push({ kind: 'invalid', code: 'UNKNOWN_SIMPLE_FIELD', path: key, message: `Unknown Simple Intent field "${key}".` });
   }
   if (value.shape === undefined || value.shape === null) addMissing(issues, 'shape', 'shape');
   else if (value.shape !== 'plate' && value.shape !== 'profile') issues.push({ kind: 'unsupported', code: 'UNSUPPORTED_SHAPE', path: 'shape', message: `Shape "${String(value.shape)}" is not supported.` });
@@ -621,38 +666,18 @@ function normalizeSimplePlan(value: Record<string, unknown>): NormalizedFeatureP
     features.push({ type: 'rectangular_pad', width: size?.[0], height: size?.[1], length: size?.[2] });
     paths.push('shape');
   }
+  if (Object.hasOwn(value, 'holes') && Object.hasOwn(value, 'hole_groups')) issues.push({ kind: 'invalid', code: 'CONFLICTING_HOLE_GROUP_FORMAT', path: 'hole_groups', message: 'Use either holes or hole_groups, never both.' });
   if (value.holes !== undefined && value.holes !== null) {
     if (!isRecord(value.holes)) issues.push({ kind: 'invalid', code: 'INVALID_HOLES', path: 'holes', message: 'holes must be an object.' });
-    else {
-      const holes = value.holes;
-      for (const key of Object.keys(holes)) {
-        if (!['diameter', 'grid', 'start', 'spacing', 'centers', 'edge_offset', 'reference'].includes(key)) issues.push({ kind: 'invalid', code: 'UNKNOWN_SIMPLE_FIELD', path: `holes.${key}`, message: `Unknown Simple Intent hole field "${key}".` });
-      }
-      const placementKeys = ['grid', 'centers', 'edge_offset'].filter((key) => Object.hasOwn(holes, key) && holes[key] !== undefined);
-      if (placementKeys.length > 1) issues.push({ kind: 'invalid', code: 'CONFLICTING_HOLE_PLACEMENT', path: 'holes', message: `Specify exactly one hole placement form, not ${placementKeys.join(' + ')}.` });
-      let placement: Record<string, unknown> | undefined;
-      if (placementKeys.length === 0) addMissing(issues, 'holes', 'One of holes.grid, holes.centers, or holes.edge_offset');
-      else if (placementKeys.length === 1 && placementKeys[0] === 'grid') {
-        const grid = simpleTuple(holes.grid, 'holes.grid', true, true, issues);
-        const start = simpleTuple(holes.start, 'holes.start', false, false, issues);
-        const spacing = simpleTuple(holes.spacing, 'holes.spacing', true, false, issues);
-        if (grid !== undefined && start !== undefined && spacing !== undefined) placement = { type: 'rectangular_grid', columns: grid[0], rows: grid[1], origin: { x: start[0], y: start[1] }, spacing_x: spacing[0], spacing_y: spacing[1] };
-      } else if (placementKeys.length === 1 && placementKeys[0] === 'centers') {
-        if (!Array.isArray(holes.centers) || holes.centers.length === 0) issues.push({ kind: 'invalid', code: 'EMPTY_HOLE_CENTERS', path: 'holes.centers', message: 'centers must be a non-empty array.' });
-        else {
-          const centers: Point2D[] = [];
-          holes.centers.forEach((center, index) => {
-            if (!Array.isArray(center) || center.length !== 2 || center.some((item) => typeof item !== 'number' || !Number.isFinite(item))) issues.push({ kind: 'invalid', code: 'INVALID_HOLE_CENTER', path: `holes.centers.${index}`, message: 'Each center must be exactly [x,y] with finite coordinates.' });
-            else centers.push({ x: center[0] as number, y: center[1] as number });
-          });
-          if (centers.length === holes.centers.length) placement = { type: 'explicit', centers };
-        }
-      } else if (placementKeys.length === 1) {
-        placement = { type: 'edge_offset', distance: holes.edge_offset, reference: holes.reference };
-      }
-      features.push({ type: 'hole_pattern', diameter: holes.diameter, placement });
-      paths.push('holes');
-    }
+    else appendSimpleHoleFeature(value.holes, 'holes', false, features, paths, issues);
+  }
+  if (value.hole_groups !== undefined && value.hole_groups !== null) {
+    if (!Array.isArray(value.hole_groups) || value.hole_groups.length === 0) issues.push({ kind: 'invalid', code: 'INVALID_HOLE_GROUPS', path: 'hole_groups', message: 'hole_groups must be a non-empty array.' });
+    else value.hole_groups.forEach((group, index) => {
+      const path = `hole_groups.${index}`;
+      if (!isRecord(group)) issues.push({ kind: 'invalid', code: 'INVALID_HOLE_GROUP', path, message: 'Each hole group must be an object.' });
+      else appendSimpleHoleFeature(group, path, true, features, paths, issues);
+    });
   }
   for (const [operation, allowed] of [['fillet', ['radius', 'edges']], ['chamfer', ['size', 'edges']]] as const) {
     const candidate = value[operation];
@@ -691,7 +716,7 @@ function normalizeToFeaturePlan(value: Record<string, unknown>): NormalizedFeatu
     };
   }
   const hasSimpleOperationWithoutFormat = !hasFeatureFields && !hasLegacyFields
-    && ['holes', 'fillet', 'chamfer'].some((key) => Object.hasOwn(value, key));
+    && ['holes', 'hole_groups', 'fillet', 'chamfer'].some((key) => Object.hasOwn(value, key));
   if (hasSimpleFields || hasSimpleOperationWithoutFormat) return normalizeSimplePlan(value);
   const issues: InternalIssue[] = [];
   if (Object.hasOwn(value, 'features') || Object.hasOwn(value, 'unit')) {
@@ -899,6 +924,46 @@ function resolveHolePattern(feature: Record<string, unknown>, path: string, widt
   return { diameter, centers, issues, ambiguityDistance };
 }
 
+interface ResolvedHoleGroup {
+  feature: Record<string, unknown>;
+  path: string;
+  resolution: HoleResolution;
+}
+
+function validateCrossGroupHoleGeometry(groups: ResolvedHoleGroup[]): InternalIssue[] {
+  const issues: InternalIssue[] = [];
+  for (let firstGroup = 0; firstGroup < groups.length; firstGroup += 1) {
+    const first = groups[firstGroup];
+    if (first.resolution.centers === undefined || first.resolution.diameter === undefined) continue;
+    for (let secondGroup = firstGroup + 1; secondGroup < groups.length; secondGroup += 1) {
+      const second = groups[secondGroup];
+      if (second.resolution.centers === undefined || second.resolution.diameter === undefined) continue;
+      for (let firstIndex = 0; firstIndex < first.resolution.centers.length; firstIndex += 1) {
+        for (let secondIndex = 0; secondIndex < second.resolution.centers.length; secondIndex += 1) {
+          const firstCenter = first.resolution.centers[firstIndex];
+          const secondCenter = second.resolution.centers[secondIndex];
+          const centerDistance = Math.hypot(firstCenter.x - secondCenter.x, firstCenter.y - secondCenter.y);
+          const requiredDistanceExclusive = (first.resolution.diameter + second.resolution.diameter) / 2 + LINEAR_TOLERANCE_MM;
+          if (centerDistance <= requiredDistanceExclusive) {
+            issues.push({
+              kind: 'invalid', code: 'HOLES_OVERLAP', path: `${second.path}.placement`,
+              message: 'Hole profiles from different semantic groups overlap, touch, or are within tolerance.',
+              details: {
+                firstFeatureId: first.feature.id, secondFeatureId: second.feature.id,
+                firstHoleIndex: firstIndex, secondHoleIndex: secondIndex,
+                firstCenter, secondCenter, centerDistance, requiredCenterDistanceExclusive: requiredDistanceExclusive,
+              },
+            });
+            firstIndex = first.resolution.centers.length;
+            secondIndex = second.resolution.centers.length;
+          }
+        }
+      }
+    }
+  }
+  return issues;
+}
+
 export function validateCadPlan(value: unknown): CadPlanValidationResult {
   if (!isRecord(value)) return validateLegacyCadPlan(value);
   const normalized = normalizeToFeaturePlan(value);
@@ -948,7 +1013,7 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
     if (type === undefined || type === null) structuralIssues.push({ kind: 'incomplete', code: 'MISSING_REQUIRED_VALUE', path: `${path}.type`, message: 'Feature type is required.' });
     else if (!(SUPPORTED_FEATURE_TYPES as readonly string[]).includes(String(type))) structuralIssues.push({ kind: 'unsupported', code: 'UNSUPPORTED_FEATURE_TYPE', path: `${path}.type`, message: `Feature type "${String(type)}" is not supported.` });
     else {
-      if (seenTypes.has(String(type))) structuralIssues.push({ kind: 'invalid', code: 'DUPLICATE_FEATURE_TYPE', path: `${path}.type`, message: `Only one ${String(type)} feature is currently supported.` });
+      if (type !== 'hole_pattern' && seenTypes.has(String(type))) structuralIssues.push({ kind: 'invalid', code: 'DUPLICATE_FEATURE_TYPE', path: `${path}.type`, message: `Only one ${String(type)} feature is currently supported.` });
       seenTypes.add(String(type));
       if ((BASE_FEATURE_TYPES as readonly string[]).includes(String(type))) {
         if (index !== 0 || solidAvailable) structuralIssues.push({ kind: 'invalid', code: 'INVALID_FEATURE_ORDER', path, message: `${String(type)} must be the first and only base feature.` });
@@ -982,22 +1047,23 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
     if (normalized.unit === undefined || normalized.unit === null || normalized.unit === '') addMissing(structuralIssues, 'unit', 'Unit');
     else if (typeof normalized.unit !== 'string') structuralIssues.push({ kind: 'invalid', code: 'INVALID_UNIT', path: 'unit', message: 'Unit must be a string.' });
     else if (normalized.unit !== 'mm') structuralIssues.push({ kind: 'unsupported', code: 'UNSUPPORTED_UNIT', path: 'unit', message: `Unit "${normalized.unit}" is not supported; use mm.` });
-    const holeFeature = normalized.features.find((feature) => feature.type === 'hole_pattern');
-    const holePath = holeFeature === undefined ? undefined : normalized.paths[normalized.features.indexOf(holeFeature)];
-    if (profileValidation.segments !== undefined && profileValidation.arcCount !== undefined && profileValidation.arcCount > 0 && holeFeature !== undefined) {
-      structuralIssues.push({ kind: 'unsupported', code: 'ARC_PROFILE_HOLES_UNSUPPORTED', path: holePath ?? 'holes', message: 'Hole patterns on profiles containing arcs are not supported until curved-boundary material validation is available.' });
+    const holeFeatures = normalized.features
+      .map((feature, index) => ({ feature, path: normalized.paths[index] }))
+      .filter((entry) => entry.feature.type === 'hole_pattern');
+    if (profileValidation.segments !== undefined && profileValidation.arcCount !== undefined && profileValidation.arcCount > 0 && holeFeatures.length > 0) {
+      structuralIssues.push({ kind: 'unsupported', code: 'ARC_PROFILE_HOLES_UNSUPPORTED', path: holeFeatures[0].path, message: 'Hole patterns on profiles containing arcs are not supported until curved-boundary material validation is available.' });
     }
     const linearMaterialPolygon: PolygonPoint[] | undefined = profileValidation.points
       ?? (profileValidation.segments !== undefined && profileValidation.arcCount === 0
         ? profileValidation.segments.map((segment) => [segment.start.x, segment.start.y])
         : undefined);
-    const holeResolution = holeFeature === undefined || holePath === undefined || linearMaterialPolygon === undefined
-      ? undefined
-      : resolveHolePattern(holeFeature, holePath, undefined, undefined, linearMaterialPolygon);
-    if (holeResolution !== undefined) structuralIssues.push(...holeResolution.issues);
+    const holeGroups: ResolvedHoleGroup[] = linearMaterialPolygon === undefined ? [] : holeFeatures.map(({ feature, path }) => ({
+      feature, path, resolution: resolveHolePattern(feature, path, undefined, undefined, linearMaterialPolygon),
+    }));
+    structuralIssues.push(...holeGroups.flatMap((group) => group.resolution.issues), ...validateCrossGroupHoleGeometry(holeGroups));
     const validProfileRepresentation = profileValidation.points !== undefined || profileValidation.segments !== undefined;
     if (structuralIssues.length > 0 || !validProfileRepresentation || profileValidation.length === undefined
-      || (holeFeature !== undefined && (holeResolution?.centers === undefined || holeResolution.diameter === undefined))) {
+      || holeGroups.some((group) => group.resolution.centers === undefined || group.resolution.diameter === undefined)) {
       const status = statusFor(structuralIssues);
       return { status, can_execute: false, issues: structuralIssues.map(({ kind: _kind, ...issue }) => issue) };
     }
@@ -1007,7 +1073,7 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
       ? { type: 'line', start: segment.start, end: segment.end }
       : { type: 'arc', start: segment.start, end: segment.end, center: segment.center, direction: segment.direction });
     const resolvedFeatures: Record<string, unknown>[] = [resolvedProfile];
-    if (holeFeature !== undefined && holeResolution !== undefined) {
+    for (const { feature: holeFeature, resolution: holeResolution } of holeGroups) {
       resolvedFeatures.push({
         id: holeFeature.id,
         type: 'hole_pattern',
@@ -1032,13 +1098,14 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
   }
 
   const baseFeature = normalized.features.find((feature) => feature.type === 'rectangular_pad');
-  const holeFeature = normalized.features.find((feature) => feature.type === 'hole_pattern');
+  const holeFeatures = normalized.features
+    .map((feature, index) => ({ feature, path: normalized.paths[index] }))
+    .filter((entry) => entry.feature.type === 'hole_pattern');
   const filletFeature = normalized.features.find((feature) => feature.type === 'fillet');
   const chamferFeature = normalized.features.find((feature) => feature.type === 'chamfer');
-  const holePath = holeFeature === undefined ? undefined : normalized.paths[normalized.features.indexOf(holeFeature)];
-  const holeResolution = holeFeature === undefined || holePath === undefined
-    ? undefined
-    : resolveHolePattern(holeFeature, holePath, baseFeature?.width, baseFeature?.height);
+  const holeGroups: ResolvedHoleGroup[] = holeFeatures.map(({ feature, path }) => ({
+    feature, path, resolution: resolveHolePattern(feature, path, baseFeature?.width, baseFeature?.height),
+  }));
   const legacyPlan: Record<string, unknown> = {
     base: baseFeature === undefined ? undefined : { type: 'rectangular_plate', width: baseFeature.width, height: baseFeature.height, thickness: baseFeature.length, unit: normalized.unit },
   };
@@ -1046,19 +1113,22 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
   if (chamferFeature !== undefined) legacyPlan.chamfer = { size: chamferFeature.size, edges: chamferFeature.edges };
   const validated = validateLegacyCadPlan(legacyPlan);
   validated.issues = validated.issues.map((issue) => ({ ...issue, path: translateIssuePath(issue.path, normalized) }));
-  if (holeResolution !== undefined) validated.issues.push(...holeResolution.issues.map(({ kind: _kind, ...issue }) => issue));
+  const holeIssues = [...holeGroups.flatMap((group) => group.resolution.issues), ...validateCrossGroupHoleGeometry(holeGroups)];
+  validated.issues.push(...holeIssues.map(({ kind: _kind, ...issue }) => issue));
   const combinedInternalIssues: InternalIssue[] = [
     ...validated.issues.map((issue) => ({ ...issue, kind: issue.code === 'AMBIGUOUS_DISTANCE_REFERENCE' ? 'ambiguous' as const : issue.code === 'MISSING_REQUIRED_VALUE' ? 'incomplete' as const : issue.code.startsWith('UNSUPPORTED_') ? 'unsupported' as const : 'invalid' as const })),
   ];
   validated.status = statusFor(combinedInternalIssues);
   validated.can_execute = validated.status === 'valid';
-  if (validated.status !== 'valid' || validated.resolved_plan === undefined || (holeFeature !== undefined && (holeResolution?.centers === undefined || holeResolution.diameter === undefined))) {
+  if (validated.status !== 'valid' || validated.resolved_plan === undefined || holeGroups.some((group) => group.resolution.centers === undefined || group.resolution.diameter === undefined)) {
     delete validated.resolved_plan;
-    if (holeResolution?.ambiguityDistance !== undefined) validated.clarification_visual = { type: 'svg', content: ambiguitySvg(holeResolution.ambiguityDistance) };
+    const ambiguousGroup = holeGroups.find((group) => group.resolution.ambiguityDistance !== undefined);
+    if (ambiguousGroup?.resolution.ambiguityDistance !== undefined) validated.clarification_visual = { type: 'svg', content: ambiguitySvg(ambiguousGroup.resolution.ambiguityDistance) };
     return validated;
   }
 
   const legacyResolved = validated.resolved_plan;
+  const resolutionByFeature = new Map(holeGroups.map((group) => [group.feature, group.resolution]));
   const resolvedFeatures = normalized.features.map((feature) => {
     const dependencies: Record<string, unknown> = {};
     if (typeof feature.after === 'string') dependencies.after = feature.after;
@@ -1068,7 +1138,8 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
       return { id: feature.id, type: 'rectangular_pad', width: resolvedBase.width, height: resolvedBase.height, length: resolvedBase.thickness, ...dependencies };
     }
     if (feature.type === 'hole_pattern') {
-      return { id: feature.id, type: 'hole_pattern', diameter: holeResolution!.diameter, centers: holeResolution!.centers, operation: 'through_all', ...dependencies };
+      const resolution = resolutionByFeature.get(feature)!;
+      return { id: feature.id, type: 'hole_pattern', diameter: resolution.diameter, centers: resolution.centers, operation: 'through_all', ...dependencies };
     }
     const dimension = feature.type === 'fillet' ? 'radius' : 'size';
     const resolvedOperation = legacyResolved[String(feature.type)] as Record<string, unknown>;

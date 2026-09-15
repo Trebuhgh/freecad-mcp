@@ -41,6 +41,7 @@ test('cad_validate_plan schema presents Simple Intent first and isolates compati
   assert.equal(Object.hasOwn(simple.properties, 'base'), false);
   assert.equal(Object.hasOwn(simple.properties.holes.properties, 'placement'), false);
   assert.equal(Object.hasOwn(simple.properties.holes.properties, 'count'), false);
+  assert.equal(simple.properties.hole_groups.items.properties.id.type[0], 'string');
   assert.equal(simple.properties.segments.minItems, 1);
   assert.equal(feature.title, 'Advanced Feature Plan (compatibility)');
   assert.deepEqual(feature.required, ['features']);
@@ -665,4 +666,64 @@ test('profile_pad edge-offset, non-through operation, fillet, and chamfer remain
     assert.ok(result.issues.some((issue) => ['PROFILE_PAD_HOLE_PLACEMENT_UNSUPPORTED', 'UNSUPPORTED_HOLE_OPERATION', 'PROFILE_PAD_FINISHING_UNSUPPORTED'].includes(issue.code)));
     assert.equal(bridge.calls, 0);
   }
+});
+
+test('feature plan resolves multiple semantic hole patterns in dependency order', async () => {
+  const { result, bridge } = await validate({
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { id: 'mounting_holes', type: 'hole_pattern', diameter: 6, placement: { type: 'explicit', centers: [[20, 15], [80, 15], [20, 45], [80, 45]] }, operation: 'through_all', after: 'base' },
+      { id: 'sensor_holes', type: 'hole_pattern', diameter: 4, placement: { type: 'explicit', centers: [[50, 30]] }, operation: 'through_all', after: 'mounting_holes' },
+    ],
+  });
+  assert.equal(result.status, 'valid', JSON.stringify(result, null, 2));
+  assert.equal(result.can_execute, true);
+  assert.deepEqual(result.resolved_plan.features.map(({ id, type, after }) => ({ id, type, after })), [
+    { id: 'base', type: 'rectangular_pad', after: undefined },
+    { id: 'mounting_holes', type: 'hole_pattern', after: 'base' },
+    { id: 'sensor_holes', type: 'hole_pattern', after: 'mounting_holes' },
+  ]);
+  assert.equal(bridge.calls, 0);
+});
+
+test('Simple Intent hole_groups normalize to named sequential hole patterns while holes remains backward compatible', async () => {
+  const groups = await validate({
+    shape: 'plate', size: [100, 60, 10], unit: 'mm',
+    hole_groups: [
+      { id: 'mounting_holes', diameter: 6, centers: [[20, 15], [80, 15], [20, 45], [80, 45]] },
+      { id: 'sensor_holes', diameter: 4, centers: [[50, 30]] },
+    ],
+  });
+  assert.equal(groups.result.status, 'valid', JSON.stringify(groups.result, null, 2));
+  assert.deepEqual(groups.result.resolved_plan.features.map((feature) => feature.id), ['base', 'mounting_holes', 'sensor_holes']);
+  assert.equal(groups.result.resolved_plan.features[2].after, 'mounting_holes');
+
+  const single = await validate({ shape: 'plate', size: [100, 60, 10], unit: 'mm', holes: { diameter: 6, centers: [[20, 20]] } });
+  assert.equal(single.result.status, 'valid');
+  assert.deepEqual(single.result.resolved_plan.features.map((feature) => feature.id), ['base', 'holes']);
+
+  const mixed = await validate({
+    shape: 'plate', size: [100, 60, 10], unit: 'mm', holes: { diameter: 6, centers: [[20, 20]] },
+    hole_groups: [{ id: 'sensor_holes', diameter: 4, centers: [[50, 30]] }],
+  });
+  assert.equal(mixed.result.can_execute, false);
+  assert.ok(mixed.result.issues.some((issue) => issue.code === 'CONFLICTING_HOLE_GROUP_FORMAT'));
+});
+
+test('cross-group hole overlap or contact is rejected before FreeCAD', async () => {
+  const { result, bridge } = await validate({
+    shape: 'plate', size: [100, 60, 10], unit: 'mm',
+    hole_groups: [
+      { id: 'holes_a', diameter: 6, centers: [[30, 30]] },
+      { id: 'holes_b', diameter: 4, centers: [[35, 30]] },
+    ],
+  });
+  assert.equal(result.status, 'invalid');
+  assert.equal(result.can_execute, false);
+  const overlap = result.issues.find((issue) => issue.code === 'HOLES_OVERLAP');
+  assert.ok(overlap, JSON.stringify(result, null, 2));
+  assert.equal(overlap.details.firstFeatureId, 'holes_a');
+  assert.equal(overlap.details.secondFeatureId, 'holes_b');
+  assert.equal(bridge.calls, 0);
 });

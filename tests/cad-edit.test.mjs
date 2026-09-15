@@ -17,6 +17,14 @@ const holedPlatePlan = {
     { id: 'holes', type: 'hole_pattern', diameter: 6, placement: { type: 'explicit', centers: holeCenters }, operation: 'through_all', after: 'base' },
   ],
 };
+const multiHolePlan = {
+  unit: 'mm',
+  features: [
+    { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+    { id: 'mounting_holes', type: 'hole_pattern', diameter: 6, placement: { type: 'explicit', centers: [[20, 15], [80, 15], [20, 45], [80, 45]] }, operation: 'through_all', after: 'base' },
+    { id: 'sensor_holes', type: 'hole_pattern', diameter: 4, placement: { type: 'explicit', centers: [[50, 30]] }, operation: 'through_all', after: 'mounting_holes' },
+  ],
+};
 
 function payload(toolResult) {
   return JSON.parse(toolResult.content[0].text);
@@ -170,6 +178,47 @@ _mcp_result["result"] = {
     "base": {"width": float(base_sketch.getDatum(width_index).Value), "height": float(base_sketch.getDatum(height_index).Value), "length": float(base_pad.Length.Value)},
     "tip": doc.getObject("Body").Tip.Name, "object_count": len(doc.Objects),
 }`));
+}
+
+async function inspectManagedHoleGroups(bridge, documentName) {
+  return payload(await bridge.run(`
+doc = FreeCAD.getDocument(${JSON.stringify(documentName)})
+metadata = doc.getObject("ManagedModelMetadata")
+plan = json.loads(metadata.ResolvedPlanJson)
+bindings = json.loads(metadata.FeatureBindingsJson)
+groups = {}
+for feature_plan in plan["features"]:
+    if feature_plan["type"] != "hole_pattern":
+        continue
+    binding = bindings[feature_plan["id"]]
+    sketch = doc.getObject(binding["sketch_object"])
+    circles = []
+    for name in binding["parameters"]["diameter"]["constraint_names"]:
+        index = next(index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == name)
+        circle = sketch.Geometry[int(sketch.Constraints[index].First)]
+        circles.append({"x": float(circle.Center.x), "y": float(circle.Center.y), "diameter": float(circle.Radius) * 2.0})
+    circles.sort(key=lambda item: (item["x"], item["y"]))
+    groups[feature_plan["id"]] = {"diameter": float(feature_plan["diameter"]), "circles": circles, "sketch": sketch.Name, "pocket": binding["feature_object"], "constraint_names": binding["parameters"]["diameter"]["constraint_names"]}
+cylinders = []
+for face in doc.getObject("Body").Tip.Shape.Faces:
+    if face.Surface.__class__.__name__ == "Cylinder":
+        surface = face.Surface
+        cylinders.append({"x": float(surface.Center.x), "y": float(surface.Center.y), "diameter": float(surface.Radius) * 2.0})
+cylinders.sort(key=lambda item: (item["x"], item["y"]))
+_mcp_result["result"] = {"model_id": str(metadata.ModelId), "model_revision": int(metadata.ModelRevision), "plan_digest": str(metadata.PlanDigest), "resolved_plan": plan, "bindings": bindings, "groups": groups, "cylinders": cylinders, "tip": doc.getObject("Body").Tip.Name, "object_count": len(doc.Objects)}`));
+}
+
+function groupDiameterEdit(created, modelRevision, targetFeatureId, oldValue, newValue, overrides = {}) {
+  return {
+    model_id: created.managed_model.model_id,
+    model_revision: modelRevision,
+    target_feature_id: targetFeatureId,
+    parameter: 'diameter',
+    old_value: oldValue,
+    new_value: newValue,
+    unit: 'mm',
+    ...overrides,
+  };
 }
 
 function widthEdit(created, overrides = {}) {
@@ -895,4 +944,166 @@ os.remove(path)`));
   assert.deepEqual(reload.binding.parameters.diameter.constraint_names, ['diameter_0', 'diameter_1']);
   assert.deepEqual(reload.diameters, [8, 8]);
   assert.deepEqual(reload.cylinder_diameters, [8, 8]);
+});
+
+test('two hole patterns execute sequentially and can be edited independently across revisions', async (t) => {
+  const { bridge, planGate, editGate, created } = await createManagedHoledPlate(t, 'MultiHoleEdit', multiHolePlan);
+  assert.deepEqual(created.executed_steps, ['base', 'mounting_holes', 'sensor_holes']);
+  assert.equal(created.verification.bodyTip, 'PlanFeature_2');
+  assert.equal(created.geometry_signature.surfaces.cylindrical.filter((surface) => surface.surface_role === 'hole').length, 5);
+  const before = await inspectManagedHoleGroups(bridge, 'MultiHoleEdit');
+  assert.equal(before.tip, 'PlanFeature_2');
+  assert.deepEqual(Object.keys(before.groups), ['mounting_holes', 'sensor_holes']);
+  assert.deepEqual(before.groups.mounting_holes.circles.map((hole) => hole.diameter), [6, 6, 6, 6]);
+  assert.deepEqual(before.groups.sensor_holes.circles.map((hole) => hole.diameter), [4]);
+  const discovery = await listManagedModels(bridge);
+  assert.deepEqual(discovery.models[0].features.filter((feature) => feature.type === 'hole_pattern'), [
+    { id: 'mounting_holes', type: 'hole_pattern', parameters: { diameter: 6 } },
+    { id: 'sensor_holes', type: 'hole_pattern', parameters: { diameter: 4 } },
+  ]);
+
+  const mountingEdit = groupDiameterEdit(created, 1, 'mounting_holes', 6, 8);
+  const mountingValidation = payload(await handleHighLevelCadTool('cad_validate_edit_plan', mountingEdit, bridge, planGate, editGate));
+  assert.equal(mountingValidation.status, 'valid', JSON.stringify(mountingValidation, null, 2));
+  const mountingExecution = payload(await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate));
+  assert.equal(mountingExecution.status, 'verified', JSON.stringify(mountingExecution, null, 2));
+  assert.equal(mountingExecution.managed_model.model_id, created.managed_model.model_id);
+  assert.equal(mountingExecution.managed_model.model_revision, 2);
+  assert.equal(mountingExecution.verification.checks.hole_groups.passed, true);
+  let state = await inspectManagedHoleGroups(bridge, 'MultiHoleEdit');
+  assert.deepEqual(state.groups.mounting_holes.circles.map((hole) => hole.diameter), [8, 8, 8, 8]);
+  assert.deepEqual(state.groups.sensor_holes.circles.map((hole) => hole.diameter), [4]);
+  assert.deepEqual(state.cylinders.map((hole) => hole.diameter), [8, 8, 4, 8, 8]);
+  assert.deepEqual(state.cylinders.map(({ x, y }) => ({ x, y })), before.cylinders.map(({ x, y }) => ({ x, y })));
+  assert.equal(state.object_count, before.object_count);
+
+  const stale = payload(await handleHighLevelCadTool('cad_validate_edit_plan', mountingEdit, bridge, planGate, editGate));
+  assert.equal(stale.can_execute, false);
+  assert.equal(stale.issues[0].code, 'STALE_MODEL_REVISION');
+  const missing = payload(await handleHighLevelCadTool('cad_validate_edit_plan', groupDiameterEdit(created, 2, 'missing_holes', 4, 5), bridge, planGate, editGate));
+  assert.equal(missing.can_execute, false);
+  assert.equal(missing.issues[0].code, 'TARGET_FEATURE_NOT_FOUND');
+  const wrongType = payload(await handleHighLevelCadTool('cad_validate_edit_plan', groupDiameterEdit(created, 2, 'base', 100, 110), bridge, planGate, editGate));
+  assert.equal(wrongType.can_execute, false);
+  assert.equal(wrongType.issues[0].code, 'UNSUPPORTED_EDIT_PARAMETER');
+
+  const sensorEdit = groupDiameterEdit(created, 2, 'sensor_holes', 4, 5);
+  const sensorValidation = payload(await handleHighLevelCadTool('cad_validate_edit_plan', sensorEdit, bridge, planGate, editGate));
+  assert.equal(sensorValidation.status, 'valid', JSON.stringify(sensorValidation, null, 2));
+  const sensorExecution = payload(await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate));
+  assert.equal(sensorExecution.status, 'verified', JSON.stringify(sensorExecution, null, 2));
+  assert.equal(sensorExecution.managed_model.model_revision, 3);
+  state = await inspectManagedHoleGroups(bridge, 'MultiHoleEdit');
+  assert.deepEqual(state.groups.mounting_holes.circles.map((hole) => hole.diameter), [8, 8, 8, 8]);
+  assert.deepEqual(state.groups.sensor_holes.circles.map((hole) => hole.diameter), [5]);
+});
+
+test('multi-hole validation detects binding damage, isolated constraint drift, and cross-group edit collisions', async (t) => {
+  const first = await createManagedHoledPlate(t, 'MultiHoleInvalid', multiHolePlan);
+  await first.bridge.run(`
+doc = FreeCAD.getDocument("MultiHoleInvalid")
+metadata = doc.getObject("ManagedModelMetadata")
+bindings = json.loads(metadata.FeatureBindingsJson)
+sketch = doc.getObject(bindings["sensor_holes"]["sketch_object"])
+name = bindings["sensor_holes"]["parameters"]["diameter"]["constraint_names"][0]
+index = next(index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == name)
+sketch.setDatum(index, FreeCAD.Units.Quantity("4.5 mm"))
+doc.recompute()
+_mcp_result["result"] = True`);
+  const drift = payload(await handleHighLevelCadTool('cad_validate_edit_plan', groupDiameterEdit(first.created, 1, 'sensor_holes', 4, 5), first.bridge, first.planGate, first.editGate));
+  assert.equal(drift.can_execute, false);
+  assert.equal(drift.issues[0].code, 'MODEL_STATE_MISMATCH');
+  await first.bridge.run(`
+doc = FreeCAD.getDocument("MultiHoleInvalid")
+metadata = doc.getObject("ManagedModelMetadata")
+bindings = json.loads(metadata.FeatureBindingsJson)
+sketch = doc.getObject(bindings["sensor_holes"]["sketch_object"])
+name = bindings["sensor_holes"]["parameters"]["diameter"]["constraint_names"][0]
+index = next(index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == name)
+sketch.setDatum(index, FreeCAD.Units.Quantity("4 mm"))
+bindings["mounting_holes"]["parameters"]["diameter"]["constraint_names"][0] = "missing"
+metadata.FeatureBindingsJson = json.dumps(bindings, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+doc.recompute()
+_mcp_result["result"] = True`);
+  const damaged = payload(await handleHighLevelCadTool('cad_validate_edit_plan', groupDiameterEdit(first.created, 1, 'mounting_holes', 6, 8), first.bridge, first.planGate, first.editGate));
+  assert.equal(damaged.can_execute, false);
+  assert.equal(damaged.issues[0].code, 'FEATURE_BINDING_INVALID');
+
+  const collisionPlan = {
+    unit: 'mm', features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { id: 'mounting_holes', type: 'hole_pattern', diameter: 6, placement: { type: 'explicit', centers: [[30, 30]] }, operation: 'through_all', after: 'base' },
+      { id: 'sensor_holes', type: 'hole_pattern', diameter: 4, placement: { type: 'explicit', centers: [[42, 30]] }, operation: 'through_all', after: 'mounting_holes' },
+    ],
+  };
+  const second = await createManagedHoledPlate(t, 'MultiHoleCollision', collisionPlan);
+  const before = await inspectManagedHoleGroups(second.bridge, 'MultiHoleCollision');
+  const collision = payload(await handleHighLevelCadTool('cad_validate_edit_plan', groupDiameterEdit(second.created, 1, 'mounting_holes', 6, 20), second.bridge, second.planGate, second.editGate));
+  assert.equal(collision.can_execute, false);
+  assert.ok(collision.issues.some((issue) => issue.code === 'HOLES_OVERLAP'));
+  assert.deepEqual(await inspectManagedHoleGroups(second.bridge, 'MultiHoleCollision'), before);
+});
+
+test('multi-hole verification rollback restores only the target constraints and the complete original model', async (t) => {
+  const { bridge, planGate, editGate, created } = await createManagedHoledPlate(t, 'MultiHoleRollback', multiHolePlan);
+  const before = await inspectManagedHoleGroups(bridge, 'MultiHoleRollback');
+  const validation = payload(await handleHighLevelCadTool('cad_validate_edit_plan', groupDiameterEdit(created, 1, 'mounting_holes', 6, 8), bridge, planGate, editGate));
+  assert.equal(validation.can_execute, true);
+  bridge.mutateNextCode((code) => {
+    const marker = '    # edit_verification_snapshot_complete';
+    assert.ok(code.includes(marker));
+    return code.replace(marker, '    actual_snapshot["volume"] = 1.0\n' + marker);
+  });
+  const failedResult = await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate);
+  const failed = payload(failedResult);
+  assert.equal(failedResult.isError, true);
+  assert.equal(failed.code, 'CAD_EDIT_VERIFICATION_FAILED');
+  assert.equal(failed.rollback.passed, true, JSON.stringify(failed, null, 2));
+  const after = await inspectManagedHoleGroups(bridge, 'MultiHoleRollback');
+  assert.deepEqual(after.groups, before.groups);
+  assert.deepEqual(after.cylinders, before.cylinders);
+  assert.equal(after.model_revision, before.model_revision);
+  assert.equal(after.plan_digest, before.plan_digest);
+  assert.deepEqual(after.resolved_plan, before.resolved_plan);
+});
+
+test('two hole pattern bindings and edited geometry survive FCStd save and reload', async (t) => {
+  const { bridge, planGate, editGate, created } = await createManagedHoledPlate(t, 'MultiHoleReload', multiHolePlan);
+  const validation = payload(await handleHighLevelCadTool('cad_validate_edit_plan', groupDiameterEdit(created, 1, 'mounting_holes', 6, 8), bridge, planGate, editGate));
+  assert.equal(validation.can_execute, true);
+  const execution = payload(await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate));
+  assert.equal(execution.status, 'verified', JSON.stringify(execution, null, 2));
+  const reload = payload(await bridge.run(`
+import os
+import tempfile
+doc = FreeCAD.getDocument("MultiHoleReload")
+descriptor, path = tempfile.mkstemp(suffix=".FCStd")
+os.close(descriptor)
+doc.saveAs(path)
+FreeCAD.closeDocument(doc.Name)
+reloaded = FreeCAD.openDocument(path)
+metadata = reloaded.getObject("ManagedModelMetadata")
+plan = json.loads(metadata.ResolvedPlanJson)
+bindings = json.loads(metadata.FeatureBindingsJson)
+groups = {}
+for item in plan["features"]:
+    if item["type"] != "hole_pattern": continue
+    binding = bindings[item["id"]]
+    sketch = reloaded.getObject(binding["sketch_object"])
+    diameters = []
+    for name in binding["parameters"]["diameter"]["constraint_names"]:
+        index = next(index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == name)
+        diameters.append(float(sketch.Geometry[int(sketch.Constraints[index].First)].Radius) * 2.0)
+    groups[item["id"]] = {"sketch": sketch.Name, "pocket": binding["feature_object"], "constraint_names": binding["parameters"]["diameter"]["constraint_names"], "diameters": diameters}
+_mcp_result["result"] = {"model_id": str(metadata.ModelId), "model_revision": int(metadata.ModelRevision), "plan_digest": str(metadata.PlanDigest), "plan": plan, "groups": groups, "tip": reloaded.getObject("Body").Tip.Name}
+FreeCAD.closeDocument(reloaded.Name)
+os.remove(path)`));
+  assert.equal(reload.model_id, created.managed_model.model_id);
+  assert.equal(reload.model_revision, 2);
+  assert.equal(reload.plan_digest, execution.managed_model.plan_digest);
+  assert.equal(reload.plan.features.find((feature) => feature.id === 'mounting_holes').diameter, 8);
+  assert.equal(reload.plan.features.find((feature) => feature.id === 'sensor_holes').diameter, 4);
+  assert.deepEqual(reload.groups.mounting_holes.diameters, [8, 8, 8, 8]);
+  assert.deepEqual(reload.groups.sensor_holes.diameters, [4]);
+  assert.equal(reload.tip, 'PlanFeature_2');
 });
