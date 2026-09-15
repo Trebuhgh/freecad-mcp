@@ -68,10 +68,10 @@ import Part
 _mcp_result = {"success": True}
 try:
 ${indented}
-    result = {"ok": True, "result": _mcp_result["result"], "openDocuments": list(FreeCAD.listDocuments().keys())}
+    result = {"ok": True, "result": _mcp_result["result"], "openDocuments": list(FreeCAD.listDocuments().keys()), "documents": {name: [obj.Name for obj in doc.Objects] for name, doc in FreeCAD.listDocuments().items()}}
 except Exception as error:
     import traceback
-    result = {"ok": False, "error": str(error), "traceback": traceback.format_exc(), "openDocuments": list(FreeCAD.listDocuments().keys())}
+    result = {"ok": False, "error": str(error), "traceback": traceback.format_exc(), "openDocuments": list(FreeCAD.listDocuments().keys()), "documents": {name: [obj.Name for obj in doc.Objects] for name, doc in FreeCAD.listDocuments().items()}}
     ${allowFailure ? 'pass' : 'raise'}
 finally:
     with open(${JSON.stringify(outputPath)}, "w", encoding="utf-8") as output:
@@ -199,4 +199,84 @@ test('execution binds to the latest plan revision and serializes validation race
   );
   release();
   await running;
+});
+
+test('automatic document naming selects the smallest free positive CADPlan number', async () => {
+  const scenarios = [
+    [[], 'CADPlan_1'],
+    [['CADPlan_1', 'CADPlan_2'], 'CADPlan_3'],
+    [['CADPlan_1', 'CADPlan_3'], 'CADPlan_2'],
+  ];
+  for (const [existing, expected] of scenarios) {
+    const { bridge } = await validateAndCapture(plan('center'), undefined);
+    const prelude = existing.map((name) => `FreeCAD.newDocument(${JSON.stringify(name)})`).join('\n');
+    const execution = executeFreeCad(`${prelude}\n${bridge.commands[0]}`);
+    assert.equal(execution.ok, true, execution.traceback);
+    assert.equal(execution.result.document, expected);
+    assert.ok(execution.openDocuments.includes(expected));
+  }
+});
+
+test('explicit document names are strict and existing documents remain untouched', async () => {
+  const conflict = await validateAndCapture(plan('center'), 'Motorhalter');
+  const failed = executeFreeCad(`
+existing = FreeCAD.newDocument("Motorhalter")
+existing.addObject("App::FeaturePython", "ExistingMarker")
+${conflict.bridge.commands[0]}`, true);
+  assert.equal(failed.ok, false);
+  assert.match(failed.error, /CAD_DOCUMENT_ALREADY_EXISTS\|Motorhalter/);
+  assert.deepEqual(failed.documents.Motorhalter, ['ExistingMarker']);
+
+  const structuredGate = new CadPlanValidationGate();
+  const structuredBridge = new CapturingBridge({
+    content: [{ type: 'text', text: 'FreeCAD error: CAD_DOCUMENT_ALREADY_EXISTS|Motorhalter' }],
+    isError: true,
+  });
+  await handleHighLevelCadTool('cad_validate_plan', { plan: plan('center') }, structuredBridge, structuredGate);
+  const structured = await handleHighLevelCadTool('cad_execute_plan', { documentName: 'Motorhalter' }, structuredBridge, structuredGate);
+  assert.deepEqual(payload(structured), { success: false, code: 'CAD_DOCUMENT_ALREADY_EXISTS', document: 'Motorhalter' });
+
+  const available = await validateAndCapture(plan('center'), 'Motorhalter');
+  const succeeded = executeFreeCad(available.bridge.commands[0]);
+  assert.equal(succeeded.result.document, 'Motorhalter');
+});
+
+test('sequential automatic executions allocate distinct names and concurrent calls are serialized', async () => {
+  const gate = new CadPlanValidationGate();
+  const bridge = new CapturingBridge();
+  await handleHighLevelCadTool('cad_validate_plan', { plan: plan('center') }, bridge, gate);
+  await handleHighLevelCadTool('cad_execute_plan', {}, bridge, gate);
+  await handleHighLevelCadTool('cad_execute_plan', {}, bridge, gate);
+  const combined = executeFreeCad(`${bridge.commands[0]}\n_mcp_first_document = _mcp_result["result"]["document"]\n${bridge.commands[1]}\n_mcp_result["result"]["firstDocument"] = _mcp_first_document`);
+  assert.equal(combined.result.firstDocument, 'CADPlan_1');
+  assert.equal(combined.result.document, 'CADPlan_2');
+
+  let release;
+  const delayed = new CapturingBridge();
+  delayed.run = async (code) => {
+    delayed.calls += 1;
+    delayed.commands.push(code);
+    await new Promise((resolve) => { release = resolve; });
+    return { content: [{ type: 'text', text: '{}' }] };
+  };
+  const lockedGate = new CadPlanValidationGate();
+  await handleHighLevelCadTool('cad_validate_plan', { plan: plan('center') }, delayed, lockedGate);
+  const first = handleHighLevelCadTool('cad_execute_plan', {}, delayed, lockedGate);
+  const second = await handleHighLevelCadTool('cad_execute_plan', {}, delayed, lockedGate);
+  assert.equal(payload(second).code, 'CAD_PLAN_NOT_VALIDATED');
+  release();
+  await first;
+  assert.equal(delayed.calls, 1);
+});
+
+test('failed automatic execution cleans only its new document and preserves existing documents', async () => {
+  const oversized = await validateAndCapture(plan('center', { fillet: { radius: 1000, edges: 'all_vertical' } }), undefined);
+  const execution = executeFreeCad(`
+keep = FreeCAD.newDocument("KeepMe")
+keep.addObject("App::FeaturePython", "KeepMarker")
+${oversized.bridge.commands[0]}`, true);
+  assert.equal(execution.ok, false);
+  assert.match(execution.error, /CAD_EXECUTE_PLAN_FAILED\|fillet\|fillet\|fillet\|/);
+  assert.deepEqual(execution.documents.KeepMe, ['KeepMarker']);
+  assert.equal(execution.openDocuments.includes('CADPlan_1'), false);
 });

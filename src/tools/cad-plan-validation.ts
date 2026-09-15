@@ -184,7 +184,7 @@ export const CAD_PLAN_TOOLS = [{
   inputSchema: {
     type: 'object' as const,
     properties: {
-      documentName: { type: 'string', description: 'Optional non-geometric FreeCAD document name.' },
+      documentName: { type: 'string', description: 'Optional explicit non-geometric FreeCAD document name. If omitted, the server atomically selects the smallest free CADPlan_N name. Explicit conflicts are errors and are never renamed or overwritten.' },
     },
     additionalProperties: false,
     required: [],

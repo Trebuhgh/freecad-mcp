@@ -4,20 +4,21 @@ import { CadPlanValidationGate, cadPlanNotValidatedToolResult } from './cad-plan
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-function validateDocumentName(value: unknown, revision: number): string {
-  const name = value === undefined ? `CADPlan_${revision}` : value;
-  if (typeof name !== 'string' || !IDENTIFIER.test(name) || name.length > 128) throw new Error('Invalid documentName: use letters, digits, and underscores, starting with a letter or underscore');
-  return name;
+function validateDocumentName(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !IDENTIFIER.test(value) || value.length > 128) throw new Error('Invalid documentName: use letters, digits, and underscores, starting with a letter or underscore');
+  return value;
 }
 
-function executionPython(plan: Record<string, unknown>, revision: number, documentName: string): string {
+function executionPython(plan: Record<string, unknown>, revision: number, requestedDocumentName: string | undefined): string {
   return `
 import FreeCAD
 import Part
 import Sketcher
 plan = ${JSON.stringify(plan)}
 plan_revision = ${revision}
-document_name = ${JSON.stringify(documentName)}
+requested_document_name = ${requestedDocumentName === undefined ? 'None' : JSON.stringify(requestedDocumentName)}
+document_name = None
 failed_feature = None
 failed_feature_type = None
 failed_step = "preflight"
@@ -80,8 +81,16 @@ def select_edges(source, selection):
     return [item["subname"] for item in selected]
 
 try:
-    if document_name in FreeCAD.listDocuments():
-        raise ValueError("DOCUMENT_ALREADY_EXISTS: " + document_name)
+    existing_documents = FreeCAD.listDocuments()
+    if requested_document_name is None:
+        document_number = 1
+        while "CADPlan_" + str(document_number) in existing_documents:
+            document_number += 1
+        document_name = "CADPlan_" + str(document_number)
+    else:
+        document_name = requested_document_name
+        if document_name in existing_documents:
+            raise RuntimeError("CAD_DOCUMENT_ALREADY_EXISTS|" + document_name)
     features = plan["features"]
     base_plan = features[0]
     width = float(base_plan["width"])
@@ -225,12 +234,20 @@ except Exception as error:
             FreeCAD.closeDocument(doc.Name)
         except Exception:
             pass
+    if str(error).startswith("CAD_DOCUMENT_ALREADY_EXISTS|"):
+        raise RuntimeError(str(error))
     raise RuntimeError("CAD_EXECUTE_PLAN_FAILED|" + str(failed_feature or "") + "|" + str(failed_feature_type or "") + "|" + failed_step + "|" + str(error))
 `;
 }
 
 function executionFailure(result: ToolResult): ToolResult {
   const text = result.content.map((item) => item.text).join('\n');
+  const conflictMarker = 'CAD_DOCUMENT_ALREADY_EXISTS|';
+  const conflictStart = text.indexOf(conflictMarker);
+  if (conflictStart >= 0) {
+    const document = text.slice(conflictStart + conflictMarker.length).split(/[\r\n]/, 1)[0].trim();
+    return { content: [{ type: 'text', text: JSON.stringify({ success: false, code: 'CAD_DOCUMENT_ALREADY_EXISTS', document }) }], isError: true };
+  }
   const marker = 'CAD_EXECUTE_PLAN_FAILED|';
   const start = text.indexOf(marker);
   const parts = start >= 0 ? text.slice(start + marker.length).split('|') : [];
@@ -242,7 +259,7 @@ export async function handleCadExecutePlan(args: ToolArgs, bridge: FreeCADBridge
   if (unexpected.length > 0) throw new Error(`Unexpected argument(s): ${unexpected.join(', ')}`);
   const execution = gate.beginExecution();
   if (execution === undefined) return cadPlanNotValidatedToolResult();
-  const name = validateDocumentName(args.documentName, execution.revision);
+  const name = validateDocumentName(args.documentName);
   try {
     const result = await bridge.run(executionPython(execution.resolvedPlan, execution.revision, name));
     return result.isError ? executionFailure(result) : result;
