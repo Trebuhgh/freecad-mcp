@@ -87,6 +87,50 @@ export const HIGH_LEVEL_CAD_TOOLS = [
       required: ['sketch', 'length'],
     },
   },
+  {
+    name: 'cad_create_hole_sketch',
+    description: 'Create a fully constrained set of circular hole profiles directly inside an explicit PartDesign Body.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        body: { type: 'string', description: 'Qualified Body ID, for example Part::Body' },
+        support: { type: 'string', description: 'Optional semantic support "top"/"bottom", or explicit Document::Object::FaceN reference' },
+        plane: { type: 'string', enum: ['XY', 'XZ', 'YZ'], description: 'Body origin plane or semantic support orientation (default: XY)' },
+        name: { type: 'string', description: 'Internal Sketch name (default: HoleSketch)' },
+        holes: {
+          type: 'array',
+          minItems: 1,
+          items: {
+            type: 'object',
+            properties: {
+              x: { type: 'number', description: 'Circle center X coordinate in sketch space, in mm' },
+              y: { type: 'number', description: 'Circle center Y coordinate in sketch space, in mm' },
+              diameter: { type: 'number', exclusiveMinimum: 0, description: 'Hole diameter in mm' },
+            },
+            additionalProperties: false,
+            required: ['x', 'y', 'diameter'],
+          },
+        },
+      },
+      additionalProperties: false,
+      required: ['body', 'holes'],
+    },
+  },
+  {
+    name: 'cad_pocket',
+    description: 'Create and validate a parametric PartDesign Pocket from one or more closed profiles in a Body-owned sketch.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        sketch: { type: 'string', description: 'Qualified sketch ID, qualified Body path, or globally unique sketch name' },
+        type: { type: 'string', enum: ['through_all', 'length'], description: 'Pocket extent (default: through_all)' },
+        length: { type: 'number', exclusiveMinimum: 0, description: 'Pocket length in mm; required when type is length' },
+        name: { type: 'string', description: 'Internal Pocket name (default: Pocket)' },
+      },
+      additionalProperties: false,
+      required: ['sketch'],
+    },
+  },
 ];
 
 function assertAllowedKeys(args: ToolArgs, allowed: string[]): void {
@@ -171,6 +215,91 @@ function validatePositiveDimension(value: unknown, field: string): number {
     throw new Error(`Invalid ${field}: expected a value greater than zero`);
   }
   return number;
+}
+
+function validateHoles(value: unknown): Array<{ x: number; y: number; diameter: number }> {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error('Invalid holes: expected a non-empty array');
+  }
+  if (value.length > 1000) {
+    throw new Error('Invalid holes: maximum number of holes is 1000');
+  }
+  return value.map((hole, index) => {
+    if (typeof hole !== 'object' || hole === null || Array.isArray(hole)) {
+      throw new Error(`Invalid holes[${index}]: expected an object`);
+    }
+    const record = hole as Record<string, unknown>;
+    const unexpected = Object.keys(record).filter((key) => !['x', 'y', 'diameter'].includes(key));
+    if (unexpected.length > 0) {
+      throw new Error(`Unexpected holes[${index}] argument(s): ${unexpected.join(', ')}`);
+    }
+    return {
+      x: validateFiniteNumber(record.x, `holes[${index}].x`),
+      y: validateFiniteNumber(record.y, `holes[${index}].y`),
+      diameter: validatePositiveDimension(record.diameter, `holes[${index}].diameter`),
+    };
+  });
+}
+
+function validateSupport(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (value === 'top' || value === 'bottom') return value;
+  if (typeof value !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*::Face[1-9][0-9]*$/.test(value)) {
+    throw new Error('Invalid support: expected "top", "bottom", or Document::Object::FaceN');
+  }
+  return value;
+}
+
+function sketchSupportPython(plane: 'XY' | 'XZ' | 'YZ', support: string | undefined): string {
+  if (support === undefined) {
+    return `
+expected_role = ${JSON.stringify(`${plane}_Plane`)}
+support_object = next((item for item in body.Origin.OriginFeatures if getattr(item, "Role", "") == expected_role), None)
+if support_object is None:
+    raise RuntimeError("ORIGIN_PLANE_NOT_FOUND: " + expected_role)
+support_subname = ""`;
+  }
+
+  if (support === 'top' || support === 'bottom') {
+    const axis = plane === 'XY' ? 'z' : plane === 'XZ' ? 'y' : 'x';
+    const normal = plane === 'XY' ? '(0.0, 0.0, 1.0)' : plane === 'XZ' ? '(0.0, 1.0, 0.0)' : '(1.0, 0.0, 0.0)';
+    const choose = support === 'top' ? 'max' : 'min';
+    return `
+support_object = body.Tip
+if support_object is None or not hasattr(support_object, "Shape") or support_object.Shape.isNull():
+    raise ValueError("SUPPORT_SOLID_NOT_FOUND: Body has no usable Tip")
+target_normal = ${normal}
+face_candidates = []
+for face_index, face in enumerate(support_object.Shape.Faces, start=1):
+    if face.Surface.__class__.__name__ != "Plane":
+        continue
+    center = face.CenterOfMass
+    normal = face.normalAt(0, 0)
+    alignment = abs(normal.x * target_normal[0] + normal.y * target_normal[1] + normal.z * target_normal[2])
+    if alignment > 0.999999:
+        face_candidates.append((getattr(center, ${JSON.stringify(axis)}), face_index))
+if not face_candidates:
+    raise ValueError("SEMANTIC_SUPPORT_NOT_FOUND: no planar face parallel to ${plane}")
+selected_coordinate = ${choose}(item[0] for item in face_candidates)
+selected = [item for item in face_candidates if abs(item[0] - selected_coordinate) < 1e-7]
+if len(selected) != 1:
+    raise ValueError("SEMANTIC_SUPPORT_AMBIGUOUS: ${support} face is not unique")
+support_subname = "Face" + str(selected[0][1])`;
+  }
+
+  const [document, object, face] = support.split('::');
+  return `
+if doc.Name != ${JSON.stringify(document)}:
+    raise ValueError("SUPPORT_DOCUMENT_MISMATCH: ${support}")
+support_object = doc.getObject(${JSON.stringify(object)})
+if support_object is None:
+    raise ValueError("SUPPORT_OBJECT_NOT_FOUND: ${support}")
+if support_object.getParentGeoFeatureGroup() != body:
+    raise ValueError("SUPPORT_BODY_MISMATCH: ${support}")
+support_subname = ${JSON.stringify(face)}
+support_index = int(support_subname[4:])
+if support_index < 1 or support_index > len(support_object.Shape.Faces):
+    raise ValueError("SUPPORT_FACE_NOT_FOUND: ${support}")`;
 }
 
 function sketchInspectionPython(sketchExpression: string, indent = ''): string {
@@ -506,6 +635,163 @@ try:
             "yLength": float(bounds.YLength),
             "zLength": float(bounds.ZLength)
         }
+    }
+except Exception:
+    doc.abortTransaction()
+    doc.recompute()
+    raise
+`);
+    }
+
+    case 'cad_create_hole_sketch': {
+      assertAllowedKeys(args, ['body', 'support', 'plane', 'name', 'holes']);
+      const bodyRef = validateQualifiedId(args.body, 'body');
+      const support = validateSupport(args.support);
+      const planeValue = args.plane === undefined ? 'XY' : args.plane;
+      if (planeValue !== 'XY' && planeValue !== 'XZ' && planeValue !== 'YZ') {
+        throw new Error('Invalid plane: expected XY, XZ, or YZ');
+      }
+      const plane = planeValue as 'XY' | 'XZ' | 'YZ';
+      const sketchName = validateIdentifier(args.name, 'name', 'HoleSketch');
+      const holes = validateHoles(args.holes);
+      const holesPython = JSON.stringify(holes);
+      return bridge.run(`
+import Part
+import Sketcher
+${resolveBodyPython(bodyRef.document, bodyRef.object)}
+${sketchSupportPython(plane, support)}
+doc.openTransaction("cad_create_hole_sketch")
+try:
+    sketch = body.newObject("Sketcher::SketchObject", ${JSON.stringify(sketchName)})
+    if hasattr(sketch, "AttachmentSupport"):
+        sketch.AttachmentSupport = (support_object, [support_subname])
+    elif hasattr(sketch, "Support"):
+        sketch.Support = (support_object, [support_subname])
+    else:
+        raise RuntimeError("SKETCH_ATTACHMENT_UNSUPPORTED: Sketch has no support property")
+    sketch.MapMode = "FlatFace"
+    holes = ${holesPython}
+    for hole in holes:
+        circle = sketch.addGeometry(Part.Circle(FreeCAD.Vector(hole["x"], hole["y"], 0), FreeCAD.Vector(0, 0, 1), hole["diameter"] / 2.0), False)
+        sketch.addConstraint(Sketcher.Constraint("Diameter", circle, hole["diameter"]))
+        sketch.addConstraint(Sketcher.Constraint("DistanceX", -1, 1, circle, 3, hole["x"]))
+        sketch.addConstraint(Sketcher.Constraint("DistanceY", -1, 1, circle, 3, hole["y"]))
+${sketchInspectionPython('sketch', '    ')}
+    if sketch.getParentGeoFeatureGroup() != body or sketch not in body.Group:
+        raise RuntimeError("HOLE_SKETCH_POSTCONDITION_FAILED: Sketch is not in requested Body")
+    if inspection["geometryCount"] != len(holes) or inspection["closedContours"] != len(holes) or inspection["openContours"] != 0:
+        raise RuntimeError("HOLE_SKETCH_POSTCONDITION_FAILED: circle/profile count mismatch")
+    if any(kind != "Circle" for kind in inspection["geometryTypes"]):
+        raise RuntimeError("HOLE_SKETCH_POSTCONDITION_FAILED: non-circle geometry found")
+    if not inspection["fullyConstrained"] or inspection["degreesOfFreedom"] != 0 or inspection["solverErrors"]:
+        raise RuntimeError("HOLE_SKETCH_POSTCONDITION_FAILED: Sketch is not solver-clean and fully constrained")
+    actual_support = sketch.AttachmentSupport if hasattr(sketch, "AttachmentSupport") else sketch.Support
+    if not actual_support or actual_support[0][0] != support_object:
+        raise RuntimeError("HOLE_SKETCH_POSTCONDITION_FAILED: support mismatch")
+    doc.commitTransaction()
+    _mcp_result["result"] = {
+        "ok": True,
+        "document": doc.Name,
+        "body": doc.Name + "::" + body.Name,
+        "sketch": doc.Name + "::" + sketch.Name,
+        "support": ${JSON.stringify(support ?? plane)},
+        "holeCount": len(holes),
+        "geometryCount": inspection["geometryCount"],
+        "constraintCount": inspection["constraintCount"],
+        "degreesOfFreedom": inspection["degreesOfFreedom"],
+        "fullyConstrained": inspection["fullyConstrained"],
+        "closedContours": inspection["closedContours"],
+        "solverErrors": inspection["solverErrors"],
+        "geometryTypes": inspection["geometryTypes"]
+    }
+except Exception:
+    doc.abortTransaction()
+    doc.recompute()
+    raise
+`);
+    }
+
+    case 'cad_pocket': {
+      assertAllowedKeys(args, ['sketch', 'type', 'length', 'name']);
+      const sketchResolution = resolvePadSketchReference(args.sketch);
+      const pocketType = args.type === undefined ? 'through_all' : args.type;
+      if (pocketType !== 'through_all' && pocketType !== 'length') {
+        throw new Error('Invalid type: expected through_all or length');
+      }
+      if (pocketType === 'length' && args.length === undefined) {
+        throw new Error('Invalid length: required when type is length');
+      }
+      const length = args.length === undefined ? undefined : validatePositiveDimension(args.length, 'length');
+      const pocketName = validateIdentifier(args.name, 'name', 'Pocket');
+      return bridge.run(`
+${sketchResolution}
+if sketch.TypeId != "Sketcher::SketchObject":
+    raise TypeError("OBJECT_IS_NOT_SKETCH: " + sketch.Name)
+body = sketch.getParentGeoFeatureGroup()
+if body is None or body.TypeId != "PartDesign::Body" or sketch not in body.Group:
+    raise ValueError("SKETCH_NOT_IN_BODY: " + doc.Name + "::" + sketch.Name)
+${sketchInspectionPython('sketch')}
+closed_profiles_valid = inspection["geometryCount"] > 0 and inspection["closedContours"] > 0 and inspection["openContours"] == 0
+profiles_suitable = closed_profiles_valid and inspection["fullyConstrained"] and not inspection["solverErrors"] and inspection["constructionGeometryCount"] < inspection["geometryCount"]
+if not profiles_suitable:
+    raise ValueError("SKETCH_NOT_SUITABLE_FOR_POCKET: " + str(inspection))
+base_features = [item for item in body.Group if item != sketch and hasattr(item, "Shape") and not item.Shape.isNull() and len(item.Shape.Solids) == 1 and item.Shape.isValid()]
+if not base_features:
+    raise ValueError("POCKET_BASE_SOLID_NOT_FOUND: Body contains no valid solid before the Sketch")
+base_feature = base_features[-1]
+base_volume = float(base_feature.Shape.Volume)
+doc.openTransaction("cad_pocket")
+try:
+    pocket = body.newObject("PartDesign::Pocket", ${JSON.stringify(pocketName)})
+    pocket.Profile = sketch
+    available_types = list(pocket.getEnumerationsOfProperty("Type"))
+    ${pocketType === 'through_all' ? `through_all_type = next((candidate for candidate in available_types if candidate.replace(" ", "").replace("_", "").lower() == "throughall"), None)
+    if through_all_type is None:
+        raise RuntimeError("POCKET_TYPE_UNSUPPORTED: ThroughAll is unavailable")
+    pocket.Type = through_all_type` : `length_type = next((candidate for candidate in available_types if candidate.lower() == "length"), None)
+    if length_type is None:
+        raise RuntimeError("POCKET_TYPE_UNSUPPORTED: Length is unavailable")
+    pocket.Type = length_type
+    pocket.Length = ${length}`}
+    doc.recompute()
+    if hasattr(pocket, "Reversed") and not pocket.Shape.isNull() and float(pocket.Shape.Volume) >= base_volume - 1e-7:
+        pocket.Reversed = not bool(pocket.Reversed)
+        doc.recompute()
+    error_states = [str(state) for state in pocket.State if str(state) not in ("Up-to-date", "Touched")]
+    if error_states:
+        raise RuntimeError("POCKET_RECOMPUTE_FAILED: " + str(error_states))
+    if pocket.TypeId != "PartDesign::Pocket":
+        raise RuntimeError("POCKET_POSTCONDITION_FAILED: unexpected TypeId " + pocket.TypeId)
+    if pocket.getParentGeoFeatureGroup() != body or pocket not in body.Group or body.Tip != pocket:
+        raise RuntimeError("POCKET_POSTCONDITION_FAILED: Pocket is not the Body Tip")
+    profile_target = pocket.Profile[0] if isinstance(pocket.Profile, tuple) else pocket.Profile
+    if profile_target != sketch:
+        raise RuntimeError("POCKET_POSTCONDITION_FAILED: Profile mismatch")
+    shape = pocket.Shape
+    valid = not shape.isNull() and shape.isValid() and len(shape.Solids) == 1 and shape.Volume > 0
+    if not valid:
+        raise RuntimeError("POCKET_POSTCONDITION_FAILED: result is not one valid solid")
+    if float(shape.Volume) >= base_volume:
+        raise RuntimeError("POCKET_POSTCONDITION_FAILED: no material was removed")
+    bounds = shape.BoundBox
+    cylindrical_faces = sum(1 for face in shape.Faces if face.Surface.__class__.__name__ == "Cylinder")
+    doc.commitTransaction()
+    _mcp_result["result"] = {
+        "ok": True,
+        "document": doc.Name,
+        "body": doc.Name + "::" + body.Name,
+        "sketch": doc.Name + "::" + sketch.Name,
+        "pocket": doc.Name + "::" + pocket.Name,
+        "typeId": pocket.TypeId,
+        "type": ${JSON.stringify(pocketType)},
+        "length": ${length ?? 'None'},
+        "valid": bool(valid),
+        "error": None,
+        "solidCount": len(shape.Solids),
+        "volume": float(shape.Volume),
+        "removedVolume": base_volume - float(shape.Volume),
+        "cylindricalFaceCount": cylindrical_faces,
+        "boundingBox": {"xLength": float(bounds.XLength), "yLength": float(bounds.YLength), "zLength": float(bounds.ZLength)}
     }
 except Exception:
     doc.abortTransaction()
