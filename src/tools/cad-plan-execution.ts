@@ -146,7 +146,7 @@ def inspect_geometry(shape):
     def quantized(values, tolerance):
         return tuple(int(round(float(value) / tolerance)) for value in values)
 
-    bounds = shape.BoundBox
+    bounds = shape.optimalBoundingBox(False)
     planar = []
     cylindrical = []
     probe_span = max(float(bounds.XLength), float(bounds.YLength), float(bounds.ZLength), 1.0) * 2.0 + 2.0
@@ -154,7 +154,7 @@ def inspect_geometry(shape):
         surface = face.Surface
         surface_name = surface.__class__.__name__
         center = face.CenterOfMass
-        face_bounds = face.BoundBox
+        face_bounds = face.optimalBoundingBox(False)
         extent = {
             "min": [clean(face_bounds.XMin), clean(face_bounds.YMin), clean(face_bounds.ZMin)],
             "max": [clean(face_bounds.XMax), clean(face_bounds.YMax), clean(face_bounds.ZMax)],

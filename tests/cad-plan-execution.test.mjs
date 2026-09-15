@@ -493,6 +493,21 @@ for (const [direction, expectedX, expectedArea] of [
   });
 }
 
+test('arc profile Geometry Signature uses exact BREP bounds even when triangulation is cached', async () => {
+  const planned = { shape: 'profile', segments: roundedProfileSegments('ccw'), thickness: 10, unit: 'mm' };
+  const { bridge } = await validateAndCapture(planned, 'ArcProfileExactBounds');
+  const execution = executeFreeCad(mutateInspectedShape(bridge.commands[0], 'shape.tessellate(0.1)'));
+  assert.equal(execution.ok, true, execution.traceback);
+  assert.equal(execution.result.success, true, JSON.stringify(execution.result, null, 2));
+  assert.equal(execution.result.status, 'verified');
+  assert.deepEqual(execution.result.geometry_signature.bounding_box, { x: 100, y: 40, z: 10 });
+  const curvedSurface = execution.result.geometry_signature.surfaces.cylindrical.find(
+    (surface) => surface.surface_role === 'outer_profile' && Math.abs(surface.radius - 20) <= 1e-6,
+  );
+  assert.ok(curvedSurface, 'exact cylindrical BREP surface missing');
+  assert.deepEqual(curvedSurface.extent.size, [20, 40, 10]);
+});
+
 for (const [name, centers] of [
   ['one', [[20, 20]]],
   ['multiple', [[20, 20], [40, 60], [80, 20]]],
