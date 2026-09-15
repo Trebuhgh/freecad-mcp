@@ -427,14 +427,61 @@ for (const [name, profile, code] of [
   });
 }
 
-test('profile_pad followed by hole_pattern or finishing is explicitly unsupported', async () => {
+function profileHolePlan(centers, diameter = 6) {
+  return {
+    unit: 'mm', features: [
+      { id: 'base', type: 'profile_pad', points: lProfile, length: 10 },
+      { id: 'holes', type: 'hole_pattern', diameter, placement: { type: 'explicit', centers }, operation: 'through_all' },
+    ],
+  };
+}
+
+test('profile_pad accepts explicit holes and Simple Intent resolves identically', async () => {
+  const feature = (await validate(profileHolePlan([[20, 20], [40, 60], [80, 20]]))).result;
+  const simple = (await validate({ shape: 'profile', profile: lProfile, thickness: 10, unit: 'mm', holes: { diameter: 6, centers: [[20, 20], [40, 60], [80, 20]] } })).result;
+  assert.equal(feature.status, 'valid');
+  assert.equal(feature.can_execute, true);
+  assert.deepEqual(feature.resolved_plan.features[1], {
+    id: 'holes', type: 'hole_pattern', diameter: 6,
+    centers: [{ x: 20, y: 20 }, { x: 40, y: 60 }, { x: 80, y: 20 }], operation: 'through_all', after: 'base',
+  });
+  assert.deepEqual(simple.resolved_plan, feature.resolved_plan);
+});
+
+for (const [name, centers, code, expectedDetails] of [
+  ['center in bounding-box cutout', [[80, 60]], 'PROFILE_HOLE_OUTSIDE_MATERIAL', { holeIndex: 0, center: { x: 80, y: 60 }, radius: 3 }],
+  ['circle intersects outer boundary', [[2, 20]], 'PROFILE_HOLE_INTERSECTS_BOUNDARY', { holeIndex: 0, minimumBoundaryDistance: 2, radius: 3 }],
+  ['circle touches outer boundary', [[3, 20]], 'PROFILE_HOLE_INTERSECTS_BOUNDARY', { holeIndex: 0, minimumBoundaryDistance: 3, radius: 3 }],
+  ['circle crosses concave corner', [[58, 38]], 'PROFILE_HOLE_INTERSECTS_BOUNDARY', { holeIndex: 0, radius: 3 }],
+  ['center lies exactly on concave corner', [[60, 40]], 'PROFILE_HOLE_INTERSECTS_BOUNDARY', { holeIndex: 0, minimumBoundaryDistance: 0, radius: 3 }],
+  ['holes overlap', [[20, 20], [25, 20]], 'HOLES_OVERLAP', { firstHoleIndex: 0, secondHoleIndex: 1, centerDistance: 5 }],
+]) {
+  test(`profile hole validation rejects ${name}`, async () => {
+    const { result, bridge } = await validate(profileHolePlan(centers));
+    assert.equal(result.status, 'invalid');
+    assert.equal(result.can_execute, false);
+    const issue = result.issues.find((candidate) => candidate.code === code);
+    assert.ok(issue, code);
+    assert.equal(bridge.calls, 0);
+    for (const [key, expected] of Object.entries(expectedDetails)) assert.deepEqual(issue.details[key], expected);
+  });
+}
+
+test('profile_pad non-explicit placement, non-through operation, fillet, and chamfer remain explicitly unsupported', async () => {
   const plans = [
     {
       unit: 'mm', features: [
         { type: 'profile_pad', points: lProfile, length: 10 },
-        { type: 'hole_pattern', diameter: 6, placement: { type: 'explicit', centers: [{ x: 20, y: 20 }] } },
+        { type: 'hole_pattern', diameter: 6, placement: { type: 'rectangular_grid', origin: { x: 20, y: 20 }, columns: 2, rows: 1, spacing_x: 20, spacing_y: 20 } },
       ],
     },
+    {
+      unit: 'mm', features: [
+        { type: 'profile_pad', points: lProfile, length: 10 },
+        { type: 'hole_pattern', diameter: 6, placement: { type: 'explicit', centers: [[20, 20]] }, operation: 'length' },
+      ],
+    },
+    { shape: 'profile', profile: lProfile, thickness: 10, unit: 'mm', holes: { diameter: 6, edge_offset: 10, reference: 'center' } },
     { shape: 'profile', profile: lProfile, thickness: 10, unit: 'mm', fillet: { radius: 2, edges: 'all_vertical' } },
     { shape: 'profile', profile: lProfile, thickness: 10, unit: 'mm', chamfer: { size: 1, edges: 'all_top_outer' } },
   ];
@@ -442,7 +489,7 @@ test('profile_pad followed by hole_pattern or finishing is explicitly unsupporte
     const { result, bridge } = await validate(planValue);
     assert.equal(result.status, 'unsupported');
     assert.equal(result.can_execute, false);
-    assert.ok(result.issues.some((issue) => issue.code === 'PROFILE_PAD_HOLE_PATTERN_UNSUPPORTED' || issue.code === 'PROFILE_PAD_FINISHING_UNSUPPORTED'));
+    assert.ok(result.issues.some((issue) => ['PROFILE_PAD_HOLE_PLACEMENT_UNSUPPORTED', 'UNSUPPORTED_HOLE_OPERATION', 'PROFILE_PAD_FINISHING_UNSUPPORTED'].includes(issue.code)));
     assert.equal(bridge.calls, 0);
   }
 });

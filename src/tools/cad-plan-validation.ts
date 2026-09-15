@@ -8,6 +8,7 @@ interface PlanIssue {
   code: string;
   path: string;
   message: string;
+  details?: Record<string, unknown>;
   question?: string;
   options?: Array<{ id: string; value: string; label: string }>;
 }
@@ -101,13 +102,13 @@ export class CadPlanValidationGate {
 
 export const CAD_PLAN_TOOLS = [{
   name: 'cad_validate_plan',
-  description: 'Mandatory non-mutating validation gate. PREFERRED INPUT: Simple Intent Plan. Plate: {shape:"plate",size:[100,60,10],unit:"mm"}. Polygon profile: {shape:"profile",profile:[[0,0],[100,0],[100,40],[0,40]],thickness:10,unit:"mm"}. Holes and finishing currently require shape:"plate". Feature and legacy plans remain supported.',
+  description: 'Mandatory non-mutating validation gate. PREFERRED INPUT: Simple Intent Plan. Plate: {shape:"plate",size:[100,60,10],unit:"mm"}. Polygon profile: {shape:"profile",profile:[[0,0],[100,0],[100,40],[0,40]],thickness:10,unit:"mm"}. Explicit hole centers are supported on plate and profile; grid/edge-offset and finishing currently require plate. Feature and legacy plans remain supported.',
   inputSchema: {
     type: 'object' as const,
     properties: {
       plan: {
         type: 'object',
-        description: 'Prefer Simple Intent: shape:"plate" with size, or shape:"profile" with profile vertices and thickness. Holes/fillet/chamfer currently require plate. Ordered feature and legacy rectangular_plate plans remain supported.',
+        description: 'Prefer Simple Intent: shape:"plate" with size, or shape:"profile" with profile vertices and thickness. Explicit holes.centers works for both; grid/edge-offset holes and fillet/chamfer currently require plate. Ordered feature and legacy rectangular_plate plans remain supported.',
         properties: {
           shape: { type: ['string', 'null'], enum: ['plate', 'profile', null], description: 'Simple Intent shape: rectangular plate or straight-segment polygon profile.' },
           size: { type: ['array', 'null'], minItems: 3, maxItems: 3, items: { type: 'number' }, description: 'Simple plate [width,height,thickness].' },
@@ -134,7 +135,15 @@ export const CAD_PLAN_TOOLS = [{
                     type: { type: ['string', 'null'], enum: ['edge_offset', 'explicit', 'rectangular_grid', null] },
                     distance: { type: ['number', 'null'] },
                     reference: { type: ['string', 'null'], enum: ['center', 'boundary', null], description: 'Use null when center versus boundary is not explicit.' },
-                    centers: { type: ['array', 'null'], items: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'], additionalProperties: false } },
+                    centers: {
+                      type: ['array', 'null'],
+                      items: {
+                        oneOf: [
+                          { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'], additionalProperties: false },
+                          { type: 'array', minItems: 2, maxItems: 2, items: { type: 'number' } },
+                        ],
+                      },
+                    },
                     origin: { type: ['object', 'null'], properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'], additionalProperties: false },
                     columns: { type: ['integer', 'null'] },
                     rows: { type: ['integer', 'null'] },
@@ -147,6 +156,7 @@ export const CAD_PLAN_TOOLS = [{
                 edges: { type: ['string', 'null'], enum: ['all_vertical', 'all_top', 'all_bottom', 'all_top_outer', 'all_top_inner', 'all_bottom_outer', 'all_bottom_inner', null] },
                 after: { type: ['string', 'null'], description: 'Optional reference to an earlier feature ID.' },
                 target: { type: ['string', 'null'], description: 'Optional semantic target referencing an earlier feature ID.' },
+                operation: { type: ['string', 'null'], enum: ['through_all', null], description: 'Optional hole operation; currently only through_all.' },
               },
             },
           },
@@ -687,9 +697,54 @@ interface HoleResolution {
   ambiguityDistance?: number;
 }
 
-function resolveHolePattern(feature: Record<string, unknown>, path: string, width: unknown, height: unknown): HoleResolution {
+function pointToSegmentDistance(point: Point2D, start: PolygonPoint, end: PolygonPoint): number {
+  const dx = end[0] - start[0];
+  const dy = end[1] - start[1];
+  const squaredLength = dx * dx + dy * dy;
+  if (squaredLength <= LINEAR_TOLERANCE_MM * LINEAR_TOLERANCE_MM) return Math.hypot(point.x - start[0], point.y - start[1]);
+  const projection = Math.max(0, Math.min(1, ((point.x - start[0]) * dx + (point.y - start[1]) * dy) / squaredLength));
+  return Math.hypot(point.x - (start[0] + projection * dx), point.y - (start[1] + projection * dy));
+}
+
+function pointInPolygon(point: Point2D, polygon: PolygonPoint[]): boolean {
+  let inside = false;
+  for (let index = 0; index < polygon.length; index += 1) {
+    const [ax, ay] = polygon[index];
+    const [bx, by] = polygon[(index + 1) % polygon.length];
+    // Half-open ray crossing counts shared vertices once; horizontal edges do not cross.
+    if ((ay > point.y) !== (by > point.y) && point.x < ax + ((point.y - ay) * (bx - ax)) / (by - ay)) inside = !inside;
+  }
+  return inside;
+}
+
+function validateCircleInsideProfile(
+  center: Point2D, radius: number, polygon: PolygonPoint[], path: string, holeIndex: number, diameter: number, issues: InternalIssue[],
+): void {
+  const minimumClearance = polygon.reduce(
+    (minimum, start, index) => Math.min(minimum, pointToSegmentDistance(center, start, polygon[(index + 1) % polygon.length])),
+    Infinity,
+  );
+  const details = {
+    holeIndex,
+    center: { x: center.x, y: center.y },
+    diameter,
+    radius,
+    minimumBoundaryDistance: minimumClearance,
+    requiredBoundaryDistanceExclusive: radius + LINEAR_TOLERANCE_MM,
+  };
+  if (!pointInPolygon(center, polygon) && minimumClearance > LINEAR_TOLERANCE_MM) {
+    issues.push({ kind: 'invalid', code: 'PROFILE_HOLE_OUTSIDE_MATERIAL', path, message: 'Hole center is outside the polygon material.', details });
+  } else if (minimumClearance <= radius + LINEAR_TOLERANCE_MM) {
+    issues.push({ kind: 'invalid', code: 'PROFILE_HOLE_INTERSECTS_BOUNDARY', path, message: 'Hole circle intersects, touches, or is within tolerance of the polygon boundary.', details });
+  }
+}
+
+function resolveHolePattern(feature: Record<string, unknown>, path: string, width: unknown, height: unknown, polygon?: PolygonPoint[]): HoleResolution {
   const issues: InternalIssue[] = [];
   const diameter = positiveNumber(feature, 'diameter', `${path}.diameter`, 'Hole diameter', issues);
+  if (feature.operation !== undefined && feature.operation !== null && feature.operation !== 'through_all') {
+    issues.push({ kind: 'unsupported', code: 'UNSUPPORTED_HOLE_OPERATION', path: `${path}.operation`, message: 'Only through_all hole patterns are supported.' });
+  }
   const countValue = feature.count;
   let requestedCount: number | undefined;
   if (countValue !== undefined && countValue !== null) {
@@ -701,7 +756,9 @@ function resolveHolePattern(feature: Record<string, unknown>, path: string, widt
   let ambiguityDistance: number | undefined;
   if (placement === undefined || placement === null) addMissing(issues, `${path}.placement`, 'Hole placement');
   else if (!isRecord(placement)) issues.push({ kind: 'invalid', code: 'INVALID_PLACEMENT', path: `${path}.placement`, message: 'Hole placement must be an object.' });
-  else if (placement.type === 'edge_offset') {
+  else if (polygon !== undefined && placement.type !== undefined && placement.type !== null && placement.type !== 'explicit') {
+    issues.push({ kind: 'unsupported', code: 'PROFILE_PAD_HOLE_PLACEMENT_UNSUPPORTED', path: `${path}.placement.type`, message: 'Only explicit hole centers are supported on profile_pad.' });
+  } else if (placement.type === 'edge_offset') {
     const distance = positiveNumber(placement, 'distance', `${path}.placement.distance`, 'Edge distance', issues);
     let reference: 'center' | 'boundary' | undefined;
     if (placement.reference === undefined) addMissing(issues, `${path}.placement.reference`, 'Distance reference');
@@ -720,8 +777,9 @@ function resolveHolePattern(feature: Record<string, unknown>, path: string, widt
     else {
       const parsed: Point2D[] = [];
       placement.centers.forEach((center, index) => {
-        if (!isRecord(center) || typeof center.x !== 'number' || !Number.isFinite(center.x) || typeof center.y !== 'number' || !Number.isFinite(center.y)) issues.push({ kind: 'invalid', code: 'INVALID_HOLE_CENTER', path: `${path}.placement.centers.${index}`, message: 'Each center requires finite x and y coordinates.' });
-        else parsed.push({ x: center.x, y: center.y });
+        if (Array.isArray(center) && center.length === 2 && center.every((coordinate) => typeof coordinate === 'number' && Number.isFinite(coordinate))) parsed.push({ x: center[0] as number, y: center[1] as number });
+        else if (isRecord(center) && typeof center.x === 'number' && Number.isFinite(center.x) && typeof center.y === 'number' && Number.isFinite(center.y)) parsed.push({ x: center.x, y: center.y });
+        else issues.push({ kind: 'invalid', code: 'INVALID_HOLE_CENTER', path: `${path}.placement.centers.${index}`, message: 'Each center requires finite x and y coordinates as [x,y] or {x,y}.' });
       });
       if (parsed.length === placement.centers.length) centers = parsed;
     }
@@ -750,12 +808,17 @@ function resolveHolePattern(feature: Record<string, unknown>, path: string, widt
   else issues.push({ kind: 'unsupported', code: 'UNSUPPORTED_PLACEMENT', path: `${path}.placement.type`, message: `Placement type "${String(placement.type)}" is not supported.` });
 
   if (centers !== undefined && requestedCount !== undefined && requestedCount !== centers.length) issues.push({ kind: 'invalid', code: 'HOLE_COUNT_MISMATCH', path: `${path}.count`, message: `count ${requestedCount} does not match ${centers.length} resolved centers.` });
-  if (centers !== undefined && diameter !== undefined && typeof width === 'number' && typeof height === 'number') {
+  if (centers !== undefined && diameter !== undefined) {
     const radius = diameter / 2;
-    if (!centers.every((center) => radius <= center.x && center.x <= width - radius && radius <= center.y && center.y <= height - radius)) issues.push({ kind: 'invalid', code: 'HOLE_OUTSIDE_BASE', path: `${path}.placement`, message: 'At least one hole is not completely inside the rectangular base.' });
+    if (polygon !== undefined) {
+      centers.forEach((center, index) => validateCircleInsideProfile(center, radius, polygon, `${path}.placement.centers.${index}`, index, diameter, issues));
+    } else if (typeof width === 'number' && typeof height === 'number') {
+      if (!centers.every((center) => radius <= center.x && center.x <= width - radius && radius <= center.y && center.y <= height - radius)) issues.push({ kind: 'invalid', code: 'HOLE_OUTSIDE_BASE', path: `${path}.placement`, message: 'At least one hole is not completely inside the rectangular base.' });
+    }
     for (let first = 0; first < centers.length; first += 1) for (let second = first + 1; second < centers.length; second += 1) {
-      if (Math.hypot(centers[first].x - centers[second].x, centers[first].y - centers[second].y) <= diameter) {
-        issues.push({ kind: 'invalid', code: 'HOLES_OVERLAP', path: `${path}.placement`, message: 'Hole profiles overlap or touch.' });
+      const centerDistance = Math.hypot(centers[first].x - centers[second].x, centers[first].y - centers[second].y);
+      if (centerDistance <= diameter + (polygon === undefined ? 0 : LINEAR_TOLERANCE_MM)) {
+        issues.push({ kind: 'invalid', code: 'HOLES_OVERLAP', path: `${path}.placement`, message: 'Hole profiles overlap, touch, or are within tolerance.', details: { firstHoleIndex: first, secondHoleIndex: second, firstCenter: centers[first], secondCenter: centers[second], diameter, centerDistance, requiredCenterDistanceExclusive: diameter + (polygon === undefined ? 0 : LINEAR_TOLERANCE_MM) } });
         first = centers.length;
         break;
       }
@@ -829,9 +892,8 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
   const profileFeature = normalized.features.find((feature) => feature.type === 'profile_pad');
   if (profileFeature !== undefined) {
     normalized.features.forEach((feature, index) => {
-      if (feature === profileFeature) return;
-      const code = feature.type === 'hole_pattern' ? 'PROFILE_PAD_HOLE_PATTERN_UNSUPPORTED' : 'PROFILE_PAD_FINISHING_UNSUPPORTED';
-      structuralIssues.push({ kind: 'unsupported', code, path: normalized.paths[index], message: `${String(feature.type)} is not yet supported after profile_pad.` });
+      if (feature === profileFeature || feature.type === 'hole_pattern') return;
+      structuralIssues.push({ kind: 'unsupported', code: 'PROFILE_PAD_FINISHING_UNSUPPORTED', path: normalized.paths[index], message: `${String(feature.type)} is not yet supported after profile_pad.` });
     });
     const profileIndex = normalized.features.indexOf(profileFeature);
     const profilePath = normalized.paths[profileIndex];
@@ -846,15 +908,34 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
     if (normalized.unit === undefined || normalized.unit === null || normalized.unit === '') addMissing(structuralIssues, 'unit', 'Unit');
     else if (typeof normalized.unit !== 'string') structuralIssues.push({ kind: 'invalid', code: 'INVALID_UNIT', path: 'unit', message: 'Unit must be a string.' });
     else if (normalized.unit !== 'mm') structuralIssues.push({ kind: 'unsupported', code: 'UNSUPPORTED_UNIT', path: 'unit', message: `Unit "${normalized.unit}" is not supported; use mm.` });
-    if (structuralIssues.length > 0 || profileValidation.points === undefined || profileValidation.length === undefined) {
+    const holeFeature = normalized.features.find((feature) => feature.type === 'hole_pattern');
+    const holePath = holeFeature === undefined ? undefined : normalized.paths[normalized.features.indexOf(holeFeature)];
+    const holeResolution = holeFeature === undefined || holePath === undefined || profileValidation.points === undefined
+      ? undefined
+      : resolveHolePattern(holeFeature, holePath, undefined, undefined, profileValidation.points);
+    if (holeResolution !== undefined) structuralIssues.push(...holeResolution.issues);
+    if (structuralIssues.length > 0 || profileValidation.points === undefined || profileValidation.length === undefined
+      || (holeFeature !== undefined && (holeResolution?.centers === undefined || holeResolution.diameter === undefined))) {
       const status = statusFor(structuralIssues);
       return { status, can_execute: false, issues: structuralIssues.map(({ kind: _kind, ...issue }) => issue) };
+    }
+    const resolvedFeatures: Record<string, unknown>[] = [{ id: profileFeature.id, type: 'profile_pad', points: profileValidation.points, length: profileValidation.length }];
+    if (holeFeature !== undefined && holeResolution !== undefined) {
+      resolvedFeatures.push({
+        id: holeFeature.id,
+        type: 'hole_pattern',
+        diameter: holeResolution.diameter,
+        centers: holeResolution.centers,
+        operation: 'through_all',
+        ...(typeof holeFeature.after === 'string' ? { after: holeFeature.after } : {}),
+        ...(typeof holeFeature.target === 'string' ? { target: holeFeature.target } : {}),
+      });
     }
     return {
       status: 'valid',
       can_execute: true,
       issues: [],
-      resolved_plan: { unit: 'mm', features: [{ id: profileFeature.id, type: 'profile_pad', points: profileValidation.points, length: profileValidation.length }] },
+      resolved_plan: { unit: 'mm', features: resolvedFeatures },
     };
   }
 

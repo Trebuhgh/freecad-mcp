@@ -10,6 +10,7 @@ import { CadPlanValidationGate } from '../dist/tools/cad-plan-validation.js';
 
 const freecadPython = process.env.FREECAD_PYTHON || 'C:\\Program Files\\FreeCAD 1.1\\bin\\python.exe';
 const base = { type: 'rectangular_plate', width: 100, height: 60, thickness: 10, unit: 'mm' };
+const lProfile = [[0, 0], [100, 0], [100, 40], [60, 40], [60, 80], [0, 80]];
 
 function plan(reference, operations = {}) {
   return {
@@ -422,7 +423,7 @@ test('geometry signature is deterministic and contains no topological index iden
 });
 
 for (const [name, profile, expectedBounds, expectedArea] of [
-  ['L', [[0, 0], [100, 0], [100, 40], [60, 40], [60, 80], [0, 80]], { x: 100, y: 80, z: 10 }, 6400],
+  ['L', lProfile, { x: 100, y: 80, z: 10 }, 6400],
   ['U', [[0, 0], [100, 0], [100, 80], [70, 80], [70, 30], [30, 30], [30, 80], [0, 80]], { x: 100, y: 80, z: 10 }, 6000],
 ]) {
   test(`${name}-profile executes as a fully constrained profile_pad and verifies geometry`, async () => {
@@ -444,6 +445,64 @@ for (const [name, profile, expectedBounds, expectedArea] of [
     assert.deepEqual(profileVerification.volume, { expected: expectedArea * 10, actual: expectedArea * 10, passed: true });
   });
 }
+
+for (const [name, centers] of [
+  ['one', [[20, 20]]],
+  ['multiple', [[20, 20], [40, 60], [80, 20]]],
+]) {
+  test(`profile_pad executes ${name} explicit through hole pattern and verifies actual geometry`, async () => {
+    const planned = {
+      unit: 'mm',
+      features: [
+        { id: 'base', type: 'profile_pad', points: lProfile, length: 10 },
+        { id: 'holes', type: 'hole_pattern', diameter: 6, placement: { type: 'explicit', centers }, operation: 'through_all' },
+      ],
+    };
+    const expectedCenters = centers.map(([x, y]) => ({ x, y }));
+    const { bridge, validation } = await validateAndCapture(planned, `ProfileHoles_${name}`);
+    assert.deepEqual(validation.resolved_plan.features[1].centers, expectedCenters);
+    assert.equal(validation.resolved_plan.features[1].operation, 'through_all');
+    assert.doesNotMatch(bridge.commands[0], /"placement"|"explicit"/);
+
+    const execution = executeFreeCad(bridge.commands[0]);
+    assert.equal(execution.ok, true, execution.traceback);
+    assert.equal(execution.result.success, true, JSON.stringify(execution.result, null, 2));
+    assert.equal(execution.result.status, 'verified');
+    assert.equal(execution.result.features[1].object_type, 'PartDesign::Pocket');
+    assert.equal(execution.result.features[1].through_all, true);
+    assert.equal(execution.result.features[1].verified_holes, centers.length);
+    assert.equal(execution.result.solidCount, 1);
+    assert.deepEqual(execution.result.verification.recomputeErrors, []);
+    assert.deepEqual(execution.result.verification.verifiedHoleCenters, expectedCenters);
+
+    const expectedVolume = 64000 - centers.length * Math.PI * 3 ** 2 * 10;
+    assert.ok(Math.abs(execution.result.geometry_signature.volume - expectedVolume) <= 1e-6);
+    const cylinders = execution.result.geometry_signature.surfaces.cylindrical.filter(
+      (surface) => surface.axis_material_length <= 1e-6 && Math.abs(surface.radius - 3) <= 1e-6,
+    );
+    assert.equal(cylinders.length, centers.length);
+    assert.deepEqual(cylinders.map((surface) => surface.axis_point.slice(0, 2)), centers);
+    assert.ok(execution.result.verification.features.every((feature) => feature.passed));
+  });
+}
+
+test('profile hole SOLL/IST verification independently rejects a filled actual hole', async () => {
+  const planned = {
+    shape: 'profile', profile: lProfile, thickness: 10, unit: 'mm',
+    holes: { diameter: 6, centers: [[20, 20]] },
+  };
+  const { bridge } = await validateAndCapture(planned, 'ProfileHoleSignatureMismatch');
+  const mutation = 'shape = shape.fuse(Part.makeCylinder(3.0, 10.0, FreeCAD.Vector(20.0, 20.0, 0.0)))';
+  const execution = executeFreeCad(mutateInspectedShape(bridge.commands[0], mutation), true);
+  assert.equal(execution.ok, true, execution.traceback);
+  assert.equal(execution.result.success, false);
+  assert.equal(execution.result.status, 'verification_failed');
+  assert.equal(execution.result.code, 'CAD_VERIFICATION_FAILED');
+  assert.equal(execution.result.geometry_signature.surfaces.cylindrical.length, 0);
+  const issue = execution.result.issues.find((candidate) => candidate.check === 'hole_count');
+  assert.ok(issue, 'hole_count issue missing');
+  assert.deepEqual({ expected: issue.expected, actual: issue.actual }, { expected: 1, actual: 0 });
+});
 
 for (const scenario of [
   {

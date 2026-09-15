@@ -22,6 +22,7 @@ function executionPython(plan: Record<string, unknown>, revision: number, reques
 import FreeCAD
 import Part
 import Sketcher
+import math
 plan = ${JSON.stringify(plan)}
 plan_revision = ${revision}
 LINEAR_TOLERANCE_MM = ${LINEAR_TOLERANCE_MM}
@@ -297,7 +298,7 @@ try:
             if body.Tip != pocket or pocket.Shape.isNull() or not pocket.Shape.isValid() or len(pocket.Shape.Solids) != 1 or float(pocket.Shape.Volume) >= source_volume:
                 raise RuntimeError("POCKET_POSTCONDITION_FAILED")
             expected_holes.append({"id": feature_id, "diameter": diameter, "centers": centers})
-            feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pocket.Name, "verified_holes": len(centers), "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(hole_sketch.DoF), "source_volume": source_volume, "result_volume": float(pocket.Shape.Volume), "through_all": True})
+            feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pocket.Name, "object_type": pocket.TypeId, "verified_holes": len(centers), "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(hole_sketch.DoF), "source_volume": source_volume, "result_volume": float(pocket.Shape.Volume), "through_all": True})
         elif feature_type in ("fillet", "chamfer"):
             source = body.Tip
             source_volume = float(source.Shape.Volume)
@@ -391,7 +392,8 @@ try:
             entry["solid_created"] = bool(feature_result.get("solid_valid"))
             entry["passed"] = entry["sketch_closed"] and entry["sketch_fully_constrained"] and entry["sketch_degrees_of_freedom"] == 0 and entry["solid_created"]
             if feature_type == "profile_pad":
-                expected_volume = expected_profile_area * length
+                expected_hole_volume = sum(len(item["centers"]) * math.pi * (float(item["diameter"]) / 2.0) ** 2 * length for item in features if item["type"] == "hole_pattern")
+                expected_volume = expected_profile_area * length - expected_hole_volume
                 actual_volume = geometry_signature["volume"]
                 volume_passed = abs(float(actual_volume) - float(expected_volume)) <= VOLUME_TOLERANCE_MM3
                 entry["segment_count"] = {"expected": len(profile_points), "actual": feature_result.get("segment_count"), "passed": feature_result.get("segment_count") == len(profile_points)}
@@ -399,7 +401,7 @@ try:
                 entry["volume"] = {"expected": expected_volume, "actual": actual_volume, "passed": volume_passed}
                 entry["passed"] = entry["passed"] and entry["segment_count"]["passed"] and entry["extrusion_height"]["passed"] and volume_passed
                 if not volume_passed:
-                    add_issue(feature_id, feature_type, "volume", expected_volume, actual_volume, "The actual volume does not equal polygon area multiplied by extrusion length.")
+                    add_issue(feature_id, feature_type, "volume", expected_volume, actual_volume, "The actual volume does not equal the extruded polygon volume minus the resolved through-hole volumes.")
                 if not entry["extrusion_height"]["passed"]:
                     add_issue(feature_id, feature_type, "extrusion_height", length, geometry_signature["bounding_box"]["z"], "The actual extrusion height does not match profile_pad.length.")
             if not entry["passed"]:
