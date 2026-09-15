@@ -75,6 +75,8 @@ test('public schemas expose neither GeometryIndex nor PointPos', () => {
       'cad_pad',
       'cad_create_hole_sketch',
       'cad_pocket',
+      'cad_fillet',
+      'cad_chamfer',
     ],
   );
 });
@@ -94,6 +96,7 @@ test('FreeCAD integration: 100 x 60 x 10 plate receives four through holes with 
   const bridge = new CapturingBridge([
     { documentId: 'Part100x60', bodyId: 'Part100x60::Body' },
     { sketchId: 'Part100x60::Sketch' },
+    {},
     {},
     {},
     {},
@@ -123,10 +126,13 @@ test('FreeCAD integration: 100 x 60 x 10 plate receives four through holes with 
   await handleHighLevelCadTool('cad_pocket', {
     sketch: 'Part100x60::HoleSketch', type: 'through_all',
   }, bridge);
+  await handleHighLevelCadTool('cad_fillet', {
+    body: 'Part100x60::Body', radius: 2, edges: 'all_vertical',
+  }, bridge);
 
   const execution = runFreeCadScript(bridge.commands);
   assert.equal(execution.ok, true, execution.traceback);
-  const [part, sketch, rectangle, inspection, validation, pad, holeSketch, pocket] = execution.results;
+  const [part, sketch, rectangle, inspection, validation, pad, holeSketch, pocket, fillet] = execution.results;
 
   assert.equal(part.bodyCount, 1);
   assert.equal(part.documentId, 'Part100x60');
@@ -194,6 +200,17 @@ test('FreeCAD integration: 100 x 60 x 10 plate receives four through holes with 
   assert.ok(Math.abs(pocket.boundingBox.yLength - 60) < 1e-7);
   assert.ok(Math.abs(pocket.boundingBox.zLength - 10) < 1e-7);
   assert.ok(Math.abs(pocket.volume - expectedVolume) < 1e-4);
+
+  assert.equal(fillet.typeId, 'PartDesign::Fillet');
+  assert.equal(fillet.feature, 'Part100x60::Fillet');
+  assert.equal(fillet.sourceFeature, 'Part100x60::Pocket');
+  assert.equal(fillet.radius, 2);
+  assert.equal(fillet.valid, true);
+  assert.equal(fillet.solidCount, 1);
+  assert.equal(fillet.error, null);
+  assert.equal(fillet.selectedEdges.length, 4);
+  assert.ok(fillet.selectedEdges.every((edge) => edge.direction.z > 0.999999));
+  assert.notEqual(fillet.volume, fillet.sourceVolume);
 });
 
 test('cad_pad rejects non-positive length before FreeCAD mutation', async () => {
@@ -239,4 +256,91 @@ test('cad_pocket fails cleanly when its Body has no base solid', async () => {
   assert.equal(execution.ok, false);
   assert.match(execution.error, /POCKET_BASE_SOLID_NOT_FOUND/);
   assert.deepEqual(execution.objects.NoSolidPart.filter((object) => object.typeId === 'PartDesign::Pocket'), []);
+});
+
+test('cad_chamfer geometrically selects one outer edge on a plate with four holes', async () => {
+  const bridge = new CapturingBridge([{}, {}, {}, {}, {}, {}, {}]);
+  await handleHighLevelCadTool('cad_create_part', { name: 'ChamferPart' }, bridge);
+  await handleHighLevelCadTool('cad_create_sketch', { body: 'ChamferPart::Body', plane: 'XY' }, bridge);
+  await handleHighLevelCadTool('cad_sketch_rectangle', {
+    sketch: 'ChamferPart::Sketch', x: 0, y: 0, width: 100, height: 60,
+  }, bridge);
+  await handleHighLevelCadTool('cad_pad', { sketch: 'ChamferPart::Sketch', length: 10 }, bridge);
+  await handleHighLevelCadTool('cad_create_hole_sketch', {
+    body: 'ChamferPart::Body', holes: [
+      { x: 10, y: 10, diameter: 8 }, { x: 90, y: 10, diameter: 8 },
+      { x: 10, y: 50, diameter: 8 }, { x: 90, y: 50, diameter: 8 },
+    ],
+  }, bridge);
+  await handleHighLevelCadTool('cad_pocket', { sketch: 'ChamferPart::HoleSketch' }, bridge);
+  await handleHighLevelCadTool('cad_chamfer', {
+    body: 'ChamferPart::Body',
+    size: 2,
+    edges: { direction: 'x', length: 100, location: { y: 0, z: 0 }, count: 1 },
+  }, bridge);
+
+  const execution = runFreeCadScript(bridge.commands);
+  assert.equal(execution.ok, true, execution.traceback);
+  const chamfer = execution.results.at(-1);
+  assert.equal(chamfer.typeId, 'PartDesign::Chamfer');
+  assert.equal(chamfer.feature, 'ChamferPart::Chamfer');
+  assert.equal(chamfer.sourceFeature, 'ChamferPart::Pocket');
+  assert.equal(chamfer.size, 2);
+  assert.equal(chamfer.valid, true);
+  assert.equal(chamfer.solidCount, 1);
+  assert.equal(chamfer.error, null);
+  assert.equal(chamfer.selectedEdges.length, 1);
+  assert.ok(chamfer.selectedEdges[0].direction.x > 0.999999);
+  assert.ok(Math.abs(chamfer.selectedEdges[0].length - 100) < 1e-7);
+  assert.notEqual(chamfer.volume, chamfer.sourceVolume);
+});
+
+test('fillet and chamfer dimensions are rejected before FreeCAD mutation', async () => {
+  for (const [tool, field] of [['cad_fillet', 'radius'], ['cad_chamfer', 'size']]) {
+    for (const value of [0, -1]) {
+      const bridge = new CapturingBridge([]);
+      await assert.rejects(
+        handleHighLevelCadTool(tool, { body: 'Part::Body', [field]: value, edges: 'all_vertical' }, bridge),
+        new RegExp(`Invalid ${field}`),
+      );
+      assert.equal(bridge.commands.length, 0);
+    }
+  }
+});
+
+async function createPlainPlateCommands(document, operation, operationArgs) {
+  const bridge = new CapturingBridge([{}, {}, {}, {}, {}]);
+  await handleHighLevelCadTool('cad_create_part', { name: document }, bridge);
+  await handleHighLevelCadTool('cad_create_sketch', { body: `${document}::Body` }, bridge);
+  await handleHighLevelCadTool('cad_sketch_rectangle', {
+    sketch: `${document}::Sketch`, x: 0, y: 0, width: 100, height: 60,
+  }, bridge);
+  await handleHighLevelCadTool('cad_pad', { sketch: `${document}::Sketch`, length: 10 }, bridge);
+  await handleHighLevelCadTool(operation, { body: `${document}::Body`, ...operationArgs }, bridge);
+  return bridge.commands;
+}
+
+test('edge selection and oversized feature failures leave no broken feature', async () => {
+  const cases = [
+    ['NoMatchingEdge', 'cad_fillet', { radius: 2, edges: { length: 123.456 } }, 'EDGE_SELECTION_COUNT_MISMATCH', 'PartDesign::Fillet'],
+    ['HugeFillet', 'cad_fillet', { radius: 1000, edges: 'all_vertical' }, 'FILLET_', 'PartDesign::Fillet'],
+    ['HugeChamfer', 'cad_chamfer', { size: 1000, edges: { direction: 'x', length: 100, location: { y: 0, z: 0 } } }, 'CHAMFER_', 'PartDesign::Chamfer'],
+  ];
+  for (const [document, operation, operationArgs, expectedError, featureType] of cases) {
+    const commands = await createPlainPlateCommands(document, operation, operationArgs);
+    const execution = runFreeCadScript(commands, true);
+    assert.equal(execution.ok, false);
+    assert.match(execution.error, new RegExp(expectedError));
+    assert.deepEqual(execution.objects[document].filter((object) => object.typeId === featureType), []);
+  }
+});
+
+test('invalid Body fails without creating a feature', async () => {
+  const bridge = new CapturingBridge([{}]);
+  await handleHighLevelCadTool('cad_fillet', {
+    body: 'MissingDocument::Body', radius: 2, edges: 'all_vertical',
+  }, bridge);
+  const execution = runFreeCadScript(bridge.commands, true);
+  assert.equal(execution.ok, false);
+  assert.match(execution.error, /MissingDocument/);
 });

@@ -131,7 +131,93 @@ export const HIGH_LEVEL_CAD_TOOLS = [
       required: ['sketch'],
     },
   },
+  {
+    name: 'cad_fillet',
+    description: 'Create a validated PartDesign Fillet on semantically or geometrically selected edges of the current Body Tip.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        body: { type: 'string', description: 'Qualified Body ID, for example Part::Body' },
+        radius: { type: 'number', exclusiveMinimum: 0, description: 'Fillet radius in mm' },
+        edges: {
+          description: 'Semantic selector or geometric edge query',
+          oneOf: [
+            { type: 'string', enum: ['all_vertical', 'all_top', 'all_bottom'] },
+            {
+              type: 'object',
+              properties: {
+                direction: { type: 'string', enum: ['x', 'y', 'z'], description: 'Select straight edges parallel to this global axis' },
+                length: { type: 'number', exclusiveMinimum: 0, description: 'Required edge length in mm' },
+                location: {
+                  type: 'object',
+                  properties: {
+                    x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
+                  },
+                  additionalProperties: false,
+                },
+                tolerance: { type: 'number', exclusiveMinimum: 0, description: 'Length/location tolerance in mm (default: 0.00001)' },
+                count: { type: 'integer', minimum: 1, description: 'Expected number of matches (default: 1)' },
+              },
+              additionalProperties: false,
+            },
+          ],
+        },
+        name: { type: 'string', description: 'Internal feature name (default: Fillet)' },
+      },
+      additionalProperties: false,
+      required: ['body', 'radius', 'edges'],
+    },
+  },
+  {
+    name: 'cad_chamfer',
+    description: 'Create a validated PartDesign Chamfer on semantically or geometrically selected edges of the current Body Tip.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        body: { type: 'string', description: 'Qualified Body ID, for example Part::Body' },
+        size: { type: 'number', exclusiveMinimum: 0, description: 'Chamfer size in mm' },
+        edges: {
+          description: 'Semantic selector or geometric edge query',
+          oneOf: [
+            { type: 'string', enum: ['all_vertical', 'all_top', 'all_bottom'] },
+            {
+              type: 'object',
+              properties: {
+                direction: { type: 'string', enum: ['x', 'y', 'z'] },
+                length: { type: 'number', exclusiveMinimum: 0 },
+                location: {
+                  type: 'object',
+                  properties: {
+                    x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
+                  },
+                  additionalProperties: false,
+                },
+                tolerance: { type: 'number', exclusiveMinimum: 0, description: 'Length/location tolerance in mm (default: 0.00001)' },
+                count: { type: 'integer', minimum: 1, description: 'Expected number of matches (default: 1)' },
+              },
+              additionalProperties: false,
+            },
+          ],
+        },
+        name: { type: 'string', description: 'Internal feature name (default: Chamfer)' },
+      },
+      additionalProperties: false,
+      required: ['body', 'size', 'edges'],
+    },
+  },
 ];
+
+type EdgeSelection =
+  | 'all_vertical'
+  | 'all_top'
+  | 'all_bottom'
+  | {
+      direction?: 'x' | 'y' | 'z';
+      length?: number;
+      location?: { x?: number; y?: number; z?: number };
+      tolerance: number;
+      count: number;
+    };
 
 function assertAllowedKeys(args: ToolArgs, allowed: string[]): void {
   const unexpected = Object.keys(args).filter((key) => !allowed.includes(key));
@@ -248,6 +334,131 @@ function validateSupport(value: unknown): string | undefined {
     throw new Error('Invalid support: expected "top", "bottom", or Document::Object::FaceN');
   }
   return value;
+}
+
+function validateEdgeSelection(value: unknown): EdgeSelection {
+  if (value === 'all_vertical' || value === 'all_top' || value === 'all_bottom') {
+    return value;
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Invalid edges: expected a semantic selector or geometric query');
+  }
+  const record = value as Record<string, unknown>;
+  const unexpected = Object.keys(record).filter((key) => !['direction', 'length', 'location', 'tolerance', 'count'].includes(key));
+  if (unexpected.length > 0) {
+    throw new Error(`Unexpected edges argument(s): ${unexpected.join(', ')}`);
+  }
+  let direction: 'x' | 'y' | 'z' | undefined;
+  if (record.direction !== undefined) {
+    if (record.direction !== 'x' && record.direction !== 'y' && record.direction !== 'z') {
+      throw new Error('Invalid edges.direction: expected x, y, or z');
+    }
+    direction = record.direction;
+  }
+  const length = record.length === undefined ? undefined : validatePositiveDimension(record.length, 'edges.length');
+  let location: { x?: number; y?: number; z?: number } | undefined;
+  if (record.location !== undefined) {
+    if (typeof record.location !== 'object' || record.location === null || Array.isArray(record.location)) {
+      throw new Error('Invalid edges.location: expected an object');
+    }
+    const locationRecord = record.location as Record<string, unknown>;
+    const unexpectedLocation = Object.keys(locationRecord).filter((key) => !['x', 'y', 'z'].includes(key));
+    if (unexpectedLocation.length > 0) {
+      throw new Error(`Unexpected edges.location argument(s): ${unexpectedLocation.join(', ')}`);
+    }
+    if (Object.keys(locationRecord).length === 0) {
+      throw new Error('Invalid edges.location: specify at least one coordinate');
+    }
+    location = {};
+    if (locationRecord.x !== undefined) location.x = validateFiniteNumber(locationRecord.x, 'edges.location.x');
+    if (locationRecord.y !== undefined) location.y = validateFiniteNumber(locationRecord.y, 'edges.location.y');
+    if (locationRecord.z !== undefined) location.z = validateFiniteNumber(locationRecord.z, 'edges.location.z');
+  }
+  if (direction === undefined && length === undefined && location === undefined) {
+    throw new Error('Invalid edges: geometric query requires direction, length, or location');
+  }
+  const tolerance = record.tolerance === undefined ? 1e-5 : validatePositiveDimension(record.tolerance, 'edges.tolerance');
+  const countValue = record.count === undefined ? 1 : record.count;
+  if (typeof countValue !== 'number' || !Number.isInteger(countValue) || countValue < 1 || countValue > 1000) {
+    throw new Error('Invalid edges.count: expected an integer from 1 to 1000');
+  }
+  return { direction, length, location, tolerance, count: countValue };
+}
+
+function edgeSelectionPython(selection: EdgeSelection): string {
+  const serialized = JSON.stringify(selection);
+  return `
+selection = ${serialized}
+source = body.Tip
+if source is None or not hasattr(source, "Shape") or source.Shape.isNull():
+    raise ValueError("BODY_TIP_SOLID_NOT_FOUND: Body Tip has no Shape")
+if not source.Shape.isValid() or len(source.Shape.Solids) != 1:
+    raise ValueError("BODY_TIP_INVALID: expected exactly one valid solid")
+source_shape = source.Shape
+source_volume = float(source_shape.Volume)
+source_bounds = source_shape.BoundBox
+edge_candidates = []
+for edge_index, edge in enumerate(source_shape.Edges, start=1):
+    center = edge.CenterOfMass
+    vertices = edge.Vertexes
+    is_line = edge.Curve.__class__.__name__ == "Line" and len(vertices) >= 2
+    direction = None
+    if is_line:
+        delta = vertices[-1].Point.sub(vertices[0].Point)
+        if delta.Length > 1e-12:
+            direction = (abs(delta.x / delta.Length), abs(delta.y / delta.Length), abs(delta.z / delta.Length))
+    record = {
+        "subname": "Edge" + str(edge_index),
+        "length": float(edge.Length),
+        "center": {"x": float(center.x), "y": float(center.y), "z": float(center.z)},
+        "direction": None if direction is None else {"x": direction[0], "y": direction[1], "z": direction[2]},
+        "isLine": bool(is_line),
+        "adjacentSurfaceTypes": [face.Surface.__class__.__name__ for face in source_shape.ancestorsOfType(edge, Part.Face)],
+        "vertices": vertices
+    }
+    edge_candidates.append(record)
+
+selected = []
+if isinstance(selection, str):
+    tolerance = 1e-7
+    if selection == "all_vertical":
+        selected = [item for item in edge_candidates if item["direction"] is not None and item["direction"]["z"] > 1.0 - 1e-7 and "Cylinder" not in item["adjacentSurfaceTypes"]]
+    elif selection == "all_top":
+        selected = [item for item in edge_candidates if item["vertices"] and all(abs(vertex.Point.z - source_bounds.ZMax) <= tolerance for vertex in item["vertices"])]
+    elif selection == "all_bottom":
+        selected = [item for item in edge_candidates if item["vertices"] and all(abs(vertex.Point.z - source_bounds.ZMin) <= tolerance for vertex in item["vertices"])]
+else:
+    tolerance = float(selection.get("tolerance", 1e-5))
+    for item in edge_candidates:
+        matches = True
+        requested_direction = selection.get("direction")
+        if requested_direction is not None:
+            matches = item["direction"] is not None and item["direction"][requested_direction] > 1.0 - 1e-7
+        if matches and selection.get("length") is not None:
+            matches = abs(item["length"] - float(selection["length"])) <= tolerance
+        if matches and selection.get("location") is not None:
+            for axis, coordinate in selection["location"].items():
+                if abs(item["center"][axis] - float(coordinate)) > tolerance:
+                    matches = False
+                    break
+        if matches:
+            selected.append(item)
+    expected_count = int(selection.get("count", 1))
+    if len(selected) > expected_count:
+        raise ValueError("EDGE_SELECTION_AMBIGUOUS: matched " + str(len(selected)) + " edges, expected " + str(expected_count))
+    if len(selected) < expected_count:
+        raise ValueError("EDGE_SELECTION_COUNT_MISMATCH: matched " + str(len(selected)) + " edges, expected " + str(expected_count))
+
+if not selected:
+    raise ValueError("EDGE_SELECTION_EMPTY: no matching edges")
+selected_subnames = [item["subname"] for item in selected]
+selected_descriptions = [{
+    "selectionId": "selected-" + str(index + 1),
+    "length": item["length"],
+    "center": item["center"],
+    "direction": item["direction"],
+    "isLine": item["isLine"]
+} for index, item in enumerate(selected)]`;
 }
 
 function sketchSupportPython(plane: 'XY' | 'XZ' | 'YZ', support: string | undefined): string {
@@ -795,6 +1006,72 @@ try:
     }
 except Exception:
     doc.abortTransaction()
+    doc.recompute()
+    raise
+`);
+    }
+
+    case 'cad_fillet':
+    case 'cad_chamfer': {
+      const isFillet = name === 'cad_fillet';
+      const dimensionField = isFillet ? 'radius' : 'size';
+      assertAllowedKeys(args, ['body', dimensionField, 'edges', 'name']);
+      const bodyRef = validateQualifiedId(args.body, 'body');
+      const dimension = validatePositiveDimension(args[dimensionField], dimensionField);
+      const selection = validateEdgeSelection(args.edges);
+      const featureName = validateIdentifier(args.name, 'name', isFillet ? 'Fillet' : 'Chamfer');
+      const featureType = isFillet ? 'PartDesign::Fillet' : 'PartDesign::Chamfer';
+      const property = isFillet ? 'Radius' : 'Size';
+      return bridge.run(`
+${resolveBodyPython(bodyRef.document, bodyRef.object)}
+${edgeSelectionPython(selection)}
+doc.openTransaction(${JSON.stringify(name)})
+try:
+    feature = body.newObject(${JSON.stringify(featureType)}, ${JSON.stringify(featureName)})
+    feature.Base = (source, selected_subnames)
+    feature.${property} = ${dimension}
+    doc.recompute()
+    error_states = [str(state) for state in feature.State if str(state) not in ("Up-to-date", "Touched")]
+    if error_states:
+        raise RuntimeError(${JSON.stringify(`${isFillet ? 'FILLET' : 'CHAMFER'}_RECOMPUTE_FAILED: `)} + str(error_states))
+    if feature.TypeId != ${JSON.stringify(featureType)}:
+        raise RuntimeError(${JSON.stringify(`${isFillet ? 'FILLET' : 'CHAMFER'}_POSTCONDITION_FAILED: unexpected TypeId`)})
+    if feature.getParentGeoFeatureGroup() != body or feature not in body.Group or body.Tip != feature:
+        raise RuntimeError(${JSON.stringify(`${isFillet ? 'FILLET' : 'CHAMFER'}_POSTCONDITION_FAILED: feature is not the Body Tip`)})
+    base_target = feature.Base[0] if isinstance(feature.Base, tuple) else feature.Base
+    if base_target != source:
+        raise RuntimeError(${JSON.stringify(`${isFillet ? 'FILLET' : 'CHAMFER'}_POSTCONDITION_FAILED: source feature mismatch`)})
+    if abs(float(feature.${property}.Value) - ${dimension}) > 1e-7:
+        raise RuntimeError(${JSON.stringify(`${isFillet ? 'FILLET' : 'CHAMFER'}_POSTCONDITION_FAILED: dimension mismatch`)})
+    shape = feature.Shape
+    valid = not shape.isNull() and shape.isValid() and len(shape.Solids) == 1 and shape.Volume > 0
+    if not valid:
+        raise RuntimeError(${JSON.stringify(`${isFillet ? 'FILLET' : 'CHAMFER'}_POSTCONDITION_FAILED: result is not one valid solid`)})
+    if abs(float(shape.Volume) - source_volume) <= 1e-7:
+        raise RuntimeError(${JSON.stringify(`${isFillet ? 'FILLET' : 'CHAMFER'}_POSTCONDITION_FAILED: geometry did not change`)})
+    bounds = shape.BoundBox
+    doc.commitTransaction()
+    _mcp_result["result"] = {
+        "document": doc.Name,
+        "body": doc.Name + "::" + body.Name,
+        "sourceFeature": doc.Name + "::" + source.Name,
+        "feature": doc.Name + "::" + feature.Name,
+        "typeId": feature.TypeId,
+        "selectedEdges": selected_descriptions,
+        ${JSON.stringify(dimensionField)}: float(feature.${property}.Value),
+        "valid": bool(valid),
+        "solidCount": len(shape.Solids),
+        "volume": float(shape.Volume),
+        "sourceVolume": source_volume,
+        "boundingBox": {"xLength": float(bounds.XLength), "yLength": float(bounds.YLength), "zLength": float(bounds.ZLength)},
+        "error": None
+    }
+except Exception:
+    doc.abortTransaction()
+    if "feature" in locals() and doc.getObject(feature.Name) is not None:
+        doc.removeObject(feature.Name)
+    if doc.getObject(source.Name) is not None and body.Tip != source:
+        body.Tip = source
     doc.recompute()
     raise
 `);
