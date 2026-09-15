@@ -4,6 +4,7 @@ import { CadPlanValidationGate, cadPlanNotValidatedToolResult } from './cad-plan
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 export const LINEAR_TOLERANCE_MM = 1e-6;
+export const AREA_TOLERANCE_MM2 = 1e-6;
 export const VOLUME_TOLERANCE_MM3 = 1e-7;
 export const DIRECTION_VECTOR_EPSILON_MM = 1e-12;
 
@@ -21,6 +22,7 @@ import Sketcher
 plan = ${JSON.stringify(plan)}
 plan_revision = ${revision}
 LINEAR_TOLERANCE_MM = ${LINEAR_TOLERANCE_MM}
+AREA_TOLERANCE_MM2 = ${AREA_TOLERANCE_MM2}
 VOLUME_TOLERANCE_MM3 = ${VOLUME_TOLERANCE_MM3}
 DIRECTION_VECTOR_EPSILON_MM = ${DIRECTION_VECTOR_EPSILON_MM}
 requested_document_name = ${requestedDocumentName === undefined ? 'None' : JSON.stringify(requestedDocumentName)}
@@ -85,6 +87,81 @@ def select_edges(source, selection):
     if not selected:
         raise ValueError("EDGE_SELECTION_EMPTY: " + str(selection))
     return [item["subname"] for item in selected]
+
+def inspect_geometry(shape):
+    def clean(value, tolerance=LINEAR_TOLERANCE_MM):
+        numeric = float(value)
+        if abs(numeric) <= tolerance:
+            return 0.0
+        return float(round(numeric / tolerance) * tolerance)
+
+    def canonical_axis(vector):
+        axis = FreeCAD.Vector(vector.x, vector.y, vector.z)
+        if axis.Length <= DIRECTION_VECTOR_EPSILON_MM:
+            return [0.0, 0.0, 0.0]
+        axis.normalize()
+        components = [clean(axis.x), clean(axis.y), clean(axis.z)]
+        first = next((component for component in components if abs(component) > LINEAR_TOLERANCE_MM), 0.0)
+        return [-component for component in components] if first < 0.0 else components
+
+    def quantized(values, tolerance):
+        return tuple(int(round(float(value) / tolerance)) for value in values)
+
+    bounds = shape.BoundBox
+    planar = []
+    cylindrical = []
+    probe_span = max(float(bounds.XLength), float(bounds.YLength), float(bounds.ZLength), 1.0) * 2.0 + 2.0
+    for face in shape.Faces:
+        surface = face.Surface
+        surface_name = surface.__class__.__name__
+        center = face.CenterOfMass
+        face_bounds = face.BoundBox
+        extent = {
+            "min": [clean(face_bounds.XMin), clean(face_bounds.YMin), clean(face_bounds.ZMin)],
+            "max": [clean(face_bounds.XMax), clean(face_bounds.YMax), clean(face_bounds.ZMax)],
+            "size": [clean(face_bounds.XLength), clean(face_bounds.YLength), clean(face_bounds.ZLength)],
+        }
+        if surface_name == "Plane":
+            parameter_range = face.ParameterRange
+            normal_vector = face.normalAt((parameter_range[0] + parameter_range[1]) / 2.0, (parameter_range[2] + parameter_range[3]) / 2.0)
+            if normal_vector.Length > DIRECTION_VECTOR_EPSILON_MM:
+                normal_vector.normalize()
+            planar.append({
+                "surface_type": "plane",
+                "area": clean(face.Area, AREA_TOLERANCE_MM2),
+                "center": [clean(center.x), clean(center.y), clean(center.z)],
+                "normal": [clean(normal_vector.x), clean(normal_vector.y), clean(normal_vector.z)],
+                "extent": extent,
+            })
+        elif surface_name == "Cylinder":
+            axis = canonical_axis(surface.Axis)
+            axis_vector = FreeCAD.Vector(axis[0], axis[1], axis[2])
+            origin = FreeCAD.Vector(surface.Center.x, surface.Center.y, surface.Center.z)
+            axis_point_vector = origin.sub(axis_vector * origin.dot(axis_vector))
+            axis_point = [clean(axis_point_vector.x), clean(axis_point_vector.y), clean(axis_point_vector.z)]
+            probe_start = axis_point_vector.sub(axis_vector * probe_span)
+            probe_end = axis_point_vector.add(axis_vector * probe_span)
+            axis_probe = Part.makeLine(probe_start, probe_end)
+            cylindrical.append({
+                "surface_type": "cylinder",
+                "area": clean(face.Area, AREA_TOLERANCE_MM2),
+                "radius": clean(surface.Radius),
+                "axis": axis,
+                "axis_point": axis_point,
+                "center": [clean(center.x), clean(center.y), clean(center.z)],
+                "extent": extent,
+                "axis_material_length": clean(axis_probe.common(shape).Length),
+            })
+    planar.sort(key=lambda item: quantized([item["area"], *item["center"], *item["normal"]], AREA_TOLERANCE_MM2))
+    cylindrical.sort(key=lambda item: quantized([item["radius"], *item["axis_point"], *item["axis"], item["area"]], LINEAR_TOLERANCE_MM))
+    return {
+        "solid_count": len(shape.Solids),
+        "shape_valid": not shape.isNull() and shape.isValid(),
+        "bounding_box": {"x": clean(bounds.XLength), "y": clean(bounds.YLength), "z": clean(bounds.ZLength)},
+        "volume": clean(shape.Volume, VOLUME_TOLERANCE_MM3),
+        "topology": {"faces": len(shape.Faces), "edges": len(shape.Edges), "vertices": len(shape.Vertexes)},
+        "surfaces": {"planar": planar, "cylindrical": cylindrical},
+    }
 
 try:
     existing_documents = FreeCAD.listDocuments()
@@ -201,32 +278,27 @@ try:
     doc.recompute()
     tip = body.Tip
     shape = tip.Shape
-    bounds = shape.BoundBox
     recompute_errors = []
     for obj in body.Group:
         object_errors = [str(state) for state in obj.State if str(state) not in ("Up-to-date", "Touched")]
         if object_errors:
             recompute_errors.append({"object": obj.Name, "states": object_errors})
 
+    # geometry_inspection_start
+    geometry_signature = inspect_geometry(shape)
     actual_holes = []
-    for face in shape.Faces:
-        if face.Surface.__class__.__name__ != "Cylinder":
+    for cylinder in geometry_signature["surfaces"]["cylindrical"]:
+        axis = cylinder["axis"]
+        if abs(axis[0]) > LINEAR_TOLERANCE_MM or abs(axis[1]) > LINEAR_TOLERANCE_MM or abs(abs(axis[2]) - 1.0) > LINEAR_TOLERANCE_MM or cylinder["axis_material_length"] > LINEAR_TOLERANCE_MM:
             continue
-        surface = face.Surface
-        axis = surface.Axis
-        if abs(abs(float(axis.z)) - 1.0) > LINEAR_TOLERANCE_MM:
-            continue
-        candidate = {"x": float(surface.Center.x), "y": float(surface.Center.y), "radius": float(surface.Radius), "axis": {"x": float(axis.x), "y": float(axis.y), "z": float(axis.z)}}
-        axis_probe = Part.makeLine(FreeCAD.Vector(candidate["x"], candidate["y"], bounds.ZMin - 1.0), FreeCAD.Vector(candidate["x"], candidate["y"], bounds.ZMax + 1.0))
-        if float(axis_probe.common(shape).Length) > LINEAR_TOLERANCE_MM:
-            continue
+        candidate = {"x": cylinder["axis_point"][0], "y": cylinder["axis_point"][1], "radius": cylinder["radius"], "axis": {"x": axis[0], "y": axis[1], "z": axis[2]}, "axis_material_length": cylinder["axis_material_length"]}
         if not any(abs(item["x"] - candidate["x"]) <= LINEAR_TOLERANCE_MM and abs(item["y"] - candidate["y"]) <= LINEAR_TOLERANCE_MM and abs(item["radius"] - candidate["radius"]) <= LINEAR_TOLERANCE_MM for item in actual_holes):
             actual_holes.append(candidate)
 
     actual_snapshot = {
-        "solid_count": len(shape.Solids),
-        "shape_valid": not shape.isNull() and shape.isValid(),
-        "bounding_box": {"x": float(bounds.XLength), "y": float(bounds.YLength), "z": float(bounds.ZLength)},
+        "solid_count": geometry_signature["solid_count"],
+        "shape_valid": geometry_signature["shape_valid"],
+        "bounding_box": geometry_signature["bounding_box"],
         "feature_ids": [item["id"] for item in feature_results],
         "body_tip": tip.Name if tip is not None else None,
         "expected_body_tip": feature_results[-1]["object"] if feature_results else None,
@@ -293,8 +365,7 @@ try:
                 center_passed = nearest is not None and abs(nearest["x"] - expected_center["x"]) <= LINEAR_TOLERANCE_MM and abs(nearest["y"] - expected_center["y"]) <= LINEAR_TOLERANCE_MM
                 radius_passed = nearest is not None and abs(nearest["radius"] - expected_radius) <= LINEAR_TOLERANCE_MM
                 axis_passed = nearest is not None and abs(float(nearest["axis"]["x"])) <= LINEAR_TOLERANCE_MM and abs(float(nearest["axis"]["y"])) <= LINEAR_TOLERANCE_MM and abs(abs(float(nearest["axis"]["z"])) - 1.0) <= LINEAR_TOLERANCE_MM
-                probe = Part.makeLine(FreeCAD.Vector(expected_center["x"], expected_center["y"], bounds.ZMin - 1.0), FreeCAD.Vector(expected_center["x"], expected_center["y"], bounds.ZMax + 1.0))
-                through_all_passed = float(probe.common(shape).Length) <= LINEAR_TOLERANCE_MM
+                through_all_passed = nearest is not None and float(nearest["axis_material_length"]) <= LINEAR_TOLERANCE_MM
                 entry["centers"].append({"expected": expected_center, "actual": actual_center, "passed": center_passed, "radius_passed": radius_passed, "axis_passed": axis_passed, "through_all_passed": through_all_passed})
                 entry["axes_passed"] = entry["axes_passed"] and axis_passed
                 entry["through_all_passed"] = entry["through_all_passed"] and through_all_passed
@@ -352,10 +423,10 @@ try:
         failed_document_name = doc.Name
         FreeCAD.closeDocument(failed_document_name)
         doc = None
-        _mcp_result["result"] = {"success": False, "status": "verification_failed", "code": "CAD_VERIFICATION_FAILED", "document": failed_document_name, "plan_revision": plan_revision, "issues": issues, "verification": verification}
+        _mcp_result["result"] = {"success": False, "status": "verification_failed", "code": "CAD_VERIFICATION_FAILED", "document": failed_document_name, "plan_revision": plan_revision, "issues": issues, "geometry_signature": geometry_signature, "verification": verification}
     else:
         doc.commitTransaction()
-        _mcp_result["result"] = {"success": True, "status": "verified", "document": doc.Name, "body": doc.Name + "::" + body.Name, "plan_revision": plan_revision, "executed_steps": executed_steps, "features": feature_results, "valid": True, "solidCount": len(shape.Solids), "boundingBox": {"xLength": float(bounds.XLength), "yLength": float(bounds.YLength), "zLength": float(bounds.ZLength)}, "volume": float(shape.Volume), "verification": verification}
+        _mcp_result["result"] = {"success": True, "status": "verified", "document": doc.Name, "body": doc.Name + "::" + body.Name, "plan_revision": plan_revision, "executed_steps": executed_steps, "features": feature_results, "valid": True, "solidCount": geometry_signature["solid_count"], "boundingBox": {"xLength": geometry_signature["bounding_box"]["x"], "yLength": geometry_signature["bounding_box"]["y"], "zLength": geometry_signature["bounding_box"]["z"]}, "volume": geometry_signature["volume"], "geometry_signature": geometry_signature, "verification": verification}
 except Exception as error:
     if doc is not None:
         try:

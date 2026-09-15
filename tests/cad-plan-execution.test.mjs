@@ -93,6 +93,13 @@ function mutateVerificationSnapshot(code, mutation) {
   return code.replace(marker, `${indented}\n${marker}`);
 }
 
+function mutateInspectedShape(code, mutation) {
+  const marker = '    # geometry_inspection_start';
+  assert.ok(code.includes(marker), 'geometry inspection marker missing');
+  const indented = mutation.split('\n').map((line) => `    ${line}`).join('\n');
+  return code.replace(marker, `${indented}\n${marker}`);
+}
+
 async function validateAndCapture(planValue, documentName) {
   const gate = new CadPlanValidationGate();
   const bridge = new CapturingBridge();
@@ -316,6 +323,11 @@ test('executor creates actual through holes for one and three explicit centers',
     assert.equal(holeVerification.actual_count, centers.length);
     assert.equal(holeVerification.expected_radius, 3);
     assert.ok(holeVerification.centers.every((center) => center.passed && center.radius_passed));
+    const signatureCylinders = execution.result.geometry_signature.surfaces.cylindrical;
+    assert.equal(signatureCylinders.length, centers.length);
+    assert.ok(signatureCylinders.every((cylinder) => Math.abs(cylinder.radius - 3) <= 1e-6));
+    assert.ok(signatureCylinders.every((cylinder) => Math.abs(Math.abs(cylinder.axis[2]) - 1) <= 1e-6));
+    assert.deepEqual(signatureCylinders.map((cylinder) => cylinder.axis_point.slice(0, 2)), centers.map(({ x, y }) => [x, y]));
     assert.equal(execution.result.solidCount, 1);
   }
 });
@@ -346,6 +358,8 @@ test('executor creates six grid holes followed by fillet and inner chamfer', asy
   assert.equal(holeVerification.expected_count, 6);
   assert.equal(holeVerification.actual_count, 6);
   assert.ok(holeVerification.centers.every((center) => center.passed));
+  const signatureHoles = execution.result.geometry_signature.surfaces.cylindrical.filter((surface) => surface.axis_material_length <= 1e-6 && Math.abs(surface.radius - 3) <= 1e-6);
+  assert.equal(signatureHoles.length, 6);
   assert.equal(execution.result.solidCount, 1);
   assert.equal(execution.result.valid, true);
 });
@@ -384,7 +398,75 @@ test('simple plate execution returns a complete verified report', async () => {
   });
   assert.equal(execution.result.verification.features[0].passed, true);
   assert.equal(execution.result.verification.body_tip_correct, true);
+  const signature = execution.result.geometry_signature;
+  assert.equal(signature.solid_count, 1);
+  assert.deepEqual(signature.bounding_box, { x: 100, y: 60, z: 10 });
+  assert.equal(signature.volume, 60000);
+  assert.deepEqual(signature.topology, { faces: 6, edges: 12, vertices: 8 });
+  assert.equal(signature.surfaces.planar.length, 6);
+  assert.equal(signature.surfaces.cylindrical.length, 0);
+  assert.ok(signature.surfaces.planar.every((surface) => surface.surface_type === 'plane' && surface.area > 0 && surface.center.length === 3 && surface.normal.length === 3));
 });
+
+test('geometry signature is deterministic and contains no topological index identities', async () => {
+  const simplePlan = {
+    shape: 'plate', size: [100, 60, 10], unit: 'mm',
+    holes: { diameter: 6, centers: [[10, 10], [50, 30], [85, 45]] },
+  };
+  const first = await validateAndCapture(simplePlan, 'SignatureRepeatA');
+  const second = await validateAndCapture(simplePlan, 'SignatureRepeatB');
+  const firstSignature = executeFreeCad(first.bridge.commands[0]).result.geometry_signature;
+  const secondSignature = executeFreeCad(second.bridge.commands[0]).result.geometry_signature;
+  assert.deepEqual(firstSignature, secondSignature);
+  assert.doesNotMatch(JSON.stringify(firstSignature), /(?:Face|Edge|Vertex)[1-9][0-9]*/);
+});
+
+for (const scenario of [
+  {
+    name: 'five actual holes versus six expected holes',
+    mutation: 'shape = shape.fuse(Part.makeCylinder(3.0, 10.0, FreeCAD.Vector(80.0, 35.0, 0.0)))',
+    check: 'hole_count', expected: 6, actual: 5,
+    inspect(signature) {
+      const holes = signature.surfaces.cylindrical.filter((surface) => surface.axis_material_length <= 1e-6);
+      assert.equal(signature.surfaces.cylindrical.length, 5);
+      assert.equal(holes.length, 5);
+    },
+  },
+  {
+    name: 'actual radius four versus expected radius three',
+    mutation: 'shape = shape.fuse(Part.makeCylinder(3.0, 10.0, FreeCAD.Vector(20.0, 15.0, 0.0))).cut(Part.makeCylinder(4.0, 10.0, FreeCAD.Vector(20.0, 15.0, 0.0)))',
+    check: 'hole_radius', expected: 3, actual: 4,
+    inspect(signature) {
+      assert.ok(signature.surfaces.cylindrical.some((surface) => surface.axis_point[0] === 20 && surface.axis_point[1] === 15 && surface.radius === 4));
+    },
+  },
+  {
+    name: 'actual center 21,15 versus expected center 20,15',
+    mutation: 'shape = shape.fuse(Part.makeCylinder(3.0, 10.0, FreeCAD.Vector(20.0, 15.0, 0.0))).cut(Part.makeCylinder(3.0, 10.0, FreeCAD.Vector(21.0, 15.0, 0.0)))',
+    check: 'hole_center', expected: { x: 20, y: 15 }, actual: { x: 21, y: 15 },
+    inspect(signature) {
+      assert.ok(signature.surfaces.cylindrical.some((surface) => surface.axis_point[0] === 21 && surface.axis_point[1] === 15 && surface.radius === 3));
+    },
+  },
+]) {
+  test(`geometry signature independence: ${scenario.name}`, async () => {
+    const gridPlan = {
+      shape: 'plate', size: [100, 60, 10], unit: 'mm',
+      holes: { diameter: 6, grid: [3, 2], start: [20, 15], spacing: [30, 20] },
+    };
+    const { bridge } = await validateAndCapture(gridPlan, `Signature_${scenario.check}`);
+    const execution = executeFreeCad(mutateInspectedShape(bridge.commands[0], scenario.mutation), true);
+    assert.equal(execution.ok, true, execution.traceback);
+    assert.equal(execution.result.success, false);
+    assert.equal(execution.result.status, 'verification_failed');
+    assert.equal(execution.result.code, 'CAD_VERIFICATION_FAILED');
+    scenario.inspect(execution.result.geometry_signature);
+    const issue = execution.result.issues.find((candidate) => candidate.check === scenario.check);
+    assert.ok(issue, `${scenario.check} issue missing`);
+    assert.deepEqual(issue.expected, scenario.expected);
+    assert.deepEqual(issue.actual, scenario.actual);
+  });
+}
 
 for (const [check, mutation, expected, actual] of [
   ['hole_count', 'actual_snapshot["holes"] = actual_snapshot["holes"][:-1]', 6, 5],
