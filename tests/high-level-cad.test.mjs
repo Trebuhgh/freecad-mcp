@@ -320,6 +320,98 @@ async function createPlainPlateCommands(document, operation, operationArgs) {
   return bridge.commands;
 }
 
+async function createDrilledPlateBridge(document) {
+  const bridge = new CapturingBridge(Array(8).fill({}));
+  await handleHighLevelCadTool('cad_create_part', { name: document }, bridge);
+  await handleHighLevelCadTool('cad_create_sketch', { body: `${document}::Body` }, bridge);
+  await handleHighLevelCadTool('cad_sketch_rectangle', {
+    sketch: `${document}::Sketch`, x: 0, y: 0, width: 100, height: 60,
+  }, bridge);
+  await handleHighLevelCadTool('cad_pad', { sketch: `${document}::Sketch`, length: 10 }, bridge);
+  await handleHighLevelCadTool('cad_create_hole_sketch', {
+    body: `${document}::Body`, holes: [
+      { x: 10, y: 10, diameter: 8 }, { x: 90, y: 10, diameter: 8 },
+      { x: 10, y: 50, diameter: 8 }, { x: 90, y: 50, diameter: 8 },
+    ],
+  }, bridge);
+  await handleHighLevelCadTool('cad_pocket', { sketch: `${document}::HoleSketch` }, bridge);
+  return bridge;
+}
+
+test('wire-based selectors distinguish outer and inner top/bottom boundaries', async () => {
+  const cases = [
+    ['PlainTopOuter', false, 'all_top_outer', 4, true],
+    ['DrilledTopOuter', true, 'all_top_outer', 4, true],
+    ['DrilledBottomOuter', true, 'all_bottom_outer', 4, true],
+    ['DrilledBottomInner', true, 'all_bottom_inner', 4, false],
+    ['LegacyAllTop', true, 'all_top', 8, null],
+    ['LegacyAllBottom', true, 'all_bottom', 8, null],
+  ];
+  for (const [document, drilled, edges, count, expectLines] of cases) {
+    const bridge = drilled
+      ? await createDrilledPlateBridge(document)
+      : new CapturingBridge(Array(5).fill({}));
+    if (!drilled) {
+      await handleHighLevelCadTool('cad_create_part', { name: document }, bridge);
+      await handleHighLevelCadTool('cad_create_sketch', { body: `${document}::Body` }, bridge);
+      await handleHighLevelCadTool('cad_sketch_rectangle', {
+        sketch: `${document}::Sketch`, x: 0, y: 0, width: 100, height: 60,
+      }, bridge);
+      await handleHighLevelCadTool('cad_pad', { sketch: `${document}::Sketch`, length: 10 }, bridge);
+    }
+    await handleHighLevelCadTool('cad_chamfer', {
+      body: `${document}::Body`, size: 0.5, edges,
+    }, bridge);
+    const execution = runFreeCadScript(bridge.commands);
+    assert.equal(execution.ok, true, execution.traceback);
+    const chamfer = execution.results.at(-1);
+    assert.equal(chamfer.selectedEdges.length, count);
+    if (expectLines !== null) {
+      assert.equal(chamfer.selectedEdges.every((edge) => edge.isLine === expectLines), true);
+    }
+    const expectedZ = edges.startsWith('all_top') ? 10 : 0;
+    assert.equal(chamfer.selectedEdges.every((edge) => Math.abs(edge.center.z - expectedZ) < 1e-7), true);
+  }
+});
+
+test('benchmark: R5 outer fillet followed by 0.5 mm chamfer of four top hole rims', async () => {
+  const bridge = await createDrilledPlateBridge('SemanticBenchmark');
+  await handleHighLevelCadTool('cad_fillet', {
+    body: 'SemanticBenchmark::Body', radius: 5, edges: 'all_vertical',
+  }, bridge);
+  await handleHighLevelCadTool('cad_chamfer', {
+    body: 'SemanticBenchmark::Body', size: 0.5, edges: 'all_top_inner',
+  }, bridge);
+
+  const execution = runFreeCadScript(bridge.commands);
+  assert.equal(execution.ok, true, execution.traceback);
+  const fillet = execution.results.at(-2);
+  const chamfer = execution.results.at(-1);
+  assert.equal(fillet.typeId, 'PartDesign::Fillet');
+  assert.equal(fillet.selectedEdges.length, 4);
+  assert.equal(chamfer.typeId, 'PartDesign::Chamfer');
+  assert.equal(chamfer.sourceFeature, 'SemanticBenchmark::Fillet');
+  assert.equal(chamfer.selectedEdges.length, 4);
+  assert.equal(chamfer.selectedEdges.every((edge) => !edge.isLine), true);
+  assert.equal(chamfer.selectedEdges.every((edge) => Math.abs(edge.center.z - 10) < 1e-7), true);
+  assert.equal(chamfer.valid, true);
+  assert.equal(chamfer.solidCount, 1);
+  assert.equal(chamfer.error, null);
+});
+
+test('inner selector without inner wires fails before creating a feature', async () => {
+  const commands = await createPlainPlateCommands(
+    'NoInnerWire', 'cad_chamfer', { size: 0.5, edges: 'all_top_inner' },
+  );
+  const execution = runFreeCadScript(commands, true);
+  assert.equal(execution.ok, false);
+  assert.match(execution.error, /EDGE_SELECTION_EMPTY/);
+  assert.deepEqual(
+    execution.objects.NoInnerWire.filter((object) => object.typeId === 'PartDesign::Chamfer'),
+    [],
+  );
+});
+
 test('edge selection and oversized feature failures leave no broken feature', async () => {
   const cases = [
     ['NoMatchingEdge', 'cad_fillet', { radius: 2, edges: { length: 123.456 } }, 'EDGE_SELECTION_COUNT_MISMATCH', 'PartDesign::Fillet'],

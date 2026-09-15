@@ -142,7 +142,7 @@ export const HIGH_LEVEL_CAD_TOOLS = [
         edges: {
           description: 'Semantic selector or geometric edge query',
           oneOf: [
-            { type: 'string', enum: ['all_vertical', 'all_top', 'all_bottom'] },
+            { type: 'string', enum: ['all_vertical', 'all_top', 'all_bottom', 'all_top_outer', 'all_top_inner', 'all_bottom_outer', 'all_bottom_inner'] },
             {
               type: 'object',
               properties: {
@@ -179,7 +179,7 @@ export const HIGH_LEVEL_CAD_TOOLS = [
         edges: {
           description: 'Semantic selector or geometric edge query',
           oneOf: [
-            { type: 'string', enum: ['all_vertical', 'all_top', 'all_bottom'] },
+            { type: 'string', enum: ['all_vertical', 'all_top', 'all_bottom', 'all_top_outer', 'all_top_inner', 'all_bottom_outer', 'all_bottom_inner'] },
             {
               type: 'object',
               properties: {
@@ -211,6 +211,10 @@ type EdgeSelection =
   | 'all_vertical'
   | 'all_top'
   | 'all_bottom'
+  | 'all_top_outer'
+  | 'all_top_inner'
+  | 'all_bottom_outer'
+  | 'all_bottom_inner'
   | {
       direction?: 'x' | 'y' | 'z';
       length?: number;
@@ -337,7 +341,11 @@ function validateSupport(value: unknown): string | undefined {
 }
 
 function validateEdgeSelection(value: unknown): EdgeSelection {
-  if (value === 'all_vertical' || value === 'all_top' || value === 'all_bottom') {
+  if (
+    value === 'all_vertical' || value === 'all_top' || value === 'all_bottom'
+    || value === 'all_top_outer' || value === 'all_top_inner'
+    || value === 'all_bottom_outer' || value === 'all_bottom_inner'
+  ) {
     return value;
   }
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -414,7 +422,8 @@ for edge_index, edge in enumerate(source_shape.Edges, start=1):
         "direction": None if direction is None else {"x": direction[0], "y": direction[1], "z": direction[2]},
         "isLine": bool(is_line),
         "adjacentSurfaceTypes": [face.Surface.__class__.__name__ for face in source_shape.ancestorsOfType(edge, Part.Face)],
-        "vertices": vertices
+        "vertices": vertices,
+        "edge": edge
     }
     edge_candidates.append(record)
 
@@ -427,6 +436,25 @@ if isinstance(selection, str):
         selected = [item for item in edge_candidates if item["vertices"] and all(abs(vertex.Point.z - source_bounds.ZMax) <= tolerance for vertex in item["vertices"])]
     elif selection == "all_bottom":
         selected = [item for item in edge_candidates if item["vertices"] and all(abs(vertex.Point.z - source_bounds.ZMin) <= tolerance for vertex in item["vertices"])]
+    elif selection in ("all_top_outer", "all_top_inner", "all_bottom_outer", "all_bottom_inner"):
+        target_z = source_bounds.ZMax if selection.startswith("all_top") else source_bounds.ZMin
+        requested_boundary = "outer" if selection.endswith("outer") else "inner"
+        outer_edges = []
+        inner_edges = []
+        for face in source_shape.Faces:
+            if face.Surface.__class__.__name__ != "Plane":
+                continue
+            face_vertices = face.Vertexes
+            if not face_vertices or not all(abs(vertex.Point.z - target_z) <= tolerance for vertex in face_vertices):
+                continue
+            outer_wire = face.OuterWire
+            for wire in face.Wires:
+                destination = outer_edges if wire.isSame(outer_wire) else inner_edges
+                for wire_edge in wire.Edges:
+                    if not any(existing.isSame(wire_edge) for existing in destination):
+                        destination.append(wire_edge)
+        boundary_edges = outer_edges if requested_boundary == "outer" else inner_edges
+        selected = [item for item in edge_candidates if any(item["edge"].isSame(boundary_edge) for boundary_edge in boundary_edges)]
 else:
     tolerance = float(selection.get("tolerance", 1e-5))
     for item in edge_candidates:
