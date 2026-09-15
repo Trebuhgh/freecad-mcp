@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { handleHighLevelCadTool } from '../dist/tools/high-level-cad.js';
-import { CadPlanValidationGate } from '../dist/tools/cad-plan-validation.js';
+import { CAD_PLAN_TOOLS, CadPlanValidationGate } from '../dist/tools/cad-plan-validation.js';
 
 const base = {
   type: 'rectangular_plate', width: 100, height: 60, thickness: 10, unit: 'mm',
@@ -28,6 +28,79 @@ async function validate(plan) {
   const response = await handleHighLevelCadTool('cad_validate_plan', { plan }, bridge, gate);
   return { result: JSON.parse(response.content[0].text), bridge, gate };
 }
+
+test('cad_validate_plan schema presents Simple Intent first and isolates compatibility formats', () => {
+  const tool = CAD_PLAN_TOOLS.find((candidate) => candidate.name === 'cad_validate_plan');
+  const planSchema = tool.inputSchema.properties.plan;
+  assert.equal(planSchema.oneOf.length, 3);
+  const [simple, feature, legacy] = planSchema.oneOf;
+  assert.equal(simple.title, 'Preferred Simple Intent Plan');
+  assert.deepEqual(simple.required, ['shape']);
+  assert.equal(simple.additionalProperties, false);
+  assert.equal(Object.hasOwn(simple.properties, 'features'), false);
+  assert.equal(Object.hasOwn(simple.properties, 'base'), false);
+  assert.equal(Object.hasOwn(simple.properties.holes.properties, 'placement'), false);
+  assert.equal(Object.hasOwn(simple.properties.holes.properties, 'count'), false);
+  assert.equal(feature.title, 'Advanced Feature Plan (compatibility)');
+  assert.deepEqual(feature.required, ['features']);
+  assert.equal(legacy.title, 'Legacy Plan (compatibility)');
+  assert.deepEqual(legacy.required, ['base']);
+  assert.match(tool.description, /Only include features explicitly requested by the user/);
+  assert.match(tool.description, /Do not mix formats/);
+});
+
+test('all seven preferred Simple Intent happy paths validate on the first call', async () => {
+  const profile = [[0, 0], [100, 0], [100, 40], [60, 40], [60, 80], [0, 80]];
+  const candidates = [
+    { shape: 'plate', size: [100, 60, 10], unit: 'mm' },
+    { shape: 'plate', size: [100, 60, 10], unit: 'mm', holes: { diameter: 6, centers: [[10, 10], [50, 30], [90, 50]] } },
+    { shape: 'plate', size: [100, 60, 10], unit: 'mm', holes: { diameter: 6, grid: [3, 2], start: [20, 15], spacing: [30, 20] } },
+    { shape: 'profile', profile, thickness: 10, unit: 'mm' },
+    { shape: 'profile', profile, thickness: 10, unit: 'mm', holes: { diameter: 6, centers: [[20, 20], [40, 60], [80, 20]] } },
+    { shape: 'plate', size: [100, 60, 10], unit: 'mm', fillet: { radius: 5, edges: 'all_vertical' } },
+    { shape: 'plate', size: [100, 60, 10], unit: 'mm', chamfer: { size: 0.5, edges: 'all_top_outer' } },
+  ];
+  for (const candidate of candidates) {
+    const { result, bridge } = await validate(candidate);
+    assert.equal(result.status, 'valid', JSON.stringify(result));
+    assert.equal(result.can_execute, true);
+    assert.ok(result.resolved_plan);
+    assert.equal(bridge.calls, 0);
+  }
+});
+
+test('Simple Intent rejects Feature Plan hole fields with precise paths', async () => {
+  for (const [field, value] of [['placement', { type: 'explicit', centers: [{ x: 20, y: 20 }] }], ['count', 1]]) {
+    const { result } = await validate({
+      shape: 'plate', size: [100, 60, 10], unit: 'mm', holes: { diameter: 6, centers: [[20, 20]], [field]: value },
+    });
+    assert.equal(result.status, 'invalid');
+    assert.equal(result.can_execute, false);
+    assert.ok(result.issues.some((issue) => issue.code === 'UNKNOWN_SIMPLE_FIELD' && issue.path === `holes.${field}`));
+  }
+});
+
+test('mixed Simple, Feature, and Legacy formats return MIXED_PLAN_FORMAT only', async () => {
+  const mixedPlans = [
+    { shape: 'plate', size: [100, 60, 10], unit: 'mm', features: [{ type: 'rectangular_pad', width: 100, height: 60, length: 10 }] },
+    { shape: 'plate', size: [100, 60, 10], unit: 'mm', base },
+    { unit: 'mm', features: [{ type: 'rectangular_pad', width: 100, height: 60, length: 10 }], base },
+  ];
+  for (const mixed of mixedPlans) {
+    const { result } = await validate(mixed);
+    assert.equal(result.status, 'invalid');
+    assert.equal(result.can_execute, false);
+    assert.deepEqual(result.issues.map((issue) => issue.code), ['MIXED_PLAN_FORMAT']);
+    assert.equal(result.issues.some((issue) => issue.code === 'INVALID_FEATURE_ORDER'), false);
+  }
+});
+
+test('operation-only incomplete Simple Intent reports missing shape instead of Feature Plan errors', async () => {
+  const { result } = await validate({ unit: 'mm', holes: { diameter: 6, centers: [[20, 20]] } });
+  assert.equal(result.status, 'incomplete');
+  assert.ok(result.issues.some((issue) => issue.code === 'MISSING_REQUIRED_VALUE' && issue.path === 'shape'));
+  assert.equal(result.issues.some((issue) => issue.code === 'INVALID_FEATURE_ORDER'), false);
+});
 
 test('ambiguous distance reference returns A/B clarification and deterministic SVG without mutation', async () => {
   const first = await validate({ base, holes: holes(null) });

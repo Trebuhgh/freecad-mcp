@@ -100,119 +100,113 @@ export class CadPlanValidationGate {
   }
 }
 
+const coordinatePairSchema = {
+  type: 'array', minItems: 2, maxItems: 2, items: { type: 'number' },
+};
+
+const simpleHolesSchema = {
+  type: ['object', 'null'],
+  description: 'Simple holes. For explicit holes use only {diameter,centers}; count is derived and operation is through_all. Never use placement, count, after, target, or operation here.',
+  properties: {
+    diameter: { type: ['number', 'null'], exclusiveMinimum: 0 },
+    centers: { type: ['array', 'null'], minItems: 1, items: coordinatePairSchema, description: 'Explicit centers as [[x,y],...]. Use this directly; do not wrap it in placement.' },
+    grid: { type: ['array', 'null'], minItems: 2, maxItems: 2, items: { type: 'integer', minimum: 1 }, description: 'Grid [columns,rows].' },
+    start: { ...coordinatePairSchema, type: ['array', 'null'], description: 'Grid origin [x,y]. Required with grid.' },
+    spacing: { ...coordinatePairSchema, type: ['array', 'null'], description: 'Positive grid spacing [x,y]. Required with grid.' },
+    edge_offset: { type: ['number', 'null'], exclusiveMinimum: 0, description: 'Four-corner edge distance.' },
+    reference: { type: ['string', 'null'], enum: ['center', 'boundary', null], description: 'Only for edge_offset. Use null unless the user explicitly says center or hole boundary.' },
+  },
+  additionalProperties: false,
+};
+
+const simplePlanSchema = {
+  title: 'Preferred Simple Intent Plan',
+  type: 'object',
+  description: 'PREFERRED LLM FORMAT. Do not mix with base, features, placement, count, after, target, or operation. Include only geometry explicitly requested by the user.',
+  properties: {
+    shape: { type: ['string', 'null'], enum: ['plate', 'profile', null], description: 'Required discriminator: plate or profile.' },
+    size: { type: ['array', 'null'], minItems: 3, maxItems: 3, items: { type: 'number' }, description: 'For shape:"plate": [width,height,thickness] in mm.' },
+    profile: { type: ['array', 'null'], minItems: 3, items: coordinatePairSchema, description: 'For shape:"profile": polygon vertices [[x,y],...]; closure is automatic.' },
+    thickness: { type: ['number', 'null'], exclusiveMinimum: 0, description: 'For shape:"profile": extrusion length in +Z.' },
+    unit: { type: ['string', 'null'], enum: ['mm', null], description: 'Currently mm.' },
+    holes: simpleHolesSchema,
+    fillet: { type: ['object', 'null'], properties: { radius: { type: ['number', 'null'], exclusiveMinimum: 0 }, edges: { type: ['string', 'object', 'null'] } }, additionalProperties: false, description: 'Include only when the user explicitly requests a fillet.' },
+    chamfer: { type: ['object', 'null'], properties: { size: { type: ['number', 'null'], exclusiveMinimum: 0 }, edges: { type: ['string', 'object', 'null'] } }, additionalProperties: false, description: 'Include only when the user explicitly requests a chamfer.' },
+  },
+  required: ['shape'],
+  additionalProperties: false,
+  examples: [
+    { shape: 'plate', size: [100, 60, 10], unit: 'mm' },
+    { shape: 'profile', profile: [[0, 0], [100, 0], [100, 40], [0, 40]], thickness: 10, unit: 'mm' },
+    { shape: 'profile', profile: [[0, 0], [100, 0], [100, 40], [60, 40], [60, 80], [0, 80]], thickness: 10, unit: 'mm', holes: { diameter: 6, centers: [[20, 20], [40, 60], [80, 20]] } },
+    { shape: 'plate', size: [100, 60, 10], unit: 'mm', holes: { diameter: 6, grid: [3, 2], start: [20, 15], spacing: [30, 20] } },
+  ],
+};
+
+const featurePlanSchema = {
+  title: 'Advanced Feature Plan (compatibility)',
+  type: 'object',
+  description: 'Advanced compatibility format. Use only when Simple Intent cannot represent the request; never mix with Simple Intent or Legacy fields.',
+  properties: {
+    unit: { type: ['string', 'null'], enum: ['mm', null] },
+    features: {
+      type: 'array', minItems: 1,
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: ['string', 'null'] },
+          type: { type: ['string', 'null'], enum: ['rectangular_pad', 'profile_pad', 'hole_pattern', 'fillet', 'chamfer', null] },
+          points: { type: ['array', 'null'], minItems: 3, items: coordinatePairSchema },
+          width: { type: ['number', 'null'] }, height: { type: ['number', 'null'] }, length: { type: ['number', 'null'] },
+          diameter: { type: ['number', 'null'] }, count: { type: ['integer', 'null'] },
+          placement: {
+            type: ['object', 'null'],
+            properties: {
+              type: { type: ['string', 'null'], enum: ['edge_offset', 'explicit', 'rectangular_grid', null] },
+              distance: { type: ['number', 'null'] },
+              reference: { type: ['string', 'null'], enum: ['center', 'boundary', null] },
+              centers: { type: ['array', 'null'], items: { oneOf: [coordinatePairSchema, { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'], additionalProperties: false }] } },
+              origin: { type: ['object', 'null'], properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'], additionalProperties: false },
+              columns: { type: ['integer', 'null'] }, rows: { type: ['integer', 'null'] }, spacing_x: { type: ['number', 'null'] }, spacing_y: { type: ['number', 'null'] },
+            },
+            additionalProperties: false,
+          },
+          radius: { type: ['number', 'null'] }, size: { type: ['number', 'null'] },
+          edges: { type: ['string', 'null'], enum: ['all_vertical', 'all_top', 'all_bottom', 'all_top_outer', 'all_top_inner', 'all_bottom_outer', 'all_bottom_inner', null] },
+          after: { type: ['string', 'null'] }, target: { type: ['string', 'null'] },
+          operation: { type: ['string', 'null'], enum: ['through_all', null] },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['features'],
+  additionalProperties: false,
+};
+
+const legacyPlanSchema = {
+  title: 'Legacy Plan (compatibility)',
+  type: 'object',
+  description: 'Legacy compatibility format. New LLM calls should use Simple Intent.',
+  properties: {
+    base: { type: 'object', properties: { type: { type: ['string', 'null'] }, width: { type: ['number', 'null'] }, height: { type: ['number', 'null'] }, thickness: { type: ['number', 'null'] }, unit: { type: ['string', 'null'] } }, additionalProperties: false },
+    holes: { type: ['object', 'null'], additionalProperties: true },
+    fillet: { type: ['object', 'null'], additionalProperties: true },
+    chamfer: { type: ['object', 'null'], additionalProperties: true },
+  },
+  required: ['base'],
+  additionalProperties: false,
+};
+
 export const CAD_PLAN_TOOLS = [{
   name: 'cad_validate_plan',
-  description: 'Mandatory non-mutating validation gate. PREFERRED INPUT: Simple Intent Plan. Plate: {shape:"plate",size:[100,60,10],unit:"mm"}. Polygon profile: {shape:"profile",profile:[[0,0],[100,0],[100,40],[0,40]],thickness:10,unit:"mm"}. Explicit hole centers are supported on plate and profile; grid/edge-offset and finishing currently require plate. Feature and legacy plans remain supported.',
+  description: 'Mandatory non-mutating validation gate. ALWAYS use the Preferred Simple Intent Plan when it can represent the request; do not create a Feature Plan yourself. Do not mix formats. Explicit holes are simply holes:{diameter,centers:[[x,y],...]}; never add placement, count, after, target, or operation. Only include features explicitly requested by the user. Never add holes, fillet, chamfer, or other geometry unless explicitly requested. Compatibility Feature/Legacy formats remain accepted for existing callers.',
   inputSchema: {
     type: 'object' as const,
     properties: {
       plan: {
-        type: 'object',
-        description: 'Prefer Simple Intent: shape:"plate" with size, or shape:"profile" with profile vertices and thickness. Explicit holes.centers works for both; grid/edge-offset holes and fillet/chamfer currently require plate. Ordered feature and legacy rectangular_plate plans remain supported.',
-        properties: {
-          shape: { type: ['string', 'null'], enum: ['plate', 'profile', null], description: 'Simple Intent shape: rectangular plate or straight-segment polygon profile.' },
-          size: { type: ['array', 'null'], minItems: 3, maxItems: 3, items: { type: 'number' }, description: 'Simple plate [width,height,thickness].' },
-          profile: { type: ['array', 'null'], minItems: 3, items: { type: 'array', minItems: 2, maxItems: 2, items: { type: 'number' } }, description: 'Simple profile polygon vertices as [[x,y],...]; closure is automatic.' },
-          thickness: { type: ['number', 'null'], exclusiveMinimum: 0, description: 'Simple profile extrusion length in +Z, in mm.' },
-          unit: { type: ['string', 'null'], enum: ['mm', null], description: 'Unit for a feature plan; currently only mm.' },
-          features: {
-            type: ['array', 'null'],
-            description: 'Ordered feature construction plan. Supported types: rectangular_pad, profile_pad, hole_pattern, fillet, chamfer.',
-            items: {
-              type: 'object',
-              properties: {
-                id: { type: ['string', 'null'], description: 'Optional stable semantic feature ID. If omitted, the server deterministically generates base, holes, fillet, chamfer, then suffixed variants.' },
-                type: { type: ['string', 'null'], enum: ['rectangular_pad', 'profile_pad', 'hole_pattern', 'fillet', 'chamfer', null] },
-                points: { type: ['array', 'null'], minItems: 3, items: { type: 'array', minItems: 2, maxItems: 2, items: { type: 'number' } }, description: 'profile_pad polygon vertices; closure is automatic.' },
-                width: { type: ['number', 'null'] },
-                height: { type: ['number', 'null'] },
-                length: { type: ['number', 'null'] },
-                diameter: { type: ['number', 'null'] },
-                count: { type: ['integer', 'null'] },
-                placement: {
-                  type: ['object', 'null'],
-                  properties: {
-                    type: { type: ['string', 'null'], enum: ['edge_offset', 'explicit', 'rectangular_grid', null] },
-                    distance: { type: ['number', 'null'] },
-                    reference: { type: ['string', 'null'], enum: ['center', 'boundary', null], description: 'Use null when center versus boundary is not explicit.' },
-                    centers: {
-                      type: ['array', 'null'],
-                      items: {
-                        oneOf: [
-                          { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'], additionalProperties: false },
-                          { type: 'array', minItems: 2, maxItems: 2, items: { type: 'number' } },
-                        ],
-                      },
-                    },
-                    origin: { type: ['object', 'null'], properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'], additionalProperties: false },
-                    columns: { type: ['integer', 'null'] },
-                    rows: { type: ['integer', 'null'] },
-                    spacing_x: { type: ['number', 'null'] },
-                    spacing_y: { type: ['number', 'null'] },
-                  },
-                },
-                radius: { type: ['number', 'null'] },
-                size: { type: ['number', 'null'] },
-                edges: { type: ['string', 'null'], enum: ['all_vertical', 'all_top', 'all_bottom', 'all_top_outer', 'all_top_inner', 'all_bottom_outer', 'all_bottom_inner', null] },
-                after: { type: ['string', 'null'], description: 'Optional reference to an earlier feature ID.' },
-                target: { type: ['string', 'null'], description: 'Optional semantic target referencing an earlier feature ID.' },
-                operation: { type: ['string', 'null'], enum: ['through_all', null], description: 'Optional hole operation; currently only through_all.' },
-              },
-            },
-          },
-          base: {
-            type: ['object', 'null'],
-            properties: {
-              type: { type: ['string', 'null'] },
-              width: { type: ['number', 'null'] },
-              height: { type: ['number', 'null'] },
-              thickness: { type: ['number', 'null'] },
-              unit: { type: ['string', 'null'] },
-            },
-          },
-          holes: {
-            type: ['object', 'null'],
-            properties: {
-              count: { type: ['integer', 'null'] },
-              diameter: { type: ['number', 'null'] },
-              grid: { type: ['array', 'null'], minItems: 2, maxItems: 2, items: { type: 'integer' }, description: 'Simple grid [columns,rows].' },
-              start: { type: ['array', 'null'], minItems: 2, maxItems: 2, items: { type: 'number' }, description: 'Simple grid origin [x,y].' },
-              spacing: { type: ['array', 'null'], minItems: 2, maxItems: 2, items: { type: 'number' }, description: 'Simple grid spacing [x,y].' },
-              centers: { type: ['array', 'null'], minItems: 1, items: { type: 'array', minItems: 2, maxItems: 2, items: { type: 'number' } }, description: 'Simple explicit centers as [[x,y],...].' },
-              edge_offset: { type: ['number', 'null'], description: 'Simple four-corner edge offset.' },
-              reference: { type: ['string', 'null'], enum: ['center', 'boundary', null] },
-              placement: {
-                type: ['object', 'null'],
-                description: 'Required hole placement: edge_offset, explicit centers, or rectangular_grid.',
-                properties: {
-                  type: { type: ['string', 'null'], enum: ['edge_offset', 'explicit', 'rectangular_grid', null], description: 'Supported strategies: edge_offset, explicit, rectangular_grid.' },
-                  distance: { type: ['number', 'null'] },
-                  reference: { type: ['string', 'null'], enum: ['center', 'boundary', null], description: 'center means distance to hole center; boundary means distance to hole rim; use null whenever the user did not explicitly disambiguate.' },
-                  centers: { type: ['array', 'null'], items: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'], additionalProperties: false } },
-                  origin: { type: ['object', 'null'], properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'], additionalProperties: false },
-                  columns: { type: ['integer', 'null'] },
-                  rows: { type: ['integer', 'null'] },
-                  spacing_x: { type: ['number', 'null'] },
-                  spacing_y: { type: ['number', 'null'] },
-                },
-              },
-            },
-          },
-          fillet: {
-            type: ['object', 'null'],
-            properties: {
-              radius: { type: ['number', 'null'] },
-              edges: { type: ['string', 'object', 'null'] },
-            },
-          },
-          chamfer: {
-            type: ['object', 'null'],
-            properties: {
-              size: { type: ['number', 'null'] },
-              edges: { type: ['string', 'object', 'null'] },
-            },
-          },
-        },
+        description: 'Choose exactly one format. The first oneOf branch is the preferred Simple Intent format for LLM calls.',
+        oneOf: [simplePlanSchema, featurePlanSchema, legacyPlanSchema],
       },
     },
     additionalProperties: false,
@@ -625,7 +619,31 @@ function normalizeSimplePlan(value: Record<string, unknown>): NormalizedFeatureP
 }
 
 function normalizeToFeaturePlan(value: Record<string, unknown>): NormalizedFeaturePlan {
-  if (Object.hasOwn(value, 'shape') || Object.hasOwn(value, 'size')) return normalizeSimplePlan(value);
+  const hasSimpleFields = ['shape', 'size', 'profile', 'thickness'].some((key) => Object.hasOwn(value, key));
+  const hasFeatureFields = Object.hasOwn(value, 'features');
+  const hasLegacyFields = Object.hasOwn(value, 'base');
+  if ([hasSimpleFields, hasFeatureFields, hasLegacyFields].filter(Boolean).length > 1) {
+    const mixedKeys = [
+      ...(hasSimpleFields ? ['Simple Intent'] : []),
+      ...(hasFeatureFields ? ['Feature Plan'] : []),
+      ...(hasLegacyFields ? ['Legacy Plan'] : []),
+    ];
+    return {
+      source: 'simple',
+      unit: value.unit,
+      features: [],
+      paths: [],
+      issues: [{
+        kind: 'invalid',
+        code: 'MIXED_PLAN_FORMAT',
+        path: 'plan',
+        message: `Do not mix ${mixedKeys.join(' and ')} fields. Use shape/size/profile/thickness for Simple Intent, features for Feature Plan, or base for Legacy Plan.`,
+      }],
+    };
+  }
+  const hasSimpleOperationWithoutFormat = !hasFeatureFields && !hasLegacyFields
+    && ['holes', 'fillet', 'chamfer'].some((key) => Object.hasOwn(value, key));
+  if (hasSimpleFields || hasSimpleOperationWithoutFormat) return normalizeSimplePlan(value);
   const issues: InternalIssue[] = [];
   if (Object.hasOwn(value, 'features') || Object.hasOwn(value, 'unit')) {
     for (const key of Object.keys(value)) {
