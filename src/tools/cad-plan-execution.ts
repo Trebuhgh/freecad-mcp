@@ -1,12 +1,15 @@
 import { FreeCADBridge } from '../freecad-bridge.js';
 import { ToolArgs, ToolResult } from '../types.js';
 import { CadPlanValidationGate, cadPlanNotValidatedToolResult } from './cad-plan-validation.js';
+import {
+  AREA_TOLERANCE_MM2,
+  DIRECTION_VECTOR_EPSILON_MM,
+  LINEAR_TOLERANCE_MM,
+  VOLUME_TOLERANCE_MM3,
+} from './cad-geometry-tolerances.js';
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
-export const LINEAR_TOLERANCE_MM = 1e-6;
-export const AREA_TOLERANCE_MM2 = 1e-6;
-export const VOLUME_TOLERANCE_MM3 = 1e-7;
-export const DIRECTION_VECTOR_EPSILON_MM = 1e-12;
+export { AREA_TOLERANCE_MM2, DIRECTION_VECTOR_EPSILON_MM, LINEAR_TOLERANCE_MM, VOLUME_TOLERANCE_MM3 };
 
 function validateDocumentName(value: unknown): string | undefined {
   if (value === undefined) return undefined;
@@ -176,9 +179,22 @@ try:
             raise RuntimeError("CAD_DOCUMENT_ALREADY_EXISTS|" + document_name)
     features = plan["features"]
     base_plan = features[0]
-    width = float(base_plan["width"])
-    height = float(base_plan["height"])
+    base_type = base_plan["type"]
     length = float(base_plan["length"])
+    width = None
+    height = None
+    profile_points = None
+    expected_profile_area = None
+    if base_type == "rectangular_pad":
+        width = float(base_plan["width"])
+        height = float(base_plan["height"])
+        expected_bounds = {"x": width, "y": height, "z": length}
+    elif base_type == "profile_pad":
+        profile_points = [[float(point[0]), float(point[1])] for point in base_plan["points"]]
+        expected_profile_area = abs(sum(profile_points[index][0] * profile_points[(index + 1) % len(profile_points)][1] - profile_points[(index + 1) % len(profile_points)][0] * profile_points[index][1] for index in range(len(profile_points))) / 2.0)
+        expected_bounds = {"x": max(point[0] for point in profile_points) - min(point[0] for point in profile_points), "y": max(point[1] for point in profile_points) - min(point[1] for point in profile_points), "z": length}
+    else:
+        raise RuntimeError("UNSUPPORTED_RESOLVED_BASE_FEATURE: " + str(base_type))
     executed_steps = []
     feature_results = []
     expected_holes = []
@@ -218,6 +234,38 @@ try:
             if body.Tip != pad or pad.Shape.isNull() or not pad.Shape.isValid() or len(pad.Shape.Solids) != 1:
                 raise RuntimeError("PAD_POSTCONDITION_FAILED")
             feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pad.Name, "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(sketch.DoF), "solid_valid": True})
+        elif feature_type == "profile_pad":
+            sketch = body.newObject("Sketcher::SketchObject", "PlanSketch_" + str(feature_index))
+            attach_xy(sketch, body)
+            segment_indices = []
+            for point_index, point in enumerate(profile_points):
+                next_point = profile_points[(point_index + 1) % len(profile_points)]
+                segment_indices.append(sketch.addGeometry(Part.LineSegment(FreeCAD.Vector(point[0], point[1], 0), FreeCAD.Vector(next_point[0], next_point[1], 0)), False))
+            for point_index, segment in enumerate(segment_indices):
+                next_segment = segment_indices[(point_index + 1) % len(segment_indices)]
+                sketch.addConstraint(Sketcher.Constraint("Coincident", segment, 2, next_segment, 1))
+            for point_index, segment in enumerate(segment_indices):
+                point = profile_points[point_index]
+                sketch.addConstraint(Sketcher.Constraint("DistanceX", -1, 1, segment, 1, point[0]))
+                sketch.addConstraint(Sketcher.Constraint("DistanceY", -1, 1, segment, 1, point[1]))
+            solve_result = sketch.solve()
+            doc.recompute()
+            check_object(sketch, "PROFILE_SKETCH_RECOMPUTE_FAILED")
+            if solve_result not in (None, 0) or not sketch.FullyConstrained or int(sketch.DoF) != 0 or len(sketch.Geometry) != len(profile_points) or len(sketch.Shape.Wires) != 1 or not sketch.Shape.Wires[0].isClosed():
+                raise RuntimeError("PROFILE_SKETCH_VALIDATION_FAILED")
+            pad = body.newObject("PartDesign::Pad", "PlanFeature_" + str(feature_index))
+            pad.Label = feature_id
+            pad.Profile = sketch
+            pad.Length = length
+            if hasattr(pad, "Reversed"):
+                pad.Reversed = False
+            if hasattr(pad, "Midplane"):
+                pad.Midplane = False
+            doc.recompute()
+            check_object(pad, "PROFILE_PAD_RECOMPUTE_FAILED")
+            if body.Tip != pad or pad.Shape.isNull() or not pad.Shape.isValid() or len(pad.Shape.Solids) != 1 or float(pad.Shape.Volume) <= VOLUME_TOLERANCE_MM3:
+                raise RuntimeError("PROFILE_PAD_POSTCONDITION_FAILED")
+            feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pad.Name, "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(sketch.DoF), "segment_count": len(sketch.Geometry), "solid_valid": True})
         elif feature_type == "hole_pattern":
             source_volume = float(body.Tip.Shape.Volume)
             diameter = float(feature_plan["diameter"])
@@ -317,11 +365,10 @@ try:
     shape_passed = actual_snapshot["shape_valid"] is True
     if not shape_passed:
         add_issue(None, None, "shape_valid", True, actual_snapshot["shape_valid"], "The final shape is null or invalid.")
-    expected_bounds = {"x": width, "y": height, "z": length}
     actual_bounds = actual_snapshot["bounding_box"]
     bounds_passed = all(abs(float(actual_bounds[axis]) - float(expected_bounds[axis])) <= LINEAR_TOLERANCE_MM for axis in ("x", "y", "z"))
     if not bounds_passed:
-        add_issue(features[0]["id"], "rectangular_pad", "bounding_box", expected_bounds, actual_bounds, "The final bounding box does not match the resolved base dimensions.")
+        add_issue(features[0]["id"], features[0]["type"], "bounding_box", expected_bounds, actual_bounds, "The final bounding box does not match the resolved base dimensions.")
     expected_feature_ids = [item["id"] for item in features]
     feature_order_passed = actual_snapshot["feature_ids"] == expected_feature_ids
     if not feature_order_passed:
@@ -337,12 +384,24 @@ try:
         feature_id = feature_plan["id"]
         feature_type = feature_plan["type"]
         entry = {"id": feature_id, "type": feature_type, "passed": True}
-        if feature_type == "rectangular_pad":
+        if feature_type in ("rectangular_pad", "profile_pad"):
             entry["sketch_closed"] = bool(feature_result.get("sketch_closed"))
             entry["sketch_fully_constrained"] = bool(feature_result.get("sketch_fully_constrained"))
             entry["sketch_degrees_of_freedom"] = feature_result.get("sketch_dof")
             entry["solid_created"] = bool(feature_result.get("solid_valid"))
             entry["passed"] = entry["sketch_closed"] and entry["sketch_fully_constrained"] and entry["sketch_degrees_of_freedom"] == 0 and entry["solid_created"]
+            if feature_type == "profile_pad":
+                expected_volume = expected_profile_area * length
+                actual_volume = geometry_signature["volume"]
+                volume_passed = abs(float(actual_volume) - float(expected_volume)) <= VOLUME_TOLERANCE_MM3
+                entry["segment_count"] = {"expected": len(profile_points), "actual": feature_result.get("segment_count"), "passed": feature_result.get("segment_count") == len(profile_points)}
+                entry["extrusion_height"] = {"expected": length, "actual": geometry_signature["bounding_box"]["z"], "passed": abs(float(geometry_signature["bounding_box"]["z"]) - length) <= LINEAR_TOLERANCE_MM}
+                entry["volume"] = {"expected": expected_volume, "actual": actual_volume, "passed": volume_passed}
+                entry["passed"] = entry["passed"] and entry["segment_count"]["passed"] and entry["extrusion_height"]["passed"] and volume_passed
+                if not volume_passed:
+                    add_issue(feature_id, feature_type, "volume", expected_volume, actual_volume, "The actual volume does not equal polygon area multiplied by extrusion length.")
+                if not entry["extrusion_height"]["passed"]:
+                    add_issue(feature_id, feature_type, "extrusion_height", length, geometry_signature["bounding_box"]["z"], "The actual extrusion height does not match profile_pad.length.")
             if not entry["passed"]:
                 add_issue(feature_id, feature_type, "base_feature", {"closed": True, "fully_constrained": True, "degrees_of_freedom": 0, "solid_created": True}, entry, "The base sketch or Pad postconditions were not preserved.")
         elif feature_type == "hole_pattern":

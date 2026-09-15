@@ -1,4 +1,5 @@
 import { ToolArgs, ToolResult } from '../types.js';
+import { AREA_TOLERANCE_MM2, LINEAR_TOLERANCE_MM } from './cad-geometry-tolerances.js';
 
 type PlanStatus = 'valid' | 'incomplete' | 'ambiguous' | 'unsupported' | 'invalid';
 type IssueKind = Exclude<PlanStatus, 'valid'>;
@@ -100,25 +101,28 @@ export class CadPlanValidationGate {
 
 export const CAD_PLAN_TOOLS = [{
   name: 'cad_validate_plan',
-  description: 'Mandatory non-mutating validation gate. PREFERRED INPUT: Simple Intent Plan. Plate: {shape:"plate",size:[100,60,10],unit:"mm"}. Explicit holes: holes:{diameter:6,centers:[[10,10],[50,30]]}. Grid: holes:{diameter:6,grid:[3,2],start:[20,15],spacing:[30,20]}. Ambiguous edge offset: holes:{diameter:8,edge_offset:10,reference:null}. Optional finishing: fillet:{radius:5,edges:"all_vertical"}, chamfer:{size:0.5,edges:"all_top_inner"}. Feature and legacy plans remain supported. Never infer center versus boundary.',
+  description: 'Mandatory non-mutating validation gate. PREFERRED INPUT: Simple Intent Plan. Plate: {shape:"plate",size:[100,60,10],unit:"mm"}. Polygon profile: {shape:"profile",profile:[[0,0],[100,0],[100,40],[0,40]],thickness:10,unit:"mm"}. Holes and finishing currently require shape:"plate". Feature and legacy plans remain supported.',
   inputSchema: {
     type: 'object' as const,
     properties: {
       plan: {
         type: 'object',
-        description: 'Prefer the compact Simple Intent form with shape + size and optional holes/fillet/chamfer. Ordered feature plans and backward-compatible legacy rectangular_plate plans remain supported. Geometrically relevant values have no implicit defaults.',
+        description: 'Prefer Simple Intent: shape:"plate" with size, or shape:"profile" with profile vertices and thickness. Holes/fillet/chamfer currently require plate. Ordered feature and legacy rectangular_plate plans remain supported.',
         properties: {
-          shape: { type: ['string', 'null'], enum: ['plate', null], description: 'Simple Intent shape; currently plate.' },
+          shape: { type: ['string', 'null'], enum: ['plate', 'profile', null], description: 'Simple Intent shape: rectangular plate or straight-segment polygon profile.' },
           size: { type: ['array', 'null'], minItems: 3, maxItems: 3, items: { type: 'number' }, description: 'Simple plate [width,height,thickness].' },
+          profile: { type: ['array', 'null'], minItems: 3, items: { type: 'array', minItems: 2, maxItems: 2, items: { type: 'number' } }, description: 'Simple profile polygon vertices as [[x,y],...]; closure is automatic.' },
+          thickness: { type: ['number', 'null'], exclusiveMinimum: 0, description: 'Simple profile extrusion length in +Z, in mm.' },
           unit: { type: ['string', 'null'], enum: ['mm', null], description: 'Unit for a feature plan; currently only mm.' },
           features: {
             type: ['array', 'null'],
-            description: 'Ordered feature construction plan. Supported types: rectangular_pad, hole_pattern, fillet, chamfer.',
+            description: 'Ordered feature construction plan. Supported types: rectangular_pad, profile_pad, hole_pattern, fillet, chamfer.',
             items: {
               type: 'object',
               properties: {
                 id: { type: ['string', 'null'], description: 'Optional stable semantic feature ID. If omitted, the server deterministically generates base, holes, fillet, chamfer, then suffixed variants.' },
-                type: { type: ['string', 'null'], enum: ['rectangular_pad', 'hole_pattern', 'fillet', 'chamfer', null] },
+                type: { type: ['string', 'null'], enum: ['rectangular_pad', 'profile_pad', 'hole_pattern', 'fillet', 'chamfer', null] },
+                points: { type: ['array', 'null'], minItems: 3, items: { type: 'array', minItems: 2, maxItems: 2, items: { type: 'number' } }, description: 'profile_pad polygon vertices; closure is automatic.' },
                 width: { type: ['number', 'null'] },
                 height: { type: ['number', 'null'] },
                 length: { type: ['number', 'null'] },
@@ -415,6 +419,8 @@ function validateLegacyCadPlan(value: unknown): CadPlanValidationResult {
 }
 
 const FEATURE_ID = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const BASE_FEATURE_TYPES = ['rectangular_pad', 'profile_pad'] as const;
+const SUPPORTED_FEATURE_TYPES = ['rectangular_pad', 'profile_pad', 'hole_pattern', 'fillet', 'chamfer'] as const;
 
 interface NormalizedFeaturePlan {
   source: 'legacy' | 'feature' | 'simple';
@@ -422,6 +428,110 @@ interface NormalizedFeaturePlan {
   features: Record<string, unknown>[];
   paths: string[];
   issues: InternalIssue[];
+}
+
+type PolygonPoint = [number, number];
+
+interface ValidatedProfile {
+  points?: PolygonPoint[];
+  length?: number;
+  area?: number;
+  issues: InternalIssue[];
+}
+
+function pointsEqual(first: PolygonPoint, second: PolygonPoint): boolean {
+  return Math.abs(first[0] - second[0]) <= LINEAR_TOLERANCE_MM
+    && Math.abs(first[1] - second[1]) <= LINEAR_TOLERANCE_MM;
+}
+
+function signedPolygonArea(points: PolygonPoint[]): number {
+  const origin = points[0];
+  let twiceArea = 0;
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const currentX = points[index][0] - origin[0];
+    const currentY = points[index][1] - origin[1];
+    const nextX = points[index + 1][0] - origin[0];
+    const nextY = points[index + 1][1] - origin[1];
+    twiceArea += currentX * nextY - nextX * currentY;
+  }
+  return twiceArea / 2;
+}
+
+function orientation(first: PolygonPoint, second: PolygonPoint, third: PolygonPoint): number {
+  return (second[0] - first[0]) * (third[1] - first[1]) - (second[1] - first[1]) * (third[0] - first[0]);
+}
+
+function pointOnSegment(point: PolygonPoint, start: PolygonPoint, end: PolygonPoint): boolean {
+  return Math.abs(orientation(start, end, point)) <= AREA_TOLERANCE_MM2
+    && point[0] >= Math.min(start[0], end[0]) - LINEAR_TOLERANCE_MM
+    && point[0] <= Math.max(start[0], end[0]) + LINEAR_TOLERANCE_MM
+    && point[1] >= Math.min(start[1], end[1]) - LINEAR_TOLERANCE_MM
+    && point[1] <= Math.max(start[1], end[1]) + LINEAR_TOLERANCE_MM;
+}
+
+function segmentsIntersect(firstStart: PolygonPoint, firstEnd: PolygonPoint, secondStart: PolygonPoint, secondEnd: PolygonPoint): boolean {
+  const firstSide = orientation(firstStart, firstEnd, secondStart);
+  const secondSide = orientation(firstStart, firstEnd, secondEnd);
+  const thirdSide = orientation(secondStart, secondEnd, firstStart);
+  const fourthSide = orientation(secondStart, secondEnd, firstEnd);
+  const opposite = (firstSide > AREA_TOLERANCE_MM2 && secondSide < -AREA_TOLERANCE_MM2) || (firstSide < -AREA_TOLERANCE_MM2 && secondSide > AREA_TOLERANCE_MM2);
+  const reverseOpposite = (thirdSide > AREA_TOLERANCE_MM2 && fourthSide < -AREA_TOLERANCE_MM2) || (thirdSide < -AREA_TOLERANCE_MM2 && fourthSide > AREA_TOLERANCE_MM2);
+  if (opposite && reverseOpposite) return true;
+  return (Math.abs(firstSide) <= AREA_TOLERANCE_MM2 && pointOnSegment(secondStart, firstStart, firstEnd))
+    || (Math.abs(secondSide) <= AREA_TOLERANCE_MM2 && pointOnSegment(secondEnd, firstStart, firstEnd))
+    || (Math.abs(thirdSide) <= AREA_TOLERANCE_MM2 && pointOnSegment(firstStart, secondStart, secondEnd))
+    || (Math.abs(fourthSide) <= AREA_TOLERANCE_MM2 && pointOnSegment(firstEnd, secondStart, secondEnd));
+}
+
+function validateProfilePad(feature: Record<string, unknown>, path: string): ValidatedProfile {
+  const issues: InternalIssue[] = [];
+  for (const key of Object.keys(feature)) {
+    if (!['id', 'type', 'points', 'length', 'after', 'target'].includes(key)) issues.push({ kind: 'invalid', code: 'UNKNOWN_PROFILE_FIELD', path: `${path}.${key}`, message: `Unknown profile_pad field "${key}".` });
+  }
+  const length = positiveNumber(feature, 'length', `${path}.length`, 'Profile extrusion length', issues);
+  if (!Array.isArray(feature.points)) {
+    issues.push({ kind: feature.points === undefined || feature.points === null ? 'incomplete' : 'invalid', code: feature.points === undefined || feature.points === null ? 'MISSING_REQUIRED_VALUE' : 'INVALID_PROFILE_POINTS', path: `${path}.points`, message: 'profile_pad points must be an array.' });
+    return { length, issues };
+  }
+  if (feature.points.length > 1000) {
+    issues.push({ kind: 'invalid', code: 'PROFILE_TOO_MANY_POINTS', path: `${path}.points`, message: 'At most 1000 profile points are supported.' });
+    return { length, issues };
+  }
+  const parsed: PolygonPoint[] = [];
+  feature.points.forEach((point, index) => {
+    if (!Array.isArray(point) || point.length !== 2 || point.some((coordinate) => typeof coordinate !== 'number' || !Number.isFinite(coordinate))) issues.push({ kind: 'invalid', code: 'INVALID_PROFILE_POINT', path: `${path}.points.${index}`, message: 'Each profile point must be exactly [x,y] with finite coordinates.' });
+    else parsed.push([point[0] as number, point[1] as number]);
+  });
+  if (parsed.length !== feature.points.length) return { length, issues };
+  if (parsed.length >= 2 && pointsEqual(parsed[0], parsed[parsed.length - 1])) parsed.pop();
+  if (parsed.length < 3) {
+    issues.push({ kind: 'invalid', code: 'PROFILE_TOO_FEW_POINTS', path: `${path}.points`, message: 'A profile requires at least three distinct vertices.' });
+    return { length, issues };
+  }
+  for (let index = 0; index < parsed.length; index += 1) {
+    if (pointsEqual(parsed[index], parsed[(index + 1) % parsed.length])) issues.push({ kind: 'invalid', code: 'PROFILE_DUPLICATE_POINT', path: `${path}.points.${index}`, message: 'Consecutive profile points create a zero-length segment.' });
+  }
+  const distinct: PolygonPoint[] = [];
+  for (const point of parsed) if (!distinct.some((candidate) => pointsEqual(candidate, point))) distinct.push(point);
+  if (distinct.length < 3 && !issues.some((issue) => issue.code === 'PROFILE_TOO_FEW_POINTS')) issues.push({ kind: 'invalid', code: 'PROFILE_TOO_FEW_POINTS', path: `${path}.points`, message: 'A profile requires at least three distinct vertices.' });
+  const signedArea = signedPolygonArea(parsed);
+  if (!Number.isFinite(signedArea)) issues.push({ kind: 'invalid', code: 'PROFILE_AREA_NOT_FINITE', path: `${path}.points`, message: 'The polygon area cannot be represented as a finite number.' });
+  else if (Math.abs(signedArea) <= AREA_TOLERANCE_MM2) issues.push({ kind: 'invalid', code: 'PROFILE_ZERO_AREA', path: `${path}.points`, message: 'The polygon area is zero within geometric tolerance.' });
+  for (let first = 0; first < parsed.length; first += 1) {
+    const firstNext = (first + 1) % parsed.length;
+    for (let second = first + 1; second < parsed.length; second += 1) {
+      const secondNext = (second + 1) % parsed.length;
+      if (first === second || firstNext === second || secondNext === first) continue;
+      if (segmentsIntersect(parsed[first], parsed[firstNext], parsed[second], parsed[secondNext])) {
+        issues.push({ kind: 'invalid', code: 'PROFILE_SELF_INTERSECTION', path: `${path}.points`, message: `Non-adjacent profile segments ${first} and ${second} intersect or overlap.` });
+        first = parsed.length;
+        break;
+      }
+    }
+  }
+  if (issues.length > 0 || length === undefined) return { length, issues };
+  const points = signedArea < 0 ? [parsed[0], ...parsed.slice(1).reverse()] : parsed;
+  return { points, length, area: Math.abs(signedArea), issues };
 }
 
 function simpleTuple(value: unknown, path: string, positive: boolean, integer: boolean, issues: InternalIssue[]): number[] | undefined {
@@ -439,17 +549,25 @@ function simpleTuple(value: unknown, path: string, positive: boolean, integer: b
 function normalizeSimplePlan(value: Record<string, unknown>): NormalizedFeaturePlan {
   const issues: InternalIssue[] = [];
   for (const key of Object.keys(value)) {
-    if (!['shape', 'size', 'unit', 'holes', 'fillet', 'chamfer'].includes(key)) issues.push({ kind: 'invalid', code: 'UNKNOWN_SIMPLE_FIELD', path: key, message: `Unknown Simple Intent field "${key}".` });
+    if (!['shape', 'size', 'profile', 'thickness', 'unit', 'holes', 'fillet', 'chamfer'].includes(key)) issues.push({ kind: 'invalid', code: 'UNKNOWN_SIMPLE_FIELD', path: key, message: `Unknown Simple Intent field "${key}".` });
   }
   if (value.shape === undefined || value.shape === null) addMissing(issues, 'shape', 'shape');
-  else if (value.shape !== 'plate') issues.push({ kind: 'unsupported', code: 'UNSUPPORTED_SHAPE', path: 'shape', message: `Shape "${String(value.shape)}" is not supported.` });
-  let size: number[] | undefined;
-  if (value.size === undefined || value.size === null) addMissing(issues, 'size', 'Plate size');
-  else if (!Array.isArray(value.size) || value.size.length !== 3 || value.size.some((item) => typeof item !== 'number' || !Number.isFinite(item) || item <= 0)) issues.push({ kind: 'invalid', code: 'INVALID_PLATE_SIZE', path: 'size', message: 'size must contain exactly three positive finite values [width,height,thickness].' });
-  else size = value.size as number[];
-
-  const features: Record<string, unknown>[] = [{ type: 'rectangular_pad', width: size?.[0], height: size?.[1], length: size?.[2] }];
-  const paths = ['shape'];
+  else if (value.shape !== 'plate' && value.shape !== 'profile') issues.push({ kind: 'unsupported', code: 'UNSUPPORTED_SHAPE', path: 'shape', message: `Shape "${String(value.shape)}" is not supported.` });
+  const features: Record<string, unknown>[] = [];
+  const paths: string[] = [];
+  if (value.shape === 'profile') {
+    if (value.size !== undefined) issues.push({ kind: 'invalid', code: 'CONFLICTING_BASE_DEFINITION', path: 'size', message: 'shape:"profile" uses profile and thickness, not size.' });
+    features.push({ type: 'profile_pad', points: value.profile, length: value.thickness });
+    paths.push('profile');
+  } else {
+    if (value.profile !== undefined || value.thickness !== undefined) issues.push({ kind: 'invalid', code: 'CONFLICTING_BASE_DEFINITION', path: 'profile', message: 'shape:"plate" uses size, not profile or thickness.' });
+    let size: number[] | undefined;
+    if (value.size === undefined || value.size === null) addMissing(issues, 'size', 'Plate size');
+    else if (!Array.isArray(value.size) || value.size.length !== 3 || value.size.some((item) => typeof item !== 'number' || !Number.isFinite(item) || item <= 0)) issues.push({ kind: 'invalid', code: 'INVALID_PLATE_SIZE', path: 'size', message: 'size must contain exactly three positive finite values [width,height,thickness].' });
+    else size = value.size as number[];
+    features.push({ type: 'rectangular_pad', width: size?.[0], height: size?.[1], length: size?.[2] });
+    paths.push('shape');
+  }
   if (value.holes !== undefined && value.holes !== null) {
     if (!isRecord(value.holes)) issues.push({ kind: 'invalid', code: 'INVALID_HOLES', path: 'holes', message: 'holes must be an object.' });
     else {
@@ -654,11 +772,11 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
   normalized.features = normalized.features.map((feature) => {
     const copy = { ...feature };
     const type = typeof copy.type === 'string' ? copy.type : undefined;
-    if (type !== undefined && ['rectangular_pad', 'hole_pattern', 'fillet', 'chamfer'].includes(type)) {
+    if (type !== undefined && (SUPPORTED_FEATURE_TYPES as readonly string[]).includes(type)) {
       const count = (generatedTypeCounts.get(type) ?? 0) + 1;
       generatedTypeCounts.set(type, count);
       if (copy.id === undefined || copy.id === null || copy.id === '') {
-        const baseId = type === 'rectangular_pad' ? 'base' : type === 'hole_pattern' ? 'holes' : type;
+        const baseId = (BASE_FEATURE_TYPES as readonly string[]).includes(type) ? 'base' : type === 'hole_pattern' ? 'holes' : type;
         copy.id = count === 1 ? baseId : `${baseId}_${count}`;
       }
     }
@@ -667,7 +785,7 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
   let previousSolidId: string | undefined;
   normalized.features = normalized.features.map((feature) => {
     const copy = { ...feature };
-    const supported = typeof copy.type === 'string' && ['rectangular_pad', 'hole_pattern', 'fillet', 'chamfer'].includes(copy.type);
+    const supported = typeof copy.type === 'string' && (SUPPORTED_FEATURE_TYPES as readonly string[]).includes(copy.type);
     if (supported && previousSolidId !== undefined && (copy.after === undefined || copy.after === null) && (copy.target === undefined || copy.target === null)) copy.after = previousSolidId;
     if (supported && typeof copy.id === 'string' && FEATURE_ID.test(copy.id)) previousSolidId = copy.id;
     return copy;
@@ -693,19 +811,51 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
     }
     const type = feature.type;
     if (type === undefined || type === null) structuralIssues.push({ kind: 'incomplete', code: 'MISSING_REQUIRED_VALUE', path: `${path}.type`, message: 'Feature type is required.' });
-    else if (!['rectangular_pad', 'hole_pattern', 'fillet', 'chamfer'].includes(String(type))) structuralIssues.push({ kind: 'unsupported', code: 'UNSUPPORTED_FEATURE_TYPE', path: `${path}.type`, message: `Feature type "${String(type)}" is not supported.` });
+    else if (!(SUPPORTED_FEATURE_TYPES as readonly string[]).includes(String(type))) structuralIssues.push({ kind: 'unsupported', code: 'UNSUPPORTED_FEATURE_TYPE', path: `${path}.type`, message: `Feature type "${String(type)}" is not supported.` });
     else {
       if (seenTypes.has(String(type))) structuralIssues.push({ kind: 'invalid', code: 'DUPLICATE_FEATURE_TYPE', path: `${path}.type`, message: `Only one ${String(type)} feature is currently supported.` });
       seenTypes.add(String(type));
-      if (type === 'rectangular_pad') {
-        if (index !== 0 || solidAvailable) structuralIssues.push({ kind: 'invalid', code: 'INVALID_FEATURE_ORDER', path, message: 'rectangular_pad must be the first feature.' });
+      if ((BASE_FEATURE_TYPES as readonly string[]).includes(String(type))) {
+        if (index !== 0 || solidAvailable) structuralIssues.push({ kind: 'invalid', code: 'INVALID_FEATURE_ORDER', path, message: `${String(type)} must be the first and only base feature.` });
         solidAvailable = true;
-      } else if (!solidAvailable) structuralIssues.push({ kind: 'invalid', code: 'INVALID_FEATURE_ORDER', path, message: `${String(type)} requires an earlier rectangular_pad solid.` });
+      } else if (!solidAvailable) structuralIssues.push({ kind: 'invalid', code: 'INVALID_FEATURE_ORDER', path, message: `${String(type)} requires an earlier base solid.` });
     }
     if (typeof id === 'string' && FEATURE_ID.test(id)) earlierIds.add(id);
   });
-  if (normalized.features.length > 0 && normalized.features[0].type !== 'rectangular_pad' && !structuralIssues.some((issue) => issue.code === 'INVALID_FEATURE_ORDER')) {
-    structuralIssues.push({ kind: 'invalid', code: 'INVALID_FEATURE_ORDER', path: normalized.paths[0], message: 'The first feature must be rectangular_pad.' });
+  if (normalized.features.length > 0 && !(BASE_FEATURE_TYPES as readonly unknown[]).includes(normalized.features[0].type) && !structuralIssues.some((issue) => issue.code === 'INVALID_FEATURE_ORDER')) {
+    structuralIssues.push({ kind: 'invalid', code: 'INVALID_FEATURE_ORDER', path: normalized.paths[0], message: 'The first feature must be rectangular_pad or profile_pad.' });
+  }
+
+  const profileFeature = normalized.features.find((feature) => feature.type === 'profile_pad');
+  if (profileFeature !== undefined) {
+    normalized.features.forEach((feature, index) => {
+      if (feature === profileFeature) return;
+      const code = feature.type === 'hole_pattern' ? 'PROFILE_PAD_HOLE_PATTERN_UNSUPPORTED' : 'PROFILE_PAD_FINISHING_UNSUPPORTED';
+      structuralIssues.push({ kind: 'unsupported', code, path: normalized.paths[index], message: `${String(feature.type)} is not yet supported after profile_pad.` });
+    });
+    const profileIndex = normalized.features.indexOf(profileFeature);
+    const profilePath = normalized.paths[profileIndex];
+    const profileValidation = validateProfilePad(profileFeature, profilePath);
+    structuralIssues.push(...profileValidation.issues.map((issue) => {
+      if (normalized.source !== 'simple') return issue;
+      if (issue.path === `${profilePath}.points`) return { ...issue, path: 'profile' };
+      if (issue.path.startsWith(`${profilePath}.points.`)) return { ...issue, path: `profile${issue.path.slice(`${profilePath}.points`.length)}` };
+      if (issue.path === `${profilePath}.length`) return { ...issue, path: 'thickness' };
+      return issue;
+    }));
+    if (normalized.unit === undefined || normalized.unit === null || normalized.unit === '') addMissing(structuralIssues, 'unit', 'Unit');
+    else if (typeof normalized.unit !== 'string') structuralIssues.push({ kind: 'invalid', code: 'INVALID_UNIT', path: 'unit', message: 'Unit must be a string.' });
+    else if (normalized.unit !== 'mm') structuralIssues.push({ kind: 'unsupported', code: 'UNSUPPORTED_UNIT', path: 'unit', message: `Unit "${normalized.unit}" is not supported; use mm.` });
+    if (structuralIssues.length > 0 || profileValidation.points === undefined || profileValidation.length === undefined) {
+      const status = statusFor(structuralIssues);
+      return { status, can_execute: false, issues: structuralIssues.map(({ kind: _kind, ...issue }) => issue) };
+    }
+    return {
+      status: 'valid',
+      can_execute: true,
+      issues: [],
+      resolved_plan: { unit: 'mm', features: [{ id: profileFeature.id, type: 'profile_pad', points: profileValidation.points, length: profileValidation.length }] },
+    };
   }
 
   if (structuralIssues.length > 0) {

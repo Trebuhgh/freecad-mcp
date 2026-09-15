@@ -382,3 +382,67 @@ test('simple intent rejects malformed arrays and unknown fields', async () => {
     assert.equal(result.can_execute, false);
   }
 });
+
+const lProfile = [[0, 0], [100, 0], [100, 40], [60, 40], [60, 80], [0, 80]];
+
+test('simple polygon profile normalizes to canonical profile_pad', async () => {
+  const { result, bridge } = await validate({ shape: 'profile', profile: lProfile, thickness: 10, unit: 'mm' });
+  assert.equal(result.status, 'valid');
+  assert.equal(result.can_execute, true);
+  assert.equal(bridge.calls, 0);
+  assert.deepEqual(result.resolved_plan, {
+    unit: 'mm', features: [{ id: 'base', type: 'profile_pad', points: lProfile, length: 10 }],
+  });
+  const featureResult = (await validate({ unit: 'mm', features: [{ type: 'profile_pad', points: lProfile, length: 10 }] })).result;
+  assert.equal(featureResult.status, 'valid');
+  assert.deepEqual(featureResult.resolved_plan, result.resolved_plan);
+});
+
+test('clockwise and counter-clockwise profiles produce the same resolved plan', async () => {
+  const clockwise = [lProfile[0], ...lProfile.slice(1).reverse()];
+  const ccwResult = (await validate({ shape: 'profile', profile: lProfile, thickness: 10, unit: 'mm' })).result;
+  const cwResult = (await validate({ shape: 'profile', profile: clockwise, thickness: 10, unit: 'mm' })).result;
+  assert.deepEqual(cwResult.resolved_plan, ccwResult.resolved_plan);
+});
+
+test('explicit polygon closure is removed from the resolved plan', async () => {
+  const { result } = await validate({ shape: 'profile', profile: [...lProfile, lProfile[0]], thickness: 10, unit: 'mm' });
+  assert.equal(result.status, 'valid');
+  assert.deepEqual(result.resolved_plan.features[0].points, lProfile);
+  assert.equal(result.resolved_plan.features[0].points.length, 6);
+});
+
+for (const [name, profile, code] of [
+  ['self-intersecting bow-tie', [[0, 0], [100, 100], [0, 100], [100, 0]], 'PROFILE_SELF_INTERSECTION'],
+  ['zero-area collinear profile', [[0, 0], [50, 0], [100, 0]], 'PROFILE_ZERO_AREA'],
+  ['consecutive duplicate point', [[0, 0], [100, 0], [100, 0], [0, 80]], 'PROFILE_DUPLICATE_POINT'],
+  ['too few vertices', [[0, 0], [100, 0]], 'PROFILE_TOO_FEW_POINTS'],
+]) {
+  test(`${name} is rejected before FreeCAD execution`, async () => {
+    const { result, bridge } = await validate({ shape: 'profile', profile, thickness: 10, unit: 'mm' });
+    assert.equal(result.status, 'invalid');
+    assert.equal(result.can_execute, false);
+    assert.ok(result.issues.some((issue) => issue.code === code));
+    assert.equal(bridge.calls, 0);
+  });
+}
+
+test('profile_pad followed by hole_pattern or finishing is explicitly unsupported', async () => {
+  const plans = [
+    {
+      unit: 'mm', features: [
+        { type: 'profile_pad', points: lProfile, length: 10 },
+        { type: 'hole_pattern', diameter: 6, placement: { type: 'explicit', centers: [{ x: 20, y: 20 }] } },
+      ],
+    },
+    { shape: 'profile', profile: lProfile, thickness: 10, unit: 'mm', fillet: { radius: 2, edges: 'all_vertical' } },
+    { shape: 'profile', profile: lProfile, thickness: 10, unit: 'mm', chamfer: { size: 1, edges: 'all_top_outer' } },
+  ];
+  for (const planValue of plans) {
+    const { result, bridge } = await validate(planValue);
+    assert.equal(result.status, 'unsupported');
+    assert.equal(result.can_execute, false);
+    assert.ok(result.issues.some((issue) => issue.code === 'PROFILE_PAD_HOLE_PATTERN_UNSUPPORTED' || issue.code === 'PROFILE_PAD_FINISHING_UNSUPPORTED'));
+    assert.equal(bridge.calls, 0);
+  }
+});

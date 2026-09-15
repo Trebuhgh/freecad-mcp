@@ -421,6 +421,30 @@ test('geometry signature is deterministic and contains no topological index iden
   assert.doesNotMatch(JSON.stringify(firstSignature), /(?:Face|Edge|Vertex)[1-9][0-9]*/);
 });
 
+for (const [name, profile, expectedBounds, expectedArea] of [
+  ['L', [[0, 0], [100, 0], [100, 40], [60, 40], [60, 80], [0, 80]], { x: 100, y: 80, z: 10 }, 6400],
+  ['U', [[0, 0], [100, 0], [100, 80], [70, 80], [70, 30], [30, 30], [30, 80], [0, 80]], { x: 100, y: 80, z: 10 }, 6000],
+]) {
+  test(`${name}-profile executes as a fully constrained profile_pad and verifies geometry`, async () => {
+    const { bridge, validation } = await validateAndCapture({ shape: 'profile', profile, thickness: 10, unit: 'mm' }, `Profile${name}`);
+    assert.equal(validation.resolved_plan.features[0].type, 'profile_pad');
+    const execution = executeFreeCad(bridge.commands[0]);
+    assert.equal(execution.ok, true, execution.traceback);
+    assert.equal(execution.result.success, true, JSON.stringify(execution.result, null, 2));
+    assert.equal(execution.result.status, 'verified');
+    assert.equal(execution.result.solidCount, 1);
+    assert.deepEqual(execution.result.geometry_signature.bounding_box, expectedBounds);
+    assert.equal(execution.result.geometry_signature.volume, expectedArea * 10);
+    const profileVerification = execution.result.verification.features[0];
+    assert.equal(profileVerification.type, 'profile_pad');
+    assert.equal(profileVerification.passed, true);
+    assert.equal(profileVerification.sketch_closed, true);
+    assert.equal(profileVerification.sketch_fully_constrained, true);
+    assert.equal(profileVerification.sketch_degrees_of_freedom, 0);
+    assert.deepEqual(profileVerification.volume, { expected: expectedArea * 10, actual: expectedArea * 10, passed: true });
+  });
+}
+
 for (const scenario of [
   {
     name: 'five actual holes versus six expected holes',
