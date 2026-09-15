@@ -15,6 +15,7 @@ import {
   handleCadValidateEditPlan,
 } from './cad-edit.js';
 import { CAD_MANAGED_MODEL_TOOLS, handleCadListManagedModels } from './cad-managed-models.js';
+import { cadObjectStateInspectionPython } from './cad-object-state-python.js';
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const QUALIFIED_ID = /^([A-Za-z_][A-Za-z0-9_]*)::([A-Za-z_][A-Za-z0-9_]*)$/;
@@ -578,6 +579,7 @@ if support_index < 1 or support_index > len(support_object.Shape.Faces):
 
 function sketchInspectionPython(sketchExpression: string, indent = ''): string {
   const code = `
+${cadObjectStateInspectionPython()}
 def _cad_inspect_sketch(sketch):
     solve_result = sketch.solve()
     doc = sketch.Document
@@ -597,7 +599,7 @@ def _cad_inspect_sketch(sketch):
         solver_errors.append("Partially redundant constraints: " + str(partially_redundant))
     if malformed:
         solver_errors.append("Malformed constraints: " + str(malformed))
-    error_states = [str(state) for state in sketch.State if str(state) not in ("Up-to-date", "Touched")]
+    error_states = cad_object_error_states(sketch)
     for state in error_states:
         solver_errors.append("Object state: " + state)
     shape = sketch.Shape
@@ -894,7 +896,7 @@ try:
     pad.Profile = sketch
     pad.Length = ${length}
     doc.recompute()
-    error_states = [str(state) for state in pad.State if str(state) not in ("Up-to-date", "Touched")]
+    error_states = cad_object_error_states(pad)
     if error_states:
         raise RuntimeError("PAD_RECOMPUTE_FAILED: " + str(error_states))
     if pad.TypeId != "PartDesign::Pad":
@@ -1052,7 +1054,7 @@ try:
     if hasattr(pocket, "Reversed") and not pocket.Shape.isNull() and float(pocket.Shape.Volume) >= base_volume - 1e-7:
         pocket.Reversed = not bool(pocket.Reversed)
         doc.recompute()
-    error_states = [str(state) for state in pocket.State if str(state) not in ("Up-to-date", "Touched")]
+    error_states = cad_object_error_states(pocket)
     if error_states:
         raise RuntimeError("POCKET_RECOMPUTE_FAILED: " + str(error_states))
     if pocket.TypeId != "PartDesign::Pocket":
@@ -1107,6 +1109,7 @@ except Exception:
       const featureType = isFillet ? 'PartDesign::Fillet' : 'PartDesign::Chamfer';
       const property = isFillet ? 'Radius' : 'Size';
       return bridge.run(`
+${cadObjectStateInspectionPython()}
 ${resolveBodyPython(bodyRef.document, bodyRef.object)}
 ${edgeSelectionPython(selection)}
 doc.openTransaction(${JSON.stringify(name)})
@@ -1115,7 +1118,7 @@ try:
     feature.Base = (source, selected_subnames)
     feature.${property} = ${dimension}
     doc.recompute()
-    error_states = [str(state) for state in feature.State if str(state) not in ("Up-to-date", "Touched")]
+    error_states = cad_object_error_states(feature)
     if error_states:
         raise RuntimeError(${JSON.stringify(`${isFillet ? 'FILLET' : 'CHAMFER'}_RECOMPUTE_FAILED: `)} + str(error_states))
     if feature.TypeId != ${JSON.stringify(featureType)}:

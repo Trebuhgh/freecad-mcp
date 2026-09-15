@@ -7,6 +7,7 @@ import {
   VOLUME_TOLERANCE_MM3,
 } from './cad-geometry-tolerances.js';
 import { cadGeometryInspectionPython } from './cad-geometry-inspection-python.js';
+import { cadObjectStateInspectionPython } from './cad-object-state-python.js';
 import { validateCadPlan } from './cad-plan-validation.js';
 
 type EditStatus = 'valid' | 'invalid' | 'unsupported';
@@ -305,6 +306,7 @@ LINEAR_TOLERANCE_MM = ${LINEAR_TOLERANCE_MM}
 AREA_TOLERANCE_MM2 = ${AREA_TOLERANCE_MM2}
 VOLUME_TOLERANCE_MM3 = ${VOLUME_TOLERANCE_MM3}
 DIRECTION_VECTOR_EPSILON_MM = ${DIRECTION_VECTOR_EPSILON_MM}
+${cadObjectStateInspectionPython()}
 doc = None
 transaction_open = False
 metadata = None
@@ -453,7 +455,7 @@ try:
     else:
         actual_diameters = [float(sketch.Geometry[int(sketch.Constraints[parameter_indices[name]].First)].Radius) * 2.0 for name in diameter_constraint_names]
         actual_values = {"diameter": actual_diameters[0] if actual_diameters else None}
-    recompute_errors = [{"object": obj.Name, "states": [str(state) for state in obj.State if str(state) not in ("Up-to-date", "Touched")]} for obj in doc.Objects]
+    recompute_errors = [{"object": obj.Name, "states": cad_object_error_states(obj)} for obj in doc.Objects]
     recompute_errors = [entry for entry in recompute_errors if entry["states"]]
     actual_snapshot = {
         "solid_count": geometry_signature["solid_count"], "shape_valid": geometry_signature["shape_valid"],

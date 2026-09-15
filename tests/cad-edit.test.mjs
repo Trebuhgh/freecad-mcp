@@ -998,6 +998,66 @@ test('two hole patterns execute sequentially and can be edited independently acr
   assert.deepEqual(state.groups.sensor_holes.circles.map((hole) => hole.diameter), [5]);
 });
 
+test('Expanded Body state does not fail a real multi-hole sensor diameter edit', async (t) => {
+  const { bridge, planGate, editGate, created } = await createManagedHoledPlate(t, 'ExpandedBodyEdit', multiHolePlan);
+  let validation = payload(await handleHighLevelCadTool('cad_validate_edit_plan', groupDiameterEdit(created, 1, 'mounting_holes', 6, 8), bridge, planGate, editGate));
+  assert.equal(validation.can_execute, true);
+  const mountingExecution = payload(await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate));
+  assert.equal(mountingExecution.status, 'verified', JSON.stringify(mountingExecution, null, 2));
+
+  validation = payload(await handleHighLevelCadTool('cad_validate_edit_plan', groupDiameterEdit(created, 2, 'sensor_holes', 4, 6), bridge, planGate, editGate));
+  assert.equal(validation.can_execute, true);
+  bridge.mutateNextCode((code) => {
+    const original = 'recompute_errors = [{"object": obj.Name, "states": cad_object_error_states(obj)} for obj in doc.Objects]';
+    const expanded = 'recompute_errors = [{"object": obj.Name, "states": (cad_error_states_from_state_strings(list(obj.State) + ["Expanded"]) if obj.Name == "Body" else cad_object_error_states(obj))} for obj in doc.Objects]';
+    assert.ok(code.includes(original));
+    return code.replace(original, expanded);
+  });
+  const executionResult = await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate);
+  const execution = payload(executionResult);
+  assert.equal(executionResult.isError, undefined);
+  assert.equal(execution.status, 'verified', JSON.stringify(execution, null, 2));
+  assert.deepEqual(execution.verification.checks.recompute_errors.actual, []);
+  assert.equal(execution.managed_model.model_revision, 3);
+  assert.equal(execution.rollback, undefined);
+  const state = await inspectManagedHoleGroups(bridge, 'ExpandedBodyEdit');
+  assert.deepEqual(state.groups.mounting_holes.circles.map((hole) => hole.diameter), [8, 8, 8, 8]);
+  assert.deepEqual(state.groups.sensor_holes.circles.map((hole) => hole.diameter), [6]);
+});
+
+test('a real FreeCAD recompute failure remains Invalid and blocks edit verification', async (t) => {
+  const { bridge, planGate, editGate, created } = await createManagedHoledPlate(t, 'InvalidFeatureEdit', multiHolePlan);
+  const before = await inspectManagedHoleGroups(bridge, 'InvalidFeatureEdit');
+  const validation = payload(await handleHighLevelCadTool('cad_validate_edit_plan', groupDiameterEdit(created, 1, 'sensor_holes', 4, 6), bridge, planGate, editGate));
+  assert.equal(validation.can_execute, true);
+  bridge.mutateNextCode((code) => {
+    const marker = '    doc.recompute()\n    # edit_verification_snapshot_start';
+    assert.ok(code.includes(marker));
+    return code.replace(marker, `    class _CadBrokenProxy:
+        def execute(self, obj):
+            raise RuntimeError("intentional recompute failure")
+    broken = doc.addObject("PartDesign::FeaturePython", "InjectedBrokenFeature")
+    broken.Proxy = _CadBrokenProxy()
+    broken.touch()
+    doc.recompute()
+    # edit_verification_snapshot_start`);
+  });
+  const failedResult = await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate);
+  const failed = payload(failedResult);
+  assert.equal(failedResult.isError, true);
+  assert.equal(failed.code, 'CAD_EDIT_VERIFICATION_FAILED');
+  const recomputeIssue = failed.issues.find((issue) => issue.check === 'recompute_errors');
+  assert.ok(recomputeIssue, JSON.stringify(failed, null, 2));
+  assert.deepEqual(recomputeIssue.actual, [{ object: 'InjectedBrokenFeature', states: ['Invalid'] }]);
+  assert.equal(failed.rollback.passed, true, JSON.stringify(failed, null, 2));
+  await bridge.run(`
+doc = FreeCAD.getDocument("InvalidFeatureEdit")
+doc.removeObject("InjectedBrokenFeature")
+doc.recompute()
+_mcp_result["result"] = True`);
+  assert.deepEqual(await inspectManagedHoleGroups(bridge, 'InvalidFeatureEdit'), before);
+});
+
 test('multi-hole validation detects binding damage, isolated constraint drift, and cross-group edit collisions', async (t) => {
   const first = await createManagedHoledPlate(t, 'MultiHoleInvalid', multiHolePlan);
   await first.bridge.run(`

@@ -8,6 +8,7 @@ import {
   VOLUME_TOLERANCE_MM3,
 } from './cad-geometry-tolerances.js';
 import { cadGeometryInspectionPython } from './cad-geometry-inspection-python.js';
+import { cadObjectStateInspectionPython } from './cad-object-state-python.js';
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 export { AREA_TOLERANCE_MM2, DIRECTION_VECTOR_EPSILON_MM, LINEAR_TOLERANCE_MM, VOLUME_TOLERANCE_MM3 };
@@ -35,6 +36,7 @@ LINEAR_TOLERANCE_MM = ${LINEAR_TOLERANCE_MM}
 AREA_TOLERANCE_MM2 = ${AREA_TOLERANCE_MM2}
 VOLUME_TOLERANCE_MM3 = ${VOLUME_TOLERANCE_MM3}
 DIRECTION_VECTOR_EPSILON_MM = ${DIRECTION_VECTOR_EPSILON_MM}
+${cadObjectStateInspectionPython()}
 requested_document_name = ${requestedDocumentName === undefined ? 'None' : JSON.stringify(requestedDocumentName)}
 document_name = None
 failed_feature = None
@@ -43,7 +45,7 @@ failed_step = "preflight"
 doc = None
 
 def check_object(obj, code):
-    errors = [str(state) for state in obj.State if str(state) not in ("Up-to-date", "Touched")]
+    errors = cad_object_error_states(obj)
     if errors:
         raise RuntimeError(code + ": " + str(errors))
 
@@ -363,7 +365,7 @@ try:
     shape = tip.Shape
     recompute_errors = []
     for obj in body.Group:
-        object_errors = [str(state) for state in obj.State if str(state) not in ("Up-to-date", "Touched")]
+        object_errors = cad_object_error_states(obj)
         if object_errors:
             recompute_errors.append({"object": obj.Name, "states": object_errors})
 
