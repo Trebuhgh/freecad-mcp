@@ -1,5 +1,6 @@
 import { ToolArgs, ToolResult } from '../types.js';
 import { AREA_TOLERANCE_MM2, LINEAR_TOLERANCE_MM } from './cad-geometry-tolerances.js';
+import { CanonicalProfileSegment, validateProfileSegments } from './cad-profile-geometry.js';
 
 type PlanStatus = 'valid' | 'incomplete' | 'ambiguous' | 'unsupported' | 'invalid';
 type IssueKind = Exclude<PlanStatus, 'valid'>;
@@ -104,6 +105,21 @@ const coordinatePairSchema = {
   type: 'array', minItems: 2, maxItems: 2, items: { type: 'number' },
 };
 
+const profileSegmentSchema = {
+  oneOf: [{
+    title: 'Line segment', type: 'object',
+    properties: { type: { const: 'line' }, start: coordinatePairSchema, end: coordinatePairSchema },
+    required: ['type', 'start', 'end'], additionalProperties: false,
+  }, {
+    title: 'Circular arc segment', type: 'object',
+    properties: {
+      type: { const: 'arc' }, start: coordinatePairSchema, end: coordinatePairSchema,
+      center: coordinatePairSchema, direction: { type: 'string', enum: ['cw', 'ccw'] },
+    },
+    required: ['type', 'start', 'end', 'center', 'direction'], additionalProperties: false,
+  }],
+};
+
 const simpleHolesSchema = {
   type: ['object', 'null'],
   description: 'Simple holes. For explicit holes use only {diameter,centers}; count is derived and operation is through_all. Never use placement, count, after, target, or operation here.',
@@ -127,6 +143,7 @@ const simplePlanSchema = {
     shape: { type: ['string', 'null'], enum: ['plate', 'profile', null], description: 'Required discriminator: plate or profile.' },
     size: { type: ['array', 'null'], minItems: 3, maxItems: 3, items: { type: 'number' }, description: 'For shape:"plate": [width,height,thickness] in mm.' },
     profile: { type: ['array', 'null'], minItems: 3, items: coordinatePairSchema, description: 'For shape:"profile": polygon vertices [[x,y],...]; closure is automatic.' },
+    segments: { type: ['array', 'null'], minItems: 2, items: profileSegmentSchema, description: 'For a mixed line/arc profile. Segments must form one explicitly closed outer contour. Never combine with profile.' },
     thickness: { type: ['number', 'null'], exclusiveMinimum: 0, description: 'For shape:"profile": extrusion length in +Z.' },
     unit: { type: ['string', 'null'], enum: ['mm', null], description: 'Currently mm.' },
     holes: simpleHolesSchema,
@@ -141,6 +158,7 @@ const simplePlanSchema = {
     { shape: 'profile', profile: [[0, 0], [100, 0], [100, 40], [60, 40], [60, 80], [0, 80]], thickness: 10, unit: 'mm', holes: { diameter: 6, centers: [[20, 20], [40, 60], [80, 20]] } },
     { shape: 'plate', size: [100, 60, 10], unit: 'mm', holes: { diameter: 6, grid: [3, 2], start: [20, 15], spacing: [30, 20] } },
     { shape: 'profile', profile: [[0, 0], [100, 0], [100, 40], [60, 40], [60, 80], [0, 80]], thickness: 10, unit: 'mm', holes: { diameter: 6, grid: [2, 2], start: [20, 20], spacing: [30, 30] } },
+    { shape: 'profile', segments: [{ type: 'line', start: [0, 0], end: [80, 0] }, { type: 'arc', start: [80, 0], end: [80, 40], center: [80, 20], direction: 'ccw' }, { type: 'line', start: [80, 40], end: [0, 40] }, { type: 'line', start: [0, 40], end: [0, 0] }], thickness: 10, unit: 'mm' },
   ],
 };
 
@@ -158,6 +176,7 @@ const featurePlanSchema = {
           id: { type: ['string', 'null'] },
           type: { type: ['string', 'null'], enum: ['rectangular_pad', 'profile_pad', 'hole_pattern', 'fillet', 'chamfer', null] },
           points: { type: ['array', 'null'], minItems: 3, items: coordinatePairSchema },
+          segments: { type: ['array', 'null'], minItems: 2, items: profileSegmentSchema },
           width: { type: ['number', 'null'] }, height: { type: ['number', 'null'] }, length: { type: ['number', 'null'] },
           diameter: { type: ['number', 'null'] }, count: { type: ['integer', 'null'] },
           placement: {
@@ -201,7 +220,7 @@ const legacyPlanSchema = {
 
 export const CAD_PLAN_TOOLS = [{
   name: 'cad_validate_plan',
-  description: 'Mandatory non-mutating validation gate. ALWAYS use the Preferred Simple Intent Plan when it can represent the request; do not create a Feature Plan yourself. Do not mix formats. Explicit holes use holes:{diameter,centers:[[x,y],...]}; grids use holes:{diameter,grid:[columns,rows],start:[x,y],spacing:[x,y]}. Never add placement, count, after, target, or operation. Profile supports explicit and grid holes; edge_offset and finishing remain plate-only. Only include features explicitly requested by the user. Never add holes, fillet, chamfer, or other geometry unless explicitly requested. Compatibility Feature/Legacy formats remain accepted for existing callers.',
+  description: 'Mandatory non-mutating validation gate. ALWAYS use Preferred Simple Intent when possible. Do not mix formats. Polygon profile: {shape:"profile",profile:[[x,y],...],thickness:10,unit:"mm"}. Mixed profile example: {shape:"profile",segments:[{type:"line",start:[0,0],end:[80,0]},{type:"arc",start:[80,0],end:[80,40],center:[80,20],direction:"ccw"},{type:"line",start:[80,40],end:[0,40]},{type:"line",start:[0,40],end:[0,0]}],thickness:10,unit:"mm"}. Never combine profile and segments. Only include features explicitly requested by the user. Compatibility Feature/Legacy formats remain accepted.',
   inputSchema: {
     type: 'object' as const,
     properties: {
@@ -439,8 +458,13 @@ type PolygonPoint = [number, number];
 
 interface ValidatedProfile {
   points?: PolygonPoint[];
+  segments?: CanonicalProfileSegment[];
   length?: number;
   area?: number;
+  bounds?: { minX: number; minY: number; maxX: number; maxY: number };
+  lineCount?: number;
+  arcCount?: number;
+  arcRadii?: number[];
   issues: InternalIssue[];
 }
 
@@ -491,9 +515,23 @@ function segmentsIntersect(firstStart: PolygonPoint, firstEnd: PolygonPoint, sec
 function validateProfilePad(feature: Record<string, unknown>, path: string): ValidatedProfile {
   const issues: InternalIssue[] = [];
   for (const key of Object.keys(feature)) {
-    if (!['id', 'type', 'points', 'length', 'after', 'target'].includes(key)) issues.push({ kind: 'invalid', code: 'UNKNOWN_PROFILE_FIELD', path: `${path}.${key}`, message: `Unknown profile_pad field "${key}".` });
+    if (!['id', 'type', 'points', 'segments', 'length', 'after', 'target'].includes(key)) issues.push({ kind: 'invalid', code: 'UNKNOWN_PROFILE_FIELD', path: `${path}.${key}`, message: `Unknown profile_pad field "${key}".` });
   }
   const length = positiveNumber(feature, 'length', `${path}.length`, 'Profile extrusion length', issues);
+  const hasPoints = feature.points !== undefined && feature.points !== null;
+  const hasSegments = feature.segments !== undefined && feature.segments !== null;
+  if (hasPoints && hasSegments) {
+    issues.push({ kind: 'invalid', code: 'MIXED_PROFILE_REPRESENTATION', path, message: 'Use either points or segments for profile_pad, never both.' });
+    return { length, issues };
+  }
+  if (hasSegments) {
+    const validated = validateProfileSegments(feature.segments, `${path}.segments`);
+    issues.push(...validated.issues.map((issue) => ({ ...issue, kind: issue.code.startsWith('UNSUPPORTED_') ? 'unsupported' as const : 'invalid' as const })));
+    return {
+      segments: validated.segments, length, area: validated.area, bounds: validated.bounds,
+      lineCount: validated.lineCount, arcCount: validated.arcCount, arcRadii: validated.arcRadii, issues,
+    };
+  }
   if (!Array.isArray(feature.points)) {
     issues.push({ kind: feature.points === undefined || feature.points === null ? 'incomplete' : 'invalid', code: feature.points === undefined || feature.points === null ? 'MISSING_REQUIRED_VALUE' : 'INVALID_PROFILE_POINTS', path: `${path}.points`, message: 'profile_pad points must be an array.' });
     return { length, issues };
@@ -536,7 +574,11 @@ function validateProfilePad(feature: Record<string, unknown>, path: string): Val
   }
   if (issues.length > 0 || length === undefined) return { length, issues };
   const points = signedArea < 0 ? [parsed[0], ...parsed.slice(1).reverse()] : parsed;
-  return { points, length, area: Math.abs(signedArea), issues };
+  return {
+    points, length, area: Math.abs(signedArea),
+    bounds: { minX: Math.min(...points.map((point) => point[0])), minY: Math.min(...points.map((point) => point[1])), maxX: Math.max(...points.map((point) => point[0])), maxY: Math.max(...points.map((point) => point[1])) },
+    lineCount: points.length, arcCount: 0, arcRadii: [], issues,
+  };
 }
 
 function simpleTuple(value: unknown, path: string, positive: boolean, integer: boolean, issues: InternalIssue[]): number[] | undefined {
@@ -554,7 +596,7 @@ function simpleTuple(value: unknown, path: string, positive: boolean, integer: b
 function normalizeSimplePlan(value: Record<string, unknown>): NormalizedFeaturePlan {
   const issues: InternalIssue[] = [];
   for (const key of Object.keys(value)) {
-    if (!['shape', 'size', 'profile', 'thickness', 'unit', 'holes', 'fillet', 'chamfer'].includes(key)) issues.push({ kind: 'invalid', code: 'UNKNOWN_SIMPLE_FIELD', path: key, message: `Unknown Simple Intent field "${key}".` });
+    if (!['shape', 'size', 'profile', 'segments', 'thickness', 'unit', 'holes', 'fillet', 'chamfer'].includes(key)) issues.push({ kind: 'invalid', code: 'UNKNOWN_SIMPLE_FIELD', path: key, message: `Unknown Simple Intent field "${key}".` });
   }
   if (value.shape === undefined || value.shape === null) addMissing(issues, 'shape', 'shape');
   else if (value.shape !== 'plate' && value.shape !== 'profile') issues.push({ kind: 'unsupported', code: 'UNSUPPORTED_SHAPE', path: 'shape', message: `Shape "${String(value.shape)}" is not supported.` });
@@ -562,10 +604,11 @@ function normalizeSimplePlan(value: Record<string, unknown>): NormalizedFeatureP
   const paths: string[] = [];
   if (value.shape === 'profile') {
     if (value.size !== undefined) issues.push({ kind: 'invalid', code: 'CONFLICTING_BASE_DEFINITION', path: 'size', message: 'shape:"profile" uses profile and thickness, not size.' });
-    features.push({ type: 'profile_pad', points: value.profile, length: value.thickness });
+    if (value.profile !== undefined && value.profile !== null && value.segments !== undefined && value.segments !== null) issues.push({ kind: 'invalid', code: 'MIXED_PROFILE_REPRESENTATION', path: 'profile', message: 'Use either profile or segments, never both.' });
+    features.push({ type: 'profile_pad', ...(value.segments !== undefined && value.segments !== null ? { segments: value.segments } : { points: value.profile }), length: value.thickness });
     paths.push('profile');
   } else {
-    if (value.profile !== undefined || value.thickness !== undefined) issues.push({ kind: 'invalid', code: 'CONFLICTING_BASE_DEFINITION', path: 'profile', message: 'shape:"plate" uses size, not profile or thickness.' });
+    if (value.profile !== undefined || value.segments !== undefined || value.thickness !== undefined) issues.push({ kind: 'invalid', code: 'CONFLICTING_BASE_DEFINITION', path: 'profile', message: 'shape:"plate" uses size, not profile, segments, or thickness.' });
     let size: number[] | undefined;
     if (value.size === undefined || value.size === null) addMissing(issues, 'size', 'Plate size');
     else if (!Array.isArray(value.size) || value.size.length !== 3 || value.size.some((item) => typeof item !== 'number' || !Number.isFinite(item) || item <= 0)) issues.push({ kind: 'invalid', code: 'INVALID_PLATE_SIZE', path: 'size', message: 'size must contain exactly three positive finite values [width,height,thickness].' });
@@ -620,7 +663,7 @@ function normalizeSimplePlan(value: Record<string, unknown>): NormalizedFeatureP
 }
 
 function normalizeToFeaturePlan(value: Record<string, unknown>): NormalizedFeaturePlan {
-  const hasSimpleFields = ['shape', 'size', 'profile', 'thickness'].some((key) => Object.hasOwn(value, key));
+  const hasSimpleFields = ['shape', 'size', 'profile', 'segments', 'thickness'].some((key) => Object.hasOwn(value, key));
   const hasFeatureFields = Object.hasOwn(value, 'features');
   const hasLegacyFields = Object.hasOwn(value, 'base');
   if ([hasSimpleFields, hasFeatureFields, hasLegacyFields].filter(Boolean).length > 1) {
@@ -638,7 +681,7 @@ function normalizeToFeaturePlan(value: Record<string, unknown>): NormalizedFeatu
         kind: 'invalid',
         code: 'MIXED_PLAN_FORMAT',
         path: 'plan',
-        message: `Do not mix ${mixedKeys.join(' and ')} fields. Use shape/size/profile/thickness for Simple Intent, features for Feature Plan, or base for Legacy Plan.`,
+        message: `Do not mix ${mixedKeys.join(' and ')} fields. Use shape/size/profile/segments/thickness for Simple Intent, features for Feature Plan, or base for Legacy Plan.`,
       }],
     };
   }
@@ -926,6 +969,8 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
       if (normalized.source !== 'simple') return issue;
       if (issue.path === `${profilePath}.points`) return { ...issue, path: 'profile' };
       if (issue.path.startsWith(`${profilePath}.points.`)) return { ...issue, path: `profile${issue.path.slice(`${profilePath}.points`.length)}` };
+      if (issue.path === `${profilePath}.segments`) return { ...issue, path: 'segments' };
+      if (issue.path.startsWith(`${profilePath}.segments.`)) return { ...issue, path: `segments${issue.path.slice(`${profilePath}.segments`.length)}` };
       if (issue.path === `${profilePath}.length`) return { ...issue, path: 'thickness' };
       return issue;
     }));
@@ -934,16 +979,29 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
     else if (normalized.unit !== 'mm') structuralIssues.push({ kind: 'unsupported', code: 'UNSUPPORTED_UNIT', path: 'unit', message: `Unit "${normalized.unit}" is not supported; use mm.` });
     const holeFeature = normalized.features.find((feature) => feature.type === 'hole_pattern');
     const holePath = holeFeature === undefined ? undefined : normalized.paths[normalized.features.indexOf(holeFeature)];
-    const holeResolution = holeFeature === undefined || holePath === undefined || profileValidation.points === undefined
+    if (profileValidation.segments !== undefined && profileValidation.arcCount !== undefined && profileValidation.arcCount > 0 && holeFeature !== undefined) {
+      structuralIssues.push({ kind: 'unsupported', code: 'ARC_PROFILE_HOLES_UNSUPPORTED', path: holePath ?? 'holes', message: 'Hole patterns on profiles containing arcs are not supported until curved-boundary material validation is available.' });
+    }
+    const linearMaterialPolygon: PolygonPoint[] | undefined = profileValidation.points
+      ?? (profileValidation.segments !== undefined && profileValidation.arcCount === 0
+        ? profileValidation.segments.map((segment) => [segment.start.x, segment.start.y])
+        : undefined);
+    const holeResolution = holeFeature === undefined || holePath === undefined || linearMaterialPolygon === undefined
       ? undefined
-      : resolveHolePattern(holeFeature, holePath, undefined, undefined, profileValidation.points);
+      : resolveHolePattern(holeFeature, holePath, undefined, undefined, linearMaterialPolygon);
     if (holeResolution !== undefined) structuralIssues.push(...holeResolution.issues);
-    if (structuralIssues.length > 0 || profileValidation.points === undefined || profileValidation.length === undefined
+    const validProfileRepresentation = profileValidation.points !== undefined || profileValidation.segments !== undefined;
+    if (structuralIssues.length > 0 || !validProfileRepresentation || profileValidation.length === undefined
       || (holeFeature !== undefined && (holeResolution?.centers === undefined || holeResolution.diameter === undefined))) {
       const status = statusFor(structuralIssues);
       return { status, can_execute: false, issues: structuralIssues.map(({ kind: _kind, ...issue }) => issue) };
     }
-    const resolvedFeatures: Record<string, unknown>[] = [{ id: profileFeature.id, type: 'profile_pad', points: profileValidation.points, length: profileValidation.length }];
+    const resolvedProfile: Record<string, unknown> = { id: profileFeature.id, type: 'profile_pad', length: profileValidation.length };
+    if (profileValidation.points !== undefined) resolvedProfile.points = profileValidation.points;
+    else resolvedProfile.segments = profileValidation.segments!.map((segment) => segment.type === 'line'
+      ? { type: 'line', start: segment.start, end: segment.end }
+      : { type: 'arc', start: segment.start, end: segment.end, center: segment.center, direction: segment.direction });
+    const resolvedFeatures: Record<string, unknown>[] = [resolvedProfile];
     if (holeFeature !== undefined && holeResolution !== undefined) {
       resolvedFeatures.push({
         id: holeFeature.id,

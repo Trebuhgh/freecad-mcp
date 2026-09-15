@@ -446,6 +446,53 @@ for (const [name, profile, expectedBounds, expectedArea] of [
   });
 }
 
+function roundedProfileSegments(direction) {
+  return [
+    { type: 'line', start: [0, 0], end: [80, 0] },
+    { type: 'arc', start: [80, 0], end: [80, 40], center: [80, 20], direction },
+    { type: 'line', start: [80, 40], end: [0, 40] },
+    { type: 'line', start: [0, 40], end: [0, 0] },
+  ];
+}
+
+for (const [direction, expectedX, expectedArea] of [
+  ['ccw', 100, 3200 + 200 * Math.PI],
+  ['cw', 80, 3200 - 200 * Math.PI],
+]) {
+  test(`mixed profile executes a real ${direction.toUpperCase()} arc sketch and analytically verifies the Pad`, async () => {
+    const planned = { shape: 'profile', segments: roundedProfileSegments(direction), thickness: 10, unit: 'mm' };
+    const { bridge, validation } = await validateAndCapture(planned, `ArcProfile_${direction}`);
+    assert.equal(validation.resolved_plan.features[0].segments[1].type, 'arc');
+    assert.equal(validation.resolved_plan.features[0].segments[1].direction, direction);
+    const execution = executeFreeCad(bridge.commands[0]);
+    assert.equal(execution.ok, true, execution.traceback);
+    assert.equal(execution.result.success, true, JSON.stringify(execution.result, null, 2));
+    assert.equal(execution.result.status, 'verified');
+    assert.equal(execution.result.features[0].object_type, 'PartDesign::Pad');
+    assert.deepEqual(execution.result.features[0].arc_geometry_types, ['ArcOfCircle']);
+    assert.equal(execution.result.features[0].sketch_dof, 0);
+    assert.equal(execution.result.features[0].line_segment_count, 3);
+    assert.equal(execution.result.features[0].arc_segment_count, 1);
+    assert.ok(Math.abs(execution.result.features[0].arc_radii[0] - 20) <= 1e-6);
+    assert.equal(execution.result.solidCount, 1);
+    assert.deepEqual(execution.result.geometry_signature.bounding_box, { x: expectedX, y: 40, z: 10 });
+    assert.ok(Math.abs(execution.result.geometry_signature.volume - expectedArea * 10) <= 1e-6);
+    const outerCylinder = execution.result.geometry_signature.surfaces.cylindrical.find(
+      (surface) => surface.surface_role === 'outer_profile' && Math.abs(surface.radius - 20) <= 1e-6,
+    );
+    assert.ok(outerCylinder, 'curved outer surface missing from independent Geometry Signature');
+    assert.deepEqual(outerCylinder.axis_point.slice(0, 2), [80, 20]);
+    const profileVerification = execution.result.verification.features[0];
+    assert.equal(profileVerification.passed, true);
+    assert.deepEqual(profileVerification.line_segment_count, { expected: 3, actual: 3, passed: true });
+    assert.deepEqual(profileVerification.arc_segment_count, { expected: 1, actual: 1, passed: true });
+    assert.equal(profileVerification.arc_surfaces.length, 1);
+    assert.equal(profileVerification.arc_surfaces[0].radius_passed, true);
+    assert.equal(profileVerification.arc_surfaces[0].material_axis_passed, true);
+    assert.deepEqual(execution.result.verification.recomputeErrors, []);
+  });
+}
+
 for (const [name, centers] of [
   ['one', [[20, 20]]],
   ['multiple', [[20, 20], [40, 60], [80, 20]]],
@@ -512,7 +559,8 @@ test('profile_pad executes a normalized rectangular grid as verified through hol
   const expectedCenters = [{ x: 20, y: 20 }, { x: 50, y: 20 }, { x: 20, y: 50 }, { x: 50, y: 50 }];
   const { bridge, validation } = await validateAndCapture(planned, 'ProfileGridHoles');
   assert.deepEqual(validation.resolved_plan.features[1].centers, expectedCenters);
-  assert.doesNotMatch(bridge.commands[0], /rectangular_grid|"grid"|"start"|"spacing"|"placement"/);
+  const serializedPlan = bridge.commands[0].split('\n').find((line) => line.startsWith('plan = '));
+  assert.doesNotMatch(serializedPlan, /rectangular_grid|"grid"|"start"|"spacing"|"placement"/);
 
   const execution = executeFreeCad(bridge.commands[0]);
   assert.equal(execution.ok, true, execution.traceback);

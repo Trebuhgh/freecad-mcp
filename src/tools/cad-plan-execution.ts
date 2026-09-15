@@ -53,6 +53,41 @@ def attach_xy(sketch, body):
         raise RuntimeError("SKETCH_ATTACHMENT_UNSUPPORTED")
     sketch.MapMode = "FlatFace"
 
+def arc_sweep(segment):
+    start_angle = math.atan2(segment["start"]["y"] - segment["center"]["y"], segment["start"]["x"] - segment["center"]["x"])
+    end_angle = math.atan2(segment["end"]["y"] - segment["center"]["y"], segment["end"]["x"] - segment["center"]["x"])
+    if segment["direction"] == "ccw":
+        return (end_angle - start_angle) % (2.0 * math.pi)
+    return -((start_angle - end_angle) % (2.0 * math.pi))
+
+def arc_contains_angle(segment, angle):
+    start_angle = math.atan2(segment["start"]["y"] - segment["center"]["y"], segment["start"]["x"] - segment["center"]["x"])
+    sweep = arc_sweep(segment)
+    travel = ((angle - start_angle) % (2.0 * math.pi)) if sweep > 0 else ((start_angle - angle) % (2.0 * math.pi))
+    return travel <= abs(sweep) + LINEAR_TOLERANCE_MM / float(segment["radius"])
+
+def profile_metrics(segments):
+    area = 0.0
+    points = []
+    for segment in segments:
+        start = segment["start"]
+        end = segment["end"]
+        points.extend([start, end])
+        if segment["type"] == "line":
+            area += (float(start["x"]) * float(end["y"]) - float(end["x"]) * float(start["y"])) / 2.0
+        else:
+            radius = float(segment["radius"])
+            start_angle = math.atan2(float(start["y"]) - float(segment["center"]["y"]), float(start["x"]) - float(segment["center"]["x"]))
+            end_angle = start_angle + arc_sweep(segment)
+            area += (radius * radius * (end_angle - start_angle) + radius * float(segment["center"]["x"]) * (math.sin(end_angle) - math.sin(start_angle)) + radius * float(segment["center"]["y"]) * (math.cos(start_angle) - math.cos(end_angle))) / 2.0
+            for angle in (0.0, math.pi / 2.0, math.pi, 3.0 * math.pi / 2.0):
+                if arc_contains_angle(segment, angle):
+                    points.append({"x": float(segment["center"]["x"]) + radius * math.cos(angle), "y": float(segment["center"]["y"]) + radius * math.sin(angle)})
+    return {
+        "area": abs(area),
+        "bounds": {"min_x": min(float(point["x"]) for point in points), "max_x": max(float(point["x"]) for point in points), "min_y": min(float(point["y"]) for point in points), "max_y": max(float(point["y"]) for point in points)},
+    }
+
 def select_edges(source, selection):
     shape = source.Shape
     bounds = shape.BoundBox
@@ -146,6 +181,9 @@ def inspect_geometry(shape):
             probe_start = axis_point_vector.sub(axis_vector * probe_span)
             probe_end = axis_point_vector.add(axis_vector * probe_span)
             axis_probe = Part.makeLine(probe_start, probe_end)
+            axial_length = float(face_bounds.ZLength) if abs(abs(axis[2]) - 1.0) <= LINEAR_TOLERANCE_MM else 0.0
+            angular_span = float(face.Area) / (float(surface.Radius) * axial_length) if axial_length > LINEAR_TOLERANCE_MM and float(surface.Radius) > LINEAR_TOLERANCE_MM else 0.0
+            axis_material_length = clean(axis_probe.common(shape).Length)
             cylindrical.append({
                 "surface_type": "cylinder",
                 "area": clean(face.Area, AREA_TOLERANCE_MM2),
@@ -154,7 +192,10 @@ def inspect_geometry(shape):
                 "axis_point": axis_point,
                 "center": [clean(center.x), clean(center.y), clean(center.z)],
                 "extent": extent,
-                "axis_material_length": clean(axis_probe.common(shape).Length),
+                "axis_material_length": axis_material_length,
+                "axis_relation": "void" if axis_material_length <= LINEAR_TOLERANCE_MM else "material",
+                "angular_span": clean(angular_span),
+                "surface_role": "hole" if abs(angular_span - 2.0 * math.pi) <= LINEAR_TOLERANCE_MM and axis_material_length <= LINEAR_TOLERANCE_MM else "outer_profile",
             })
     planar.sort(key=lambda item: quantized([item["area"], *item["center"], *item["normal"]], AREA_TOLERANCE_MM2))
     cylindrical.sort(key=lambda item: quantized([item["radius"], *item["axis_point"], *item["axis"], item["area"]], LINEAR_TOLERANCE_MM))
@@ -185,15 +226,28 @@ try:
     width = None
     height = None
     profile_points = None
+    profile_segments = None
     expected_profile_area = None
     if base_type == "rectangular_pad":
         width = float(base_plan["width"])
         height = float(base_plan["height"])
         expected_bounds = {"x": width, "y": height, "z": length}
     elif base_type == "profile_pad":
-        profile_points = [[float(point[0]), float(point[1])] for point in base_plan["points"]]
-        expected_profile_area = abs(sum(profile_points[index][0] * profile_points[(index + 1) % len(profile_points)][1] - profile_points[(index + 1) % len(profile_points)][0] * profile_points[index][1] for index in range(len(profile_points))) / 2.0)
-        expected_bounds = {"x": max(point[0] for point in profile_points) - min(point[0] for point in profile_points), "y": max(point[1] for point in profile_points) - min(point[1] for point in profile_points), "z": length}
+        if "segments" in base_plan:
+            profile_segments = []
+            for source in base_plan["segments"]:
+                segment = {"type": source["type"], "start": {"x": float(source["start"]["x"]), "y": float(source["start"]["y"])}, "end": {"x": float(source["end"]["x"]), "y": float(source["end"]["y"])}}
+                if source["type"] == "arc":
+                    segment["center"] = {"x": float(source["center"]["x"]), "y": float(source["center"]["y"])}
+                    segment["direction"] = source["direction"]
+                    segment["radius"] = math.hypot(segment["start"]["x"] - segment["center"]["x"], segment["start"]["y"] - segment["center"]["y"])
+                profile_segments.append(segment)
+        else:
+            profile_points = [[float(point[0]), float(point[1])] for point in base_plan["points"]]
+            profile_segments = [{"type": "line", "start": {"x": profile_points[index][0], "y": profile_points[index][1]}, "end": {"x": profile_points[(index + 1) % len(profile_points)][0], "y": profile_points[(index + 1) % len(profile_points)][1]}} for index in range(len(profile_points))]
+        metrics = profile_metrics(profile_segments)
+        expected_profile_area = metrics["area"]
+        expected_bounds = {"x": metrics["bounds"]["max_x"] - metrics["bounds"]["min_x"], "y": metrics["bounds"]["max_y"] - metrics["bounds"]["min_y"], "z": length}
     else:
         raise RuntimeError("UNSUPPORTED_RESOLVED_BASE_FEATURE: " + str(base_type))
     executed_steps = []
@@ -239,20 +293,48 @@ try:
             sketch = body.newObject("Sketcher::SketchObject", "PlanSketch_" + str(feature_index))
             attach_xy(sketch, body)
             segment_indices = []
-            for point_index, point in enumerate(profile_points):
-                next_point = profile_points[(point_index + 1) % len(profile_points)]
-                segment_indices.append(sketch.addGeometry(Part.LineSegment(FreeCAD.Vector(point[0], point[1], 0), FreeCAD.Vector(next_point[0], next_point[1], 0)), False))
+            segment_start_positions = []
+            segment_end_positions = []
+            for segment_plan in profile_segments:
+                start = segment_plan["start"]
+                end = segment_plan["end"]
+                if segment_plan["type"] == "line":
+                    geometry = Part.LineSegment(FreeCAD.Vector(start["x"], start["y"], 0), FreeCAD.Vector(end["x"], end["y"], 0))
+                else:
+                    start_angle = math.atan2(start["y"] - segment_plan["center"]["y"], start["x"] - segment_plan["center"]["x"])
+                    middle_angle = start_angle + arc_sweep(segment_plan) / 2.0
+                    middle = FreeCAD.Vector(segment_plan["center"]["x"] + segment_plan["radius"] * math.cos(middle_angle), segment_plan["center"]["y"] + segment_plan["radius"] * math.sin(middle_angle), 0)
+                    geometry = Part.Arc(FreeCAD.Vector(start["x"], start["y"], 0), middle, FreeCAD.Vector(end["x"], end["y"], 0))
+                segment_indices.append(sketch.addGeometry(geometry, False))
+                segment_start_positions.append(2 if segment_plan["type"] == "arc" and segment_plan["direction"] == "cw" else 1)
+                segment_end_positions.append(1 if segment_plan["type"] == "arc" and segment_plan["direction"] == "cw" else 2)
             for point_index, segment in enumerate(segment_indices):
                 next_segment = segment_indices[(point_index + 1) % len(segment_indices)]
-                sketch.addConstraint(Sketcher.Constraint("Coincident", segment, 2, next_segment, 1))
+                sketch.addConstraint(Sketcher.Constraint("Coincident", segment, segment_end_positions[point_index], next_segment, segment_start_positions[(point_index + 1) % len(segment_indices)]))
             for point_index, segment in enumerate(segment_indices):
-                point = profile_points[point_index]
-                sketch.addConstraint(Sketcher.Constraint("DistanceX", -1, 1, segment, 1, point[0]))
-                sketch.addConstraint(Sketcher.Constraint("DistanceY", -1, 1, segment, 1, point[1]))
+                segment_plan = profile_segments[point_index]
+                start_position = segment_start_positions[point_index]
+                sketch.addConstraint(Sketcher.Constraint("DistanceX", -1, 1, segment, start_position, segment_plan["start"]["x"]))
+                sketch.addConstraint(Sketcher.Constraint("DistanceY", -1, 1, segment, start_position, segment_plan["start"]["y"]))
+                if segment_plan["type"] == "arc":
+                    chord_dx = abs(segment_plan["end"]["x"] - segment_plan["start"]["x"])
+                    chord_dy = abs(segment_plan["end"]["y"] - segment_plan["start"]["y"])
+                    if chord_dy >= chord_dx:
+                        sketch.addConstraint(Sketcher.Constraint("DistanceX", -1, 1, segment, 3, segment_plan["center"]["x"]))
+                    else:
+                        sketch.addConstraint(Sketcher.Constraint("DistanceY", -1, 1, segment, 3, segment_plan["center"]["y"]))
             solve_result = sketch.solve()
             doc.recompute()
             check_object(sketch, "PROFILE_SKETCH_RECOMPUTE_FAILED")
-            if solve_result not in (None, 0) or not sketch.FullyConstrained or int(sketch.DoF) != 0 or len(sketch.Geometry) != len(profile_points) or len(sketch.Shape.Wires) != 1 or not sketch.Shape.Wires[0].isClosed():
+            actual_line_count = sum(1 for geometry in sketch.Geometry if geometry.__class__.__name__ == "LineSegment")
+            actual_arc_geometries = [geometry for geometry in sketch.Geometry if geometry.__class__.__name__ in ("Arc", "ArcOfCircle")]
+            expected_line_count = sum(1 for segment in profile_segments if segment["type"] == "line")
+            expected_arc_count = sum(1 for segment in profile_segments if segment["type"] == "arc")
+            arc_geometry_matches = len(actual_arc_geometries) == expected_arc_count
+            if arc_geometry_matches:
+                for segment_plan, geometry in zip([segment for segment in profile_segments if segment["type"] == "arc"], actual_arc_geometries):
+                    arc_geometry_matches = arc_geometry_matches and abs(float(geometry.Radius) - float(segment_plan["radius"])) <= LINEAR_TOLERANCE_MM and geometry.Center.sub(FreeCAD.Vector(segment_plan["center"]["x"], segment_plan["center"]["y"], 0)).Length <= LINEAR_TOLERANCE_MM
+            if solve_result not in (None, 0) or not sketch.FullyConstrained or int(sketch.DoF) != 0 or len(sketch.Geometry) != len(profile_segments) or actual_line_count != expected_line_count or not arc_geometry_matches or len(sketch.Shape.Wires) != 1 or not sketch.Shape.Wires[0].isClosed():
                 raise RuntimeError("PROFILE_SKETCH_VALIDATION_FAILED")
             pad = body.newObject("PartDesign::Pad", "PlanFeature_" + str(feature_index))
             pad.Label = feature_id
@@ -266,7 +348,7 @@ try:
             check_object(pad, "PROFILE_PAD_RECOMPUTE_FAILED")
             if body.Tip != pad or pad.Shape.isNull() or not pad.Shape.isValid() or len(pad.Shape.Solids) != 1 or float(pad.Shape.Volume) <= VOLUME_TOLERANCE_MM3:
                 raise RuntimeError("PROFILE_PAD_POSTCONDITION_FAILED")
-            feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pad.Name, "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(sketch.DoF), "segment_count": len(sketch.Geometry), "solid_valid": True})
+            feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pad.Name, "object_type": pad.TypeId, "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(sketch.DoF), "segment_count": len(sketch.Geometry), "line_segment_count": actual_line_count, "arc_segment_count": len(actual_arc_geometries), "arc_radii": [float(geometry.Radius) for geometry in actual_arc_geometries], "arc_geometry_types": [geometry.__class__.__name__ for geometry in actual_arc_geometries], "solid_valid": True})
         elif feature_type == "hole_pattern":
             source_volume = float(body.Tip.Shape.Volume)
             diameter = float(feature_plan["diameter"])
@@ -336,9 +418,12 @@ try:
     # geometry_inspection_start
     geometry_signature = inspect_geometry(shape)
     actual_holes = []
+    actual_outer_cylinders = []
     for cylinder in geometry_signature["surfaces"]["cylindrical"]:
         axis = cylinder["axis"]
-        if abs(axis[0]) > LINEAR_TOLERANCE_MM or abs(axis[1]) > LINEAR_TOLERANCE_MM or abs(abs(axis[2]) - 1.0) > LINEAR_TOLERANCE_MM or cylinder["axis_material_length"] > LINEAR_TOLERANCE_MM:
+        if abs(axis[0]) <= LINEAR_TOLERANCE_MM and abs(axis[1]) <= LINEAR_TOLERANCE_MM and abs(abs(axis[2]) - 1.0) <= LINEAR_TOLERANCE_MM and cylinder["surface_role"] == "outer_profile":
+            actual_outer_cylinders.append(cylinder)
+        if abs(axis[0]) > LINEAR_TOLERANCE_MM or abs(axis[1]) > LINEAR_TOLERANCE_MM or abs(abs(axis[2]) - 1.0) > LINEAR_TOLERANCE_MM or cylinder["surface_role"] != "hole":
             continue
         candidate = {"x": cylinder["axis_point"][0], "y": cylinder["axis_point"][1], "radius": cylinder["radius"], "axis": {"x": axis[0], "y": axis[1], "z": axis[2]}, "axis_material_length": cylinder["axis_material_length"]}
         if not any(abs(item["x"] - candidate["x"]) <= LINEAR_TOLERANCE_MM and abs(item["y"] - candidate["y"]) <= LINEAR_TOLERANCE_MM and abs(item["radius"] - candidate["radius"]) <= LINEAR_TOLERANCE_MM for item in actual_holes):
@@ -353,6 +438,7 @@ try:
         "expected_body_tip": feature_results[-1]["object"] if feature_results else None,
         "recompute_errors": recompute_errors,
         "holes": actual_holes,
+        "outer_cylinders": actual_outer_cylinders,
     }
     # verification_snapshot_complete
 
@@ -396,14 +482,30 @@ try:
                 expected_volume = expected_profile_area * length - expected_hole_volume
                 actual_volume = geometry_signature["volume"]
                 volume_passed = abs(float(actual_volume) - float(expected_volume)) <= VOLUME_TOLERANCE_MM3
-                entry["segment_count"] = {"expected": len(profile_points), "actual": feature_result.get("segment_count"), "passed": feature_result.get("segment_count") == len(profile_points)}
+                expected_line_count = sum(1 for segment in profile_segments if segment["type"] == "line")
+                expected_arc_segments = [segment for segment in profile_segments if segment["type"] == "arc"]
+                expected_arc_count = len(expected_arc_segments)
+                entry["segment_count"] = {"expected": len(profile_segments), "actual": feature_result.get("segment_count"), "passed": feature_result.get("segment_count") == len(profile_segments)}
+                entry["line_segment_count"] = {"expected": expected_line_count, "actual": feature_result.get("line_segment_count"), "passed": feature_result.get("line_segment_count") == expected_line_count}
+                entry["arc_segment_count"] = {"expected": expected_arc_count, "actual": feature_result.get("arc_segment_count"), "passed": feature_result.get("arc_segment_count") == expected_arc_count}
+                entry["arc_surfaces"] = []
+                for expected_arc in expected_arc_segments:
+                    nearest = min(actual_snapshot["outer_cylinders"], key=lambda cylinder: (cylinder["axis_point"][0] - expected_arc["center"]["x"]) ** 2 + (cylinder["axis_point"][1] - expected_arc["center"]["y"]) ** 2) if actual_snapshot["outer_cylinders"] else None
+                    center_passed = nearest is not None and abs(nearest["axis_point"][0] - expected_arc["center"]["x"]) <= LINEAR_TOLERANCE_MM and abs(nearest["axis_point"][1] - expected_arc["center"]["y"]) <= LINEAR_TOLERANCE_MM
+                    radius_passed = nearest is not None and abs(nearest["radius"] - expected_arc["radius"]) <= LINEAR_TOLERANCE_MM
+                    entry["arc_surfaces"].append({"expected_center": expected_arc["center"], "actual_center": None if nearest is None else {"x": nearest["axis_point"][0], "y": nearest["axis_point"][1]}, "expected_radius": expected_arc["radius"], "actual_radius": None if nearest is None else nearest["radius"], "center_passed": center_passed, "radius_passed": radius_passed, "material_axis_passed": nearest is not None and nearest["surface_role"] == "outer_profile"})
+                arc_surfaces_passed = len(actual_snapshot["outer_cylinders"]) >= expected_arc_count and all(item["center_passed"] and item["radius_passed"] and item["material_axis_passed"] for item in entry["arc_surfaces"])
                 entry["extrusion_height"] = {"expected": length, "actual": geometry_signature["bounding_box"]["z"], "passed": abs(float(geometry_signature["bounding_box"]["z"]) - length) <= LINEAR_TOLERANCE_MM}
                 entry["volume"] = {"expected": expected_volume, "actual": actual_volume, "passed": volume_passed}
-                entry["passed"] = entry["passed"] and entry["segment_count"]["passed"] and entry["extrusion_height"]["passed"] and volume_passed
+                entry["passed"] = entry["passed"] and entry["segment_count"]["passed"] and entry["line_segment_count"]["passed"] and entry["arc_segment_count"]["passed"] and arc_surfaces_passed and entry["extrusion_height"]["passed"] and volume_passed
                 if not volume_passed:
                     add_issue(feature_id, feature_type, "volume", expected_volume, actual_volume, "The actual volume does not equal the extruded polygon volume minus the resolved through-hole volumes.")
                 if not entry["extrusion_height"]["passed"]:
                     add_issue(feature_id, feature_type, "extrusion_height", length, geometry_signature["bounding_box"]["z"], "The actual extrusion height does not match profile_pad.length.")
+                if not entry["line_segment_count"]["passed"] or not entry["arc_segment_count"]["passed"]:
+                    add_issue(feature_id, feature_type, "profile_segment_types", {"line": expected_line_count, "arc": expected_arc_count}, {"line": feature_result.get("line_segment_count"), "arc": feature_result.get("arc_segment_count")}, "The actual Sketch geometry types do not match the resolved profile segments.")
+                if not arc_surfaces_passed:
+                    add_issue(feature_id, feature_type, "arc_surfaces", [{"center": segment["center"], "radius": segment["radius"]} for segment in expected_arc_segments], entry["arc_surfaces"], "The actual solid does not contain the expected cylindrical outer profile surfaces.")
             if not entry["passed"]:
                 add_issue(feature_id, feature_type, "base_feature", {"closed": True, "fully_constrained": True, "degrees_of_freedom": 0, "solid_created": True}, entry, "The base sketch or Pad postconditions were not preserved.")
         elif feature_type == "hole_pattern":
