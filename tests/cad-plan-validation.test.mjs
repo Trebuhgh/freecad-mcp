@@ -53,7 +53,7 @@ test('center reference resolves the four requested hole centers', async () => {
   assert.equal(result.status, 'valid');
   assert.equal(result.can_execute, true);
   assert.equal(bridge.calls, 0);
-  assert.deepEqual(result.resolved_plan.holes.centers, [
+  assert.deepEqual(result.resolved_plan.features.find((feature) => feature.type === 'hole_pattern').centers, [
     { x: 10, y: 10 }, { x: 90, y: 10 }, { x: 10, y: 50 }, { x: 90, y: 50 },
   ]);
 });
@@ -62,7 +62,7 @@ test('boundary reference includes the hole radius in the center offset', async (
   const { result } = await validate({ base, holes: holes('boundary') });
   assert.equal(result.status, 'valid');
   assert.equal(result.can_execute, true);
-  assert.deepEqual(result.resolved_plan.holes.centers, [
+  assert.deepEqual(result.resolved_plan.features.find((feature) => feature.type === 'hole_pattern').centers, [
     { x: 14, y: 14 }, { x: 86, y: 14 }, { x: 14, y: 46 }, { x: 86, y: 46 },
   ]);
 });
@@ -108,4 +108,64 @@ test('fillet and chamfer plan dimensions are validated deterministically', async
   const invalid = await validate({ base, fillet: { radius: 0, edges: 'all_vertical' } });
   assert.equal(invalid.result.status, 'invalid');
   assert.equal(invalid.result.can_execute, false);
+});
+
+test('ordered feature plan resolves hole placement to concrete centers', async () => {
+  const { result } = await validate({
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { id: 'mounting_holes', type: 'hole_pattern', diameter: 8, count: 4, placement: { type: 'edge_offset', distance: 10, reference: 'center' }, after: 'base' },
+    ],
+  });
+  assert.equal(result.status, 'valid');
+  assert.equal(result.can_execute, true);
+  assert.deepEqual(result.resolved_plan, {
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { id: 'mounting_holes', type: 'hole_pattern', diameter: 8, centers: [{ x: 10, y: 10 }, { x: 90, y: 10 }, { x: 10, y: 50 }, { x: 90, y: 50 }], operation: 'through_all', after: 'base' },
+    ],
+  });
+  const resolvedHole = result.resolved_plan.features[1];
+  assert.equal(Object.hasOwn(resolvedHole, 'placement'), false);
+  assert.equal(Object.hasOwn(resolvedHole, 'distance'), false);
+  assert.equal(Object.hasOwn(resolvedHole, 'reference'), false);
+});
+
+test('feature plan preserves ambiguity handling and SVG clarification', async () => {
+  const { result, bridge } = await validate({
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { id: 'holes', type: 'hole_pattern', diameter: 8, count: 4, placement: { type: 'edge_offset', distance: 10, reference: null } },
+    ],
+  });
+  assert.equal(result.status, 'ambiguous');
+  assert.equal(result.can_execute, false);
+  assert.ok(result.issues.some((issue) => issue.code === 'AMBIGUOUS_DISTANCE_REFERENCE' && issue.path === 'features.1.placement.reference'));
+  assert.equal(result.clarification_visual.type, 'svg');
+  assert.equal(bridge.calls, 0);
+});
+
+test('feature IDs are unique and construction order requires rectangular_pad first', async () => {
+  const duplicate = await validate({
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { id: 'base', type: 'fillet', radius: 5, edges: 'all_vertical' },
+    ],
+  });
+  assert.equal(duplicate.result.status, 'invalid');
+  assert.ok(duplicate.result.issues.some((issue) => issue.code === 'DUPLICATE_FEATURE_ID'));
+
+  const order = await validate({
+    unit: 'mm',
+    features: [
+      { id: 'rounding', type: 'fillet', radius: 5, edges: 'all_vertical' },
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+    ],
+  });
+  assert.equal(order.result.status, 'invalid');
+  assert.ok(order.result.issues.some((issue) => issue.code === 'INVALID_FEATURE_ORDER'));
 });

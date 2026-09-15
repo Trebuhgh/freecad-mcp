@@ -100,8 +100,38 @@ export const CAD_PLAN_TOOLS = [{
     properties: {
       plan: {
         type: 'object',
-        description: 'Typed plan containing a rectangular_plate base and optional holes, fillet, and chamfer operations. Geometrically relevant values have no implicit defaults.',
+        description: 'Either an ordered feature plan with unit + features, or the backward-compatible legacy rectangular_plate plan with base + optional holes/fillet/chamfer. Geometrically relevant values have no implicit defaults.',
         properties: {
+          unit: { type: ['string', 'null'], enum: ['mm', null], description: 'Unit for a feature plan; currently only mm.' },
+          features: {
+            type: ['array', 'null'],
+            description: 'Ordered feature construction plan. Supported types: rectangular_pad, hole_pattern, fillet, chamfer.',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: ['string', 'null'], description: 'Required stable, unique semantic feature ID.' },
+                type: { type: ['string', 'null'], enum: ['rectangular_pad', 'hole_pattern', 'fillet', 'chamfer', null] },
+                width: { type: ['number', 'null'] },
+                height: { type: ['number', 'null'] },
+                length: { type: ['number', 'null'] },
+                diameter: { type: ['number', 'null'] },
+                count: { type: ['integer', 'null'] },
+                placement: {
+                  type: ['object', 'null'],
+                  properties: {
+                    type: { type: ['string', 'null'], enum: ['edge_offset', null] },
+                    distance: { type: ['number', 'null'] },
+                    reference: { type: ['string', 'null'], enum: ['center', 'boundary', null], description: 'Use null when center versus boundary is not explicit.' },
+                  },
+                },
+                radius: { type: ['number', 'null'] },
+                size: { type: ['number', 'null'] },
+                edges: { type: ['string', 'null'], enum: ['all_vertical', 'all_top', 'all_bottom', 'all_top_outer', 'all_top_inner', 'all_bottom_outer', 'all_bottom_inner', null] },
+                after: { type: ['string', 'null'], description: 'Optional reference to an earlier feature ID.' },
+                target: { type: ['string', 'null'], description: 'Optional semantic target referencing an earlier feature ID.' },
+              },
+            },
+          },
           base: {
             type: ['object', 'null'],
             properties: {
@@ -216,7 +246,7 @@ function statusFor(issues: InternalIssue[]): PlanStatus {
   return 'valid';
 }
 
-export function validateCadPlan(value: unknown): CadPlanValidationResult {
+function validateLegacyCadPlan(value: unknown): CadPlanValidationResult {
   const issues: InternalIssue[] = [];
   const resolved: Record<string, unknown> = {};
   let ambiguityDistance: number | undefined;
@@ -356,6 +386,157 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
     result.clarification_visual = { type: 'svg', content: ambiguitySvg(ambiguityDistance) };
   }
   return result;
+}
+
+const FEATURE_ID = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+interface NormalizedFeaturePlan {
+  source: 'legacy' | 'feature';
+  unit: unknown;
+  features: Record<string, unknown>[];
+  paths: string[];
+  issues: InternalIssue[];
+}
+
+function normalizeToFeaturePlan(value: Record<string, unknown>): NormalizedFeaturePlan {
+  const issues: InternalIssue[] = [];
+  if (Object.hasOwn(value, 'features') || Object.hasOwn(value, 'unit')) {
+    for (const key of Object.keys(value)) {
+      if (!['unit', 'features'].includes(key)) issues.push({ kind: 'unsupported', code: 'UNSUPPORTED_PLAN_ELEMENT', path: key, message: `Plan element "${key}" is not supported in a feature plan.` });
+    }
+    if (!Array.isArray(value.features)) {
+      issues.push({ kind: value.features === undefined || value.features === null ? 'incomplete' : 'invalid', code: value.features === undefined || value.features === null ? 'MISSING_REQUIRED_VALUE' : 'INVALID_FEATURE_LIST', path: 'features', message: 'features must be a non-empty array.' });
+      return { source: 'feature', unit: value.unit, features: [], paths: [], issues };
+    }
+    if (value.features.length === 0) issues.push({ kind: 'incomplete', code: 'MISSING_REQUIRED_VALUE', path: 'features', message: 'At least one feature is required.' });
+    const features: Record<string, unknown>[] = [];
+    const paths: string[] = [];
+    value.features.forEach((feature, index) => {
+      if (!isRecord(feature)) issues.push({ kind: 'invalid', code: 'INVALID_FEATURE', path: `features.${index}`, message: 'Each feature must be an object.' });
+      else {
+        features.push(feature);
+        paths.push(`features.${index}`);
+      }
+    });
+    return { source: 'feature', unit: value.unit, features, paths, issues };
+  }
+
+  const features: Record<string, unknown>[] = [];
+  const paths: string[] = [];
+  for (const key of Object.keys(value)) {
+    if (!['base', 'holes', 'fillet', 'chamfer'].includes(key)) issues.push({ kind: 'unsupported', code: 'UNSUPPORTED_PLAN_ELEMENT', path: key, message: `Plan element "${key}" is not supported.` });
+  }
+  const base = value.base;
+  let unit: unknown;
+  for (const property of ['base', 'holes', 'fillet', 'chamfer']) {
+    if (value[property] !== undefined && value[property] !== null && !isRecord(value[property])) issues.push({ kind: 'invalid', code: `INVALID_${property.toUpperCase()}`, path: property, message: `${property} must be an object.` });
+  }
+  if (isRecord(base)) {
+    unit = base.unit;
+    features.push({ id: 'base', type: base.type === 'rectangular_plate' ? 'rectangular_pad' : base.type, width: base.width, height: base.height, length: base.thickness });
+    paths.push('base');
+  }
+  for (const [property, type] of [['holes', 'hole_pattern'], ['fillet', 'fillet'], ['chamfer', 'chamfer']] as const) {
+    if (isRecord(value[property])) {
+      features.push({ id: property, type, ...value[property] as Record<string, unknown> });
+      paths.push(property);
+    }
+  }
+  return { source: 'legacy', unit, features, paths, issues };
+}
+
+function translateIssuePath(path: string, normalized: NormalizedFeaturePlan): string {
+  if (normalized.source === 'legacy') return path;
+  const mappings: Array<[string, string | undefined]> = [
+    ['base', normalized.paths[normalized.features.findIndex((feature) => feature.type === 'rectangular_pad')]],
+    ['holes', normalized.paths[normalized.features.findIndex((feature) => feature.type === 'hole_pattern')]],
+    ['fillet', normalized.paths[normalized.features.findIndex((feature) => feature.type === 'fillet')]],
+    ['chamfer', normalized.paths[normalized.features.findIndex((feature) => feature.type === 'chamfer')]],
+  ];
+  for (const [legacy, featurePath] of mappings) {
+    if (featurePath !== undefined && (path === legacy || path.startsWith(`${legacy}.`))) return featurePath + path.slice(legacy.length);
+  }
+  return path === 'base.unit' ? 'unit' : path;
+}
+
+export function validateCadPlan(value: unknown): CadPlanValidationResult {
+  if (!isRecord(value)) return validateLegacyCadPlan(value);
+  const normalized = normalizeToFeaturePlan(value);
+  const structuralIssues = normalized.issues;
+  const seenIds = new Set<string>();
+  const earlierIds = new Set<string>();
+  const seenTypes = new Set<string>();
+  let solidAvailable = false;
+
+  normalized.features.forEach((feature, index) => {
+    const path = normalized.paths[index];
+    const id = feature.id;
+    if (id === undefined || id === null || id === '') structuralIssues.push({ kind: 'incomplete', code: 'MISSING_REQUIRED_VALUE', path: `${path}.id`, message: 'Feature ID is required.' });
+    else if (typeof id !== 'string' || !FEATURE_ID.test(id) || id.length > 128) structuralIssues.push({ kind: 'invalid', code: 'INVALID_FEATURE_ID', path: `${path}.id`, message: 'Feature ID must use letters, digits, and underscores and start with a letter or underscore.' });
+    else {
+      if (seenIds.has(id)) structuralIssues.push({ kind: 'invalid', code: 'DUPLICATE_FEATURE_ID', path: `${path}.id`, message: `Feature ID "${id}" occurs more than once.` });
+      seenIds.add(id);
+    }
+    for (const dependency of ['after', 'target'] as const) {
+      if (feature[dependency] !== undefined && (typeof feature[dependency] !== 'string' || !earlierIds.has(feature[dependency] as string))) {
+        structuralIssues.push({ kind: 'invalid', code: 'INVALID_FEATURE_REFERENCE', path: `${path}.${dependency}`, message: `${dependency} must reference an earlier feature ID.` });
+      }
+    }
+    const type = feature.type;
+    if (type === undefined || type === null) structuralIssues.push({ kind: 'incomplete', code: 'MISSING_REQUIRED_VALUE', path: `${path}.type`, message: 'Feature type is required.' });
+    else if (!['rectangular_pad', 'hole_pattern', 'fillet', 'chamfer'].includes(String(type))) structuralIssues.push({ kind: 'unsupported', code: 'UNSUPPORTED_FEATURE_TYPE', path: `${path}.type`, message: `Feature type "${String(type)}" is not supported.` });
+    else {
+      if (seenTypes.has(String(type))) structuralIssues.push({ kind: 'invalid', code: 'DUPLICATE_FEATURE_TYPE', path: `${path}.type`, message: `Only one ${String(type)} feature is currently supported.` });
+      seenTypes.add(String(type));
+      if (type === 'rectangular_pad') {
+        if (index !== 0 || solidAvailable) structuralIssues.push({ kind: 'invalid', code: 'INVALID_FEATURE_ORDER', path, message: 'rectangular_pad must be the first feature.' });
+        solidAvailable = true;
+      } else if (!solidAvailable) structuralIssues.push({ kind: 'invalid', code: 'INVALID_FEATURE_ORDER', path, message: `${String(type)} requires an earlier rectangular_pad solid.` });
+    }
+    if (typeof id === 'string' && FEATURE_ID.test(id)) earlierIds.add(id);
+  });
+  if (normalized.features.length > 0 && normalized.features[0].type !== 'rectangular_pad' && !structuralIssues.some((issue) => issue.code === 'INVALID_FEATURE_ORDER')) {
+    structuralIssues.push({ kind: 'invalid', code: 'INVALID_FEATURE_ORDER', path: normalized.paths[0], message: 'The first feature must be rectangular_pad.' });
+  }
+
+  if (structuralIssues.length > 0) {
+    const status = statusFor(structuralIssues);
+    return { status, can_execute: false, issues: structuralIssues.map(({ kind: _kind, ...issue }) => issue) };
+  }
+
+  const baseFeature = normalized.features.find((feature) => feature.type === 'rectangular_pad');
+  const holeFeature = normalized.features.find((feature) => feature.type === 'hole_pattern');
+  const filletFeature = normalized.features.find((feature) => feature.type === 'fillet');
+  const chamferFeature = normalized.features.find((feature) => feature.type === 'chamfer');
+  const legacyPlan: Record<string, unknown> = {
+    base: baseFeature === undefined ? undefined : { type: 'rectangular_plate', width: baseFeature.width, height: baseFeature.height, thickness: baseFeature.length, unit: normalized.unit },
+  };
+  if (holeFeature !== undefined) legacyPlan.holes = { count: holeFeature.count, diameter: holeFeature.diameter, placement: holeFeature.placement };
+  if (filletFeature !== undefined) legacyPlan.fillet = { radius: filletFeature.radius, edges: filletFeature.edges };
+  if (chamferFeature !== undefined) legacyPlan.chamfer = { size: chamferFeature.size, edges: chamferFeature.edges };
+  const validated = validateLegacyCadPlan(legacyPlan);
+  validated.issues = validated.issues.map((issue) => ({ ...issue, path: translateIssuePath(issue.path, normalized) }));
+  if (validated.status !== 'valid' || validated.resolved_plan === undefined) return validated;
+
+  const legacyResolved = validated.resolved_plan;
+  const resolvedFeatures = normalized.features.map((feature) => {
+    const dependencies: Record<string, unknown> = {};
+    if (feature.after !== undefined) dependencies.after = feature.after;
+    if (feature.target !== undefined) dependencies.target = feature.target;
+    if (feature.type === 'rectangular_pad') {
+      const resolvedBase = legacyResolved.base as Record<string, unknown>;
+      return { id: feature.id, type: 'rectangular_pad', width: resolvedBase.width, height: resolvedBase.height, length: resolvedBase.thickness, ...dependencies };
+    }
+    if (feature.type === 'hole_pattern') {
+      const resolvedHoles = legacyResolved.holes as Record<string, unknown>;
+      return { id: feature.id, type: 'hole_pattern', diameter: resolvedHoles.diameter, centers: resolvedHoles.centers, operation: 'through_all', ...dependencies };
+    }
+    const dimension = feature.type === 'fillet' ? 'radius' : 'size';
+    const resolvedOperation = legacyResolved[String(feature.type)] as Record<string, unknown>;
+    return { id: feature.id, type: feature.type, [dimension]: resolvedOperation[dimension], edges: resolvedOperation.edges, ...dependencies };
+  });
+  validated.resolved_plan = { unit: 'mm', features: resolvedFeatures };
+  return validated;
 }
 
 export function validateCadPlanArgs(args: ToolArgs): CadPlanValidationResult {

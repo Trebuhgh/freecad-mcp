@@ -22,6 +22,20 @@ function plan(reference, operations = {}) {
   };
 }
 
+function featurePlan(reference, includeFinishing = false) {
+  const features = [
+    { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+    { id: 'mounting_holes', type: 'hole_pattern', diameter: 8, count: 4, placement: { type: 'edge_offset', distance: 10, reference }, after: 'base' },
+  ];
+  if (includeFinishing) {
+    features.push(
+      { id: 'outer_rounding', type: 'fillet', radius: 5, edges: 'all_vertical', target: 'mounting_holes' },
+      { id: 'hole_chamfers', type: 'chamfer', size: 0.5, edges: 'all_top_inner', after: 'outer_rounding' },
+    );
+  }
+  return { unit: 'mm', features };
+}
+
 class CapturingBridge {
   calls = 0;
   commands = [];
@@ -103,7 +117,8 @@ for (const [reference, expectedCenters] of [
 ]) {
   test(`cad_execute_plan constructs the exact ${reference} hole variant`, async () => {
     const { bridge, validation } = await validateAndCapture(plan(reference), `Execute_${reference}`);
-    assert.deepEqual(validation.resolved_plan.holes.centers, expectedCenters);
+    assert.deepEqual(validation.resolved_plan.features.find((feature) => feature.type === 'hole_pattern').centers, expectedCenters);
+    assert.doesNotMatch(bridge.commands[0], /edge_offset|"reference"|"distance"/);
     const execution = executeFreeCad(bridge.commands[0]);
     assert.equal(execution.ok, true, execution.traceback);
     const result = execution.result;
@@ -114,7 +129,8 @@ for (const [reference, expectedCenters] of [
     assert.deepEqual(result.verification.verifiedHoleCenters, expectedCenters);
     assert.equal(result.verification.expectedHoleCount, 4);
     assert.deepEqual(result.verification.recomputeErrors, []);
-    assert.ok(result.executed_steps.includes('pocket_through_all'));
+    assert.ok(result.executed_steps.includes('holes'));
+    assert.equal(result.features.find((feature) => feature.id === 'holes').verified_holes, 4);
     assert.ok(Math.abs(result.boundingBox.xLength - 100) < 1e-7);
     assert.ok(Math.abs(result.boundingBox.yLength - 60) < 1e-7);
     assert.ok(Math.abs(result.boundingBox.zLength - 10) < 1e-7);
@@ -122,30 +138,27 @@ for (const [reference, expectedCenters] of [
 }
 
 test('cad_execute_plan uses only validated fillet and chamfer parameters', async () => {
-  const planned = plan('center', {
-    fillet: { radius: 5, edges: 'all_vertical' },
-    chamfer: { size: 0.5, edges: 'all_top_inner' },
-  });
+  const planned = featurePlan('center', true);
   const { bridge, validation } = await validateAndCapture(planned, 'ExecuteFeatures');
-  assert.deepEqual(validation.resolved_plan.fillet, planned.fillet);
-  assert.deepEqual(validation.resolved_plan.chamfer, planned.chamfer);
+  assert.deepEqual(validation.resolved_plan.features.find((feature) => feature.type === 'fillet'), planned.features[2]);
+  assert.deepEqual(validation.resolved_plan.features.find((feature) => feature.type === 'chamfer'), planned.features[3]);
   const execution = executeFreeCad(bridge.commands[0]);
   assert.equal(execution.ok, true, execution.traceback);
-  assert.deepEqual(execution.result.executed_steps.slice(-2), ['fillet', 'chamfer']);
-  assert.equal(execution.result.verification.bodyTip, 'Chamfer');
+  assert.deepEqual(execution.result.executed_steps, ['base', 'mounting_holes', 'outer_rounding', 'hole_chamfers']);
+  assert.equal(execution.result.features.at(-1).id, 'hole_chamfers');
   assert.equal(execution.result.solidCount, 1);
 });
 
 test('execution failure reports its step and removes the partial document', async () => {
   const gate = new CadPlanValidationGate();
   const failingBridge = new CapturingBridge({
-    content: [{ type: 'text', text: 'FreeCAD error: CAD_EXECUTE_PLAN_FAILED|pocket|simulated failure' }],
+    content: [{ type: 'text', text: 'FreeCAD error: CAD_EXECUTE_PLAN_FAILED|mounting_holes|hole_pattern|pocket|simulated failure' }],
     isError: true,
   });
   await handleHighLevelCadTool('cad_validate_plan', { plan: plan('center') }, failingBridge, gate);
   const structured = await handleHighLevelCadTool('cad_execute_plan', {}, failingBridge, gate);
   assert.deepEqual(payload(structured), {
-    success: false, code: 'CAD_PLAN_EXECUTION_FAILED', failed_step: 'pocket', error: 'simulated failure',
+    success: false, code: 'CAD_PLAN_EXECUTION_FAILED', failed_feature: 'mounting_holes', failed_feature_type: 'hole_pattern', failed_step: 'pocket', error: 'simulated failure',
   });
 
   const oversized = await validateAndCapture(plan('center', {

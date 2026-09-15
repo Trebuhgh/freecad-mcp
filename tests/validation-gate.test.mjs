@@ -86,7 +86,7 @@ test('valid plan stores resolved plan and permits mutation', async () => {
   assert.equal(payload(validation).status, 'valid');
   assert.equal(payload(validation).can_execute, true);
   assert.equal(gate.state, 'validated');
-  assert.deepEqual(gate.resolvedPlan.holes.centers, [
+  assert.deepEqual(gate.resolvedPlan.features.find((feature) => feature.type === 'hole_pattern').centers, [
     { x: 10, y: 10 }, { x: 90, y: 10 }, { x: 10, y: 50 }, { x: 90, y: 50 },
   ]);
 
