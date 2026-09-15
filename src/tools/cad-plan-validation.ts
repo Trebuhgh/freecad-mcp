@@ -79,6 +79,12 @@ export class CadPlanValidationGate {
     if (this.executingRevision === revision) this.executingRevision = undefined;
   }
 
+  blockAfterVerificationFailure(revision: number): void {
+    if (this.executingRevision !== revision) return;
+    this.currentState = 'blocked';
+    this.currentResolvedPlan = undefined;
+  }
+
   completeValidation(revision: number, result: CadPlanValidationResult): void {
     if (revision !== this.revision) return;
     this.currentResult = result;
@@ -200,7 +206,7 @@ export const CAD_PLAN_TOOLS = [{
   },
 }, {
   name: 'cad_execute_plan',
-  description: 'Execute exactly the resolved plan stored by the latest successful cad_validate_plan call. Accepts no dimensions, positions, or other geometric overrides.',
+  description: 'Execute and deterministically verify exactly the resolved plan stored by the latest successful cad_validate_plan call. success=true means status=verified. CAD_VERIFICATION_FAILED requires a corrected plan to pass cad_validate_plan again; never directly repair failed geometry. Accepts no geometric overrides.',
   inputSchema: {
     type: 'object' as const,
     properties: {

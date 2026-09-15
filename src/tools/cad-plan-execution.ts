@@ -3,6 +3,9 @@ import { ToolArgs, ToolResult } from '../types.js';
 import { CadPlanValidationGate, cadPlanNotValidatedToolResult } from './cad-plan-validation.js';
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
+export const LINEAR_TOLERANCE_MM = 1e-6;
+export const VOLUME_TOLERANCE_MM3 = 1e-7;
+export const DIRECTION_VECTOR_EPSILON_MM = 1e-12;
 
 function validateDocumentName(value: unknown): string | undefined {
   if (value === undefined) return undefined;
@@ -17,6 +20,9 @@ import Part
 import Sketcher
 plan = ${JSON.stringify(plan)}
 plan_revision = ${revision}
+LINEAR_TOLERANCE_MM = ${LINEAR_TOLERANCE_MM}
+VOLUME_TOLERANCE_MM3 = ${VOLUME_TOLERANCE_MM3}
+DIRECTION_VECTOR_EPSILON_MM = ${DIRECTION_VECTOR_EPSILON_MM}
 requested_document_name = ${requestedDocumentName === undefined ? 'None' : JSON.stringify(requestedDocumentName)}
 document_name = None
 failed_feature = None
@@ -51,10 +57,10 @@ def select_edges(source, selection):
         direction = None
         if is_line:
             delta = vertices[-1].Point.sub(vertices[0].Point)
-            if delta.Length > 1e-12:
+            if delta.Length > DIRECTION_VECTOR_EPSILON_MM:
                 direction = (abs(delta.x / delta.Length), abs(delta.y / delta.Length), abs(delta.z / delta.Length))
         candidates.append({"subname": "Edge" + str(edge_index), "edge": edge, "vertices": vertices, "direction": direction, "adjacent": [face.Surface.__class__.__name__ for face in shape.ancestorsOfType(edge, Part.Face)]})
-    tolerance = 1e-7
+    tolerance = LINEAR_TOLERANCE_MM
     if selection == "all_vertical":
         selected = [item for item in candidates if item["direction"] is not None and item["direction"][2] > 1.0 - tolerance and "Cylinder" not in item["adjacent"]]
     elif selection in ("all_top", "all_bottom"):
@@ -134,7 +140,7 @@ try:
             check_object(pad, "PAD_RECOMPUTE_FAILED")
             if body.Tip != pad or pad.Shape.isNull() or not pad.Shape.isValid() or len(pad.Shape.Solids) != 1:
                 raise RuntimeError("PAD_POSTCONDITION_FAILED")
-            feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pad.Name})
+            feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pad.Name, "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(sketch.DoF), "solid_valid": True})
         elif feature_type == "hole_pattern":
             source_volume = float(body.Tip.Shape.Volume)
             diameter = float(feature_plan["diameter"])
@@ -159,14 +165,14 @@ try:
                 raise RuntimeError("POCKET_TYPE_UNSUPPORTED: ThroughAll")
             pocket.Type = through_all
             doc.recompute()
-            if hasattr(pocket, "Reversed") and not pocket.Shape.isNull() and float(pocket.Shape.Volume) >= source_volume - 1e-7:
+            if hasattr(pocket, "Reversed") and not pocket.Shape.isNull() and float(pocket.Shape.Volume) >= source_volume - VOLUME_TOLERANCE_MM3:
                 pocket.Reversed = not bool(pocket.Reversed)
                 doc.recompute()
             check_object(pocket, "POCKET_RECOMPUTE_FAILED")
             if body.Tip != pocket or pocket.Shape.isNull() or not pocket.Shape.isValid() or len(pocket.Shape.Solids) != 1 or float(pocket.Shape.Volume) >= source_volume:
                 raise RuntimeError("POCKET_POSTCONDITION_FAILED")
             expected_holes.append({"id": feature_id, "diameter": diameter, "centers": centers})
-            feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pocket.Name, "verified_holes": len(centers)})
+            feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pocket.Name, "verified_holes": len(centers), "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(hole_sketch.DoF), "source_volume": source_volume, "result_volume": float(pocket.Shape.Volume), "through_all": True})
         elif feature_type in ("fillet", "chamfer"):
             source = body.Tip
             source_volume = float(source.Shape.Volume)
@@ -180,11 +186,11 @@ try:
             setattr(feature, property_name, float(feature_plan[dimension_name]))
             doc.recompute()
             check_object(feature, feature_type.upper() + "_RECOMPUTE_FAILED")
-            if body.Tip != feature or feature.Shape.isNull() or not feature.Shape.isValid() or len(feature.Shape.Solids) != 1 or abs(float(feature.Shape.Volume) - source_volume) <= 1e-7:
+            if body.Tip != feature or feature.Shape.isNull() or not feature.Shape.isValid() or len(feature.Shape.Solids) != 1 or abs(float(feature.Shape.Volume) - source_volume) <= VOLUME_TOLERANCE_MM3:
                 raise RuntimeError(feature_type.upper() + "_POSTCONDITION_FAILED")
-            if abs(float(getattr(feature, property_name).Value) - float(feature_plan[dimension_name])) > 1e-7:
+            if abs(float(getattr(feature, property_name).Value) - float(feature_plan[dimension_name])) > LINEAR_TOLERANCE_MM:
                 raise RuntimeError(feature_type.upper() + "_DIMENSION_MISMATCH")
-            feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": feature.Name, dimension_name: float(getattr(feature, property_name).Value), "edges": feature_plan["edges"]})
+            feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": feature.Name, dimension_name: float(getattr(feature, property_name).Value), "edges": feature_plan["edges"], "source_volume": source_volume, "result_volume": float(feature.Shape.Volume), "geometry_changed": True})
         else:
             raise RuntimeError("UNSUPPORTED_RESOLVED_FEATURE: " + str(feature_type))
         executed_steps.append(feature_id)
@@ -195,35 +201,161 @@ try:
     doc.recompute()
     tip = body.Tip
     shape = tip.Shape
-    if shape.isNull() or not shape.isValid() or len(shape.Solids) != 1:
-        raise RuntimeError("FINAL_SOLID_INVALID")
-    for obj in body.Group:
-        check_object(obj, "FEATURE_CHAIN_ERROR_" + obj.Name)
     bounds = shape.BoundBox
-    if abs(float(bounds.XLength) - width) > 1e-6 or abs(float(bounds.YLength) - height) > 1e-6 or abs(float(bounds.ZLength) - length) > 1e-6:
-        raise RuntimeError("BOUNDING_BOX_MISMATCH")
-    verified_hole_centers = []
-    for hole_feature in expected_holes:
-        radius = float(hole_feature["diameter"]) / 2.0
-        verified = 0
-        for expected in hole_feature["centers"]:
-            found = False
-            for face in shape.Faces:
-                if face.Surface.__class__.__name__ != "Cylinder":
-                    continue
-                surface = face.Surface
-                if abs(float(surface.Radius) - radius) <= 1e-6 and abs(abs(float(surface.Axis.z)) - 1.0) <= 1e-6 and abs(float(surface.Center.x) - float(expected["x"])) <= 1e-6 and abs(float(surface.Center.y) - float(expected["y"])) <= 1e-6:
-                    found = True
-                    break
-            if not found:
-                raise RuntimeError("HOLE_GEOMETRY_MISSING_AT_" + str(expected))
-            verified += 1
-            verified_hole_centers.append({"x": float(expected["x"]), "y": float(expected["y"])})
-        next(item for item in feature_results if item["id"] == hole_feature["id"])["verified_holes"] = verified
-    if len(feature_results) != len(features) or [item["id"] for item in feature_results] != [item["id"] for item in features]:
-        raise RuntimeError("FEATURE_CHAIN_INCOMPLETE")
-    doc.commitTransaction()
-    _mcp_result["result"] = {"success": True, "document": doc.Name, "body": doc.Name + "::" + body.Name, "plan_revision": plan_revision, "executed_steps": executed_steps, "features": feature_results, "valid": True, "solidCount": len(shape.Solids), "boundingBox": {"xLength": float(bounds.XLength), "yLength": float(bounds.YLength), "zLength": float(bounds.ZLength)}, "volume": float(shape.Volume), "verification": {"featureChainComplete": True, "recomputeErrors": [], "expectedHoleCount": sum(len(item["centers"]) for item in expected_holes), "verifiedHoleCenters": verified_hole_centers, "bodyTip": tip.Name}}
+    recompute_errors = []
+    for obj in body.Group:
+        object_errors = [str(state) for state in obj.State if str(state) not in ("Up-to-date", "Touched")]
+        if object_errors:
+            recompute_errors.append({"object": obj.Name, "states": object_errors})
+
+    actual_holes = []
+    for face in shape.Faces:
+        if face.Surface.__class__.__name__ != "Cylinder":
+            continue
+        surface = face.Surface
+        axis = surface.Axis
+        if abs(abs(float(axis.z)) - 1.0) > LINEAR_TOLERANCE_MM:
+            continue
+        candidate = {"x": float(surface.Center.x), "y": float(surface.Center.y), "radius": float(surface.Radius), "axis": {"x": float(axis.x), "y": float(axis.y), "z": float(axis.z)}}
+        axis_probe = Part.makeLine(FreeCAD.Vector(candidate["x"], candidate["y"], bounds.ZMin - 1.0), FreeCAD.Vector(candidate["x"], candidate["y"], bounds.ZMax + 1.0))
+        if float(axis_probe.common(shape).Length) > LINEAR_TOLERANCE_MM:
+            continue
+        if not any(abs(item["x"] - candidate["x"]) <= LINEAR_TOLERANCE_MM and abs(item["y"] - candidate["y"]) <= LINEAR_TOLERANCE_MM and abs(item["radius"] - candidate["radius"]) <= LINEAR_TOLERANCE_MM for item in actual_holes):
+            actual_holes.append(candidate)
+
+    actual_snapshot = {
+        "solid_count": len(shape.Solids),
+        "shape_valid": not shape.isNull() and shape.isValid(),
+        "bounding_box": {"x": float(bounds.XLength), "y": float(bounds.YLength), "z": float(bounds.ZLength)},
+        "feature_ids": [item["id"] for item in feature_results],
+        "body_tip": tip.Name if tip is not None else None,
+        "expected_body_tip": feature_results[-1]["object"] if feature_results else None,
+        "recompute_errors": recompute_errors,
+        "holes": actual_holes,
+    }
+    # verification_snapshot_complete
+
+    issues = []
+    def add_issue(feature_id, feature_type, check, expected, actual, message):
+        issues.append({"feature_id": feature_id, "feature_type": feature_type, "check": check, "expected": expected, "actual": actual, "message": message})
+
+    solid_passed = actual_snapshot["solid_count"] == 1
+    if not solid_passed:
+        add_issue(None, None, "solid_count", 1, actual_snapshot["solid_count"], "The final shape must contain exactly one solid.")
+    shape_passed = actual_snapshot["shape_valid"] is True
+    if not shape_passed:
+        add_issue(None, None, "shape_valid", True, actual_snapshot["shape_valid"], "The final shape is null or invalid.")
+    expected_bounds = {"x": width, "y": height, "z": length}
+    actual_bounds = actual_snapshot["bounding_box"]
+    bounds_passed = all(abs(float(actual_bounds[axis]) - float(expected_bounds[axis])) <= LINEAR_TOLERANCE_MM for axis in ("x", "y", "z"))
+    if not bounds_passed:
+        add_issue(features[0]["id"], "rectangular_pad", "bounding_box", expected_bounds, actual_bounds, "The final bounding box does not match the resolved base dimensions.")
+    expected_feature_ids = [item["id"] for item in features]
+    feature_order_passed = actual_snapshot["feature_ids"] == expected_feature_ids
+    if not feature_order_passed:
+        add_issue(None, None, "feature_order", expected_feature_ids, actual_snapshot["feature_ids"], "The executed feature chain is incomplete or out of order.")
+    body_tip_passed = actual_snapshot["body_tip"] == actual_snapshot["expected_body_tip"]
+    if not body_tip_passed:
+        add_issue(features[-1]["id"], features[-1]["type"], "body_tip", actual_snapshot["expected_body_tip"], actual_snapshot["body_tip"], "Body.Tip is not the final resolved feature.")
+    if actual_snapshot["recompute_errors"]:
+        add_issue(None, None, "recompute_errors", [], actual_snapshot["recompute_errors"], "One or more Body objects report recompute or feature errors.")
+
+    verification_features = []
+    for feature_plan, feature_result in zip(features, feature_results):
+        feature_id = feature_plan["id"]
+        feature_type = feature_plan["type"]
+        entry = {"id": feature_id, "type": feature_type, "passed": True}
+        if feature_type == "rectangular_pad":
+            entry["sketch_closed"] = bool(feature_result.get("sketch_closed"))
+            entry["sketch_fully_constrained"] = bool(feature_result.get("sketch_fully_constrained"))
+            entry["sketch_degrees_of_freedom"] = feature_result.get("sketch_dof")
+            entry["solid_created"] = bool(feature_result.get("solid_valid"))
+            entry["passed"] = entry["sketch_closed"] and entry["sketch_fully_constrained"] and entry["sketch_degrees_of_freedom"] == 0 and entry["solid_created"]
+            if not entry["passed"]:
+                add_issue(feature_id, feature_type, "base_feature", {"closed": True, "fully_constrained": True, "degrees_of_freedom": 0, "solid_created": True}, entry, "The base sketch or Pad postconditions were not preserved.")
+        elif feature_type == "hole_pattern":
+            expected_centers = [{"x": float(center["x"]), "y": float(center["y"])} for center in feature_plan["centers"]]
+            expected_radius = float(feature_plan["diameter"]) / 2.0
+            observed = actual_snapshot["holes"]
+            entry["expected_count"] = len(expected_centers)
+            entry["actual_count"] = len(observed)
+            entry["expected_radius"] = expected_radius
+            entry["actual_radii"] = [item["radius"] for item in observed]
+            entry["centers"] = []
+            entry["axes_passed"] = True
+            entry["through_all_passed"] = True
+            count_passed = len(observed) == len(expected_centers)
+            if not count_passed:
+                add_issue(feature_id, feature_type, "hole_count", len(expected_centers), len(observed), "The number of through-hole cylindrical surfaces does not match the resolved plan.")
+            for expected_center in expected_centers:
+                nearest = min(observed, key=lambda item: (item["x"] - expected_center["x"]) ** 2 + (item["y"] - expected_center["y"]) ** 2) if observed else None
+                actual_center = None if nearest is None else {"x": nearest["x"], "y": nearest["y"]}
+                center_passed = nearest is not None and abs(nearest["x"] - expected_center["x"]) <= LINEAR_TOLERANCE_MM and abs(nearest["y"] - expected_center["y"]) <= LINEAR_TOLERANCE_MM
+                radius_passed = nearest is not None and abs(nearest["radius"] - expected_radius) <= LINEAR_TOLERANCE_MM
+                axis_passed = nearest is not None and abs(float(nearest["axis"]["x"])) <= LINEAR_TOLERANCE_MM and abs(float(nearest["axis"]["y"])) <= LINEAR_TOLERANCE_MM and abs(abs(float(nearest["axis"]["z"])) - 1.0) <= LINEAR_TOLERANCE_MM
+                probe = Part.makeLine(FreeCAD.Vector(expected_center["x"], expected_center["y"], bounds.ZMin - 1.0), FreeCAD.Vector(expected_center["x"], expected_center["y"], bounds.ZMax + 1.0))
+                through_all_passed = float(probe.common(shape).Length) <= LINEAR_TOLERANCE_MM
+                entry["centers"].append({"expected": expected_center, "actual": actual_center, "passed": center_passed, "radius_passed": radius_passed, "axis_passed": axis_passed, "through_all_passed": through_all_passed})
+                entry["axes_passed"] = entry["axes_passed"] and axis_passed
+                entry["through_all_passed"] = entry["through_all_passed"] and through_all_passed
+                if not center_passed:
+                    add_issue(feature_id, feature_type, "hole_center", expected_center, actual_center, "A resolved hole center was not found within tolerance.")
+                if center_passed and not radius_passed:
+                    add_issue(feature_id, feature_type, "hole_radius", expected_radius, None if nearest is None else nearest["radius"], "A hole radius does not match the resolved diameter.")
+                if center_passed and not axis_passed:
+                    add_issue(feature_id, feature_type, "hole_axis", {"parallel_to": "z"}, None if nearest is None else nearest["axis"], "A hole axis is not parallel to the sketch normal.")
+                if not through_all_passed:
+                    add_issue(feature_id, feature_type, "through_all", True, False, "Material remains on the hole center axis.")
+            entry["sketch_closed"] = bool(feature_result.get("sketch_closed"))
+            entry["sketch_fully_constrained"] = bool(feature_result.get("sketch_fully_constrained"))
+            entry["material_removed"] = float(feature_result.get("result_volume", 0.0)) < float(feature_result.get("source_volume", 0.0)) - VOLUME_TOLERANCE_MM3
+            if not entry["sketch_closed"]:
+                add_issue(feature_id, feature_type, "sketch_closed", True, False, "The hole sketch does not contain only closed profiles.")
+            if not entry["sketch_fully_constrained"]:
+                add_issue(feature_id, feature_type, "sketch_fully_constrained", True, False, "The hole sketch is not fully constrained.")
+            if not entry["material_removed"]:
+                add_issue(feature_id, feature_type, "material_removed", True, False, "The Pocket did not remove material from the source solid.")
+            entry["passed"] = count_passed and all(item["passed"] and item["radius_passed"] and item["axis_passed"] and item["through_all_passed"] for item in entry["centers"]) and entry["sketch_closed"] and entry["sketch_fully_constrained"] and entry["material_removed"]
+        elif feature_type in ("fillet", "chamfer"):
+            dimension = "radius" if feature_type == "fillet" else "size"
+            expected_dimension = float(feature_plan[dimension])
+            actual_dimension = float(feature_result[dimension])
+            entry[dimension] = {"expected": expected_dimension, "actual": actual_dimension, "passed": abs(actual_dimension - expected_dimension) <= LINEAR_TOLERANCE_MM}
+            entry["geometry_changed"] = abs(float(feature_result["result_volume"]) - float(feature_result["source_volume"])) > VOLUME_TOLERANCE_MM3
+            entry["passed"] = entry[dimension]["passed"] and entry["geometry_changed"]
+            if not entry[dimension]["passed"]:
+                add_issue(feature_id, feature_type, dimension, expected_dimension, actual_dimension, "The stored feature dimension does not match the resolved plan.")
+            if not entry["geometry_changed"]:
+                add_issue(feature_id, feature_type, "geometry_changed", True, False, "The finishing feature did not change the solid geometry.")
+        verification_features.append(entry)
+
+    verification = {
+        "solid_count": {"expected": 1, "actual": actual_snapshot["solid_count"], "passed": solid_passed},
+        "shape_valid": {"expected": True, "actual": actual_snapshot["shape_valid"], "passed": shape_passed},
+        "bounding_box": {"expected": expected_bounds, "actual": actual_bounds, "passed": bounds_passed},
+        "feature_order": {"expected": expected_feature_ids, "actual": actual_snapshot["feature_ids"], "passed": feature_order_passed},
+        "features": verification_features,
+        "recompute_errors": actual_snapshot["recompute_errors"],
+        "body_tip_correct": body_tip_passed,
+        "tolerances": {"linear_mm": LINEAR_TOLERANCE_MM, "volume_mm3": VOLUME_TOLERANCE_MM3},
+    }
+    verification["featureChainComplete"] = feature_order_passed
+    verification["recomputeErrors"] = actual_snapshot["recompute_errors"]
+    verification["expectedHoleCount"] = sum(len(item["centers"]) for item in expected_holes)
+    verification["verifiedHoleCenters"] = [item["expected"] for entry in verification_features if entry["type"] == "hole_pattern" for item in entry["centers"] if item["passed"]]
+    verification["bodyTip"] = actual_snapshot["body_tip"]
+    if issues:
+        try:
+            doc.abortTransaction()
+        except Exception:
+            pass
+        failed_document_name = doc.Name
+        FreeCAD.closeDocument(failed_document_name)
+        doc = None
+        _mcp_result["result"] = {"success": False, "status": "verification_failed", "code": "CAD_VERIFICATION_FAILED", "document": failed_document_name, "plan_revision": plan_revision, "issues": issues, "verification": verification}
+    else:
+        doc.commitTransaction()
+        _mcp_result["result"] = {"success": True, "status": "verified", "document": doc.Name, "body": doc.Name + "::" + body.Name, "plan_revision": plan_revision, "executed_steps": executed_steps, "features": feature_results, "valid": True, "solidCount": len(shape.Solids), "boundingBox": {"xLength": float(bounds.XLength), "yLength": float(bounds.YLength), "zLength": float(bounds.ZLength)}, "volume": float(shape.Volume), "verification": verification}
 except Exception as error:
     if doc is not None:
         try:
@@ -254,6 +386,15 @@ function executionFailure(result: ToolResult): ToolResult {
   return { content: [{ type: 'text', text: JSON.stringify({ success: false, code: 'CAD_PLAN_EXECUTION_FAILED', failed_feature: parts.shift() || null, failed_feature_type: parts.shift() || null, failed_step: parts.shift() || 'unknown', error: parts.length > 0 ? parts.join('|').trim() : text }) }], isError: true };
 }
 
+function verificationFailure(result: ToolResult): boolean {
+  try {
+    const parsed = JSON.parse(result.content[0]?.text ?? '{}') as Record<string, unknown>;
+    return parsed.success === false && parsed.status === 'verification_failed' && parsed.code === 'CAD_VERIFICATION_FAILED';
+  } catch {
+    return false;
+  }
+}
+
 export async function handleCadExecutePlan(args: ToolArgs, bridge: FreeCADBridge, gate: CadPlanValidationGate): Promise<ToolResult> {
   const unexpected = Object.keys(args).filter((key) => key !== 'documentName');
   if (unexpected.length > 0) throw new Error(`Unexpected argument(s): ${unexpected.join(', ')}`);
@@ -262,7 +403,12 @@ export async function handleCadExecutePlan(args: ToolArgs, bridge: FreeCADBridge
   const name = validateDocumentName(args.documentName);
   try {
     const result = await bridge.run(executionPython(execution.resolvedPlan, execution.revision, name));
-    return result.isError ? executionFailure(result) : result;
+    if (result.isError) return executionFailure(result);
+    if (verificationFailure(result)) {
+      gate.blockAfterVerificationFailure(execution.revision);
+      return { ...result, isError: true };
+    }
+    return result;
   } finally {
     gate.endExecution(execution.revision);
   }

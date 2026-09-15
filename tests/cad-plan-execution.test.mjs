@@ -86,6 +86,13 @@ finally:
   }
 }
 
+function mutateVerificationSnapshot(code, mutation) {
+  const marker = '    # verification_snapshot_complete';
+  assert.ok(code.includes(marker), 'verification snapshot marker missing');
+  const indented = mutation.split('\n').map((line) => `    ${line}`).join('\n');
+  return code.replace(marker, `${indented}\n${marker}`);
+}
+
 async function validateAndCapture(planValue, documentName) {
   const gate = new CadPlanValidationGate();
   const bridge = new CapturingBridge();
@@ -122,9 +129,12 @@ for (const [reference, expectedCenters] of [
     const execution = executeFreeCad(bridge.commands[0]);
     assert.equal(execution.ok, true, execution.traceback);
     const result = execution.result;
-    assert.equal(result.success, true);
+    assert.equal(result.success, true, JSON.stringify(result, null, 2));
     assert.equal(result.valid, true);
+    assert.equal(result.status, 'verified');
     assert.equal(result.solidCount, 1);
+    assert.equal(result.verification.solid_count.passed, true);
+    assert.equal(result.verification.bounding_box.passed, true);
     assert.equal(result.plan_revision, 1);
     assert.deepEqual(result.verification.verifiedHoleCenters, expectedCenters);
     assert.equal(result.verification.expectedHoleCount, 4);
@@ -301,6 +311,11 @@ test('executor creates actual through holes for one and three explicit centers',
     assert.equal(execution.ok, true, execution.traceback);
     assert.equal(execution.result.features[1].verified_holes, centers.length);
     assert.deepEqual(execution.result.verification.verifiedHoleCenters, centers);
+    const holeVerification = execution.result.verification.features.find((feature) => feature.type === 'hole_pattern');
+    assert.equal(holeVerification.expected_count, centers.length);
+    assert.equal(holeVerification.actual_count, centers.length);
+    assert.equal(holeVerification.expected_radius, 3);
+    assert.ok(holeVerification.centers.every((center) => center.passed && center.radius_passed));
     assert.equal(execution.result.solidCount, 1);
   }
 });
@@ -327,6 +342,10 @@ test('executor creates six grid holes followed by fillet and inner chamfer', asy
   assert.deepEqual(execution.result.executed_steps, ['base', 'holes', 'fillet', 'chamfer']);
   assert.equal(execution.result.features[1].verified_holes, 6);
   assert.deepEqual(execution.result.verification.verifiedHoleCenters, expected);
+  const holeVerification = execution.result.verification.features.find((feature) => feature.type === 'hole_pattern');
+  assert.equal(holeVerification.expected_count, 6);
+  assert.equal(holeVerification.actual_count, 6);
+  assert.ok(holeVerification.centers.every((center) => center.passed));
   assert.equal(execution.result.solidCount, 1);
   assert.equal(execution.result.valid, true);
 });
@@ -345,10 +364,70 @@ test('executor consumes a full simple intent plan through the canonical resolved
   assert.doesNotMatch(bridge.commands[0], /rectangular_grid|spacing_x|spacing_y|edge_offset|"placement"/);
   const execution = executeFreeCad(bridge.commands[0]);
   assert.equal(execution.ok, true, execution.traceback);
-  assert.equal(execution.result.success, true);
+  assert.equal(execution.result.success, true, JSON.stringify(execution.result, null, 2));
   assert.equal(execution.result.valid, true);
   assert.equal(execution.result.solidCount, 1);
   assert.deepEqual(execution.result.executed_steps, ['base', 'holes', 'fillet', 'chamfer']);
   assert.equal(execution.result.features[1].verified_holes, 6);
+  assert.ok(execution.result.verification.features.every((feature) => feature.passed));
   assert.deepEqual(execution.result.verification.recomputeErrors, []);
+});
+
+test('simple plate execution returns a complete verified report', async () => {
+  const { bridge } = await validateAndCapture({ shape: 'plate', size: [100, 60, 10], unit: 'mm' }, 'VerifiedPlate');
+  const execution = executeFreeCad(bridge.commands[0]);
+  assert.equal(execution.result.success, true);
+  assert.equal(execution.result.status, 'verified');
+  assert.deepEqual(execution.result.verification.solid_count, { expected: 1, actual: 1, passed: true });
+  assert.deepEqual(execution.result.verification.bounding_box, {
+    expected: { x: 100, y: 60, z: 10 }, actual: { x: 100, y: 60, z: 10 }, passed: true,
+  });
+  assert.equal(execution.result.verification.features[0].passed, true);
+  assert.equal(execution.result.verification.body_tip_correct, true);
+});
+
+for (const [check, mutation, expected, actual] of [
+  ['hole_count', 'actual_snapshot["holes"] = actual_snapshot["holes"][:-1]', 6, 5],
+  ['hole_center', 'actual_snapshot["holes"][0]["x"] = 21.0', { x: 20, y: 15 }, { x: 21, y: 15 }],
+  ['hole_radius', 'actual_snapshot["holes"][0]["radius"] = 4.0', 3, 4],
+  ['bounding_box', 'actual_snapshot["bounding_box"]["x"] = 99.0', { x: 100, y: 60, z: 10 }, { x: 99, y: 60, z: 10 }],
+  ['body_tip', 'actual_snapshot["body_tip"] = "WrongTip"', 'PlanFeature_1', 'WrongTip'],
+  ['recompute_errors', 'actual_snapshot["recompute_errors"] = [{"object": "PlanFeature_1", "states": ["Invalid"]}]', [], [{ object: 'PlanFeature_1', states: ['Invalid'] }]],
+]) {
+  test(`verification failure: ${check} is structured and cleans only the new document`, async () => {
+    const gridPlan = {
+      shape: 'plate', size: [100, 60, 10], unit: 'mm',
+      holes: { diameter: 6, grid: [3, 2], start: [20, 15], spacing: [30, 20] },
+    };
+    const { bridge } = await validateAndCapture(gridPlan, `VerificationFailure_${check}`);
+    const code = mutateVerificationSnapshot(bridge.commands[0], mutation);
+    const execution = executeFreeCad(`
+keep = FreeCAD.newDocument("VerificationKeep")
+keep.addObject("App::FeaturePython", "KeepMarker")
+${code}`, true);
+    assert.equal(execution.ok, true, execution.traceback);
+    assert.equal(execution.result.success, false);
+    assert.equal(execution.result.status, 'verification_failed');
+    assert.equal(execution.result.code, 'CAD_VERIFICATION_FAILED');
+    const issue = execution.result.issues.find((candidate) => candidate.check === check);
+    assert.ok(issue, `${check} issue missing`);
+    assert.deepEqual(issue.expected, expected);
+    assert.deepEqual(issue.actual, actual);
+    assert.equal(execution.openDocuments.includes(`VerificationFailure_${check}`), false);
+    assert.deepEqual(execution.documents.VerificationKeep, ['KeepMarker']);
+  });
+}
+
+test('a structured verification failure is an MCP error and revokes execution authorization', async () => {
+  const gate = new CadPlanValidationGate();
+  const bridge = new CapturingBridge({
+    content: [{ type: 'text', text: JSON.stringify({ success: false, status: 'verification_failed', code: 'CAD_VERIFICATION_FAILED', issues: [] }) }],
+  });
+  await handleHighLevelCadTool('cad_validate_plan', { plan: { shape: 'plate', size: [100, 60, 10], unit: 'mm' } }, bridge, gate);
+  const failed = await handleHighLevelCadTool('cad_execute_plan', {}, bridge, gate);
+  assert.equal(failed.isError, true);
+  assert.equal(gate.state, 'blocked');
+  const retry = await handleHighLevelCadTool('cad_execute_plan', {}, bridge, gate);
+  assert.equal(payload(retry).code, 'CAD_PLAN_NOT_VALIDATED');
+  assert.equal(bridge.calls, 1);
 });
