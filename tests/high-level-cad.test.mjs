@@ -62,7 +62,7 @@ test('public schemas expose neither GeometryIndex nor PointPos', () => {
   assert.equal(publicArgumentNames.some((name) => name.toLowerCase() === 'pointpos'), false);
   assert.deepEqual(
     HIGH_LEVEL_CAD_TOOLS.map((tool) => tool.name),
-    ['cad_create_part', 'cad_create_sketch', 'cad_sketch_rectangle', 'cad_inspect_sketch', 'cad_validate_sketch'],
+    ['cad_create_part', 'cad_create_sketch', 'cad_sketch_rectangle', 'cad_inspect_sketch', 'cad_validate_sketch', 'cad_pad'],
   );
 });
 
@@ -77,10 +77,11 @@ test('server-side validation rejects hidden index arguments', async () => {
   assert.equal(bridge.commands.length, 0);
 });
 
-test('FreeCAD integration: Document -> Body -> Sketch and fully constrained 100 x 60 rectangle', async () => {
+test('FreeCAD integration: validated 100 x 60 sketch creates a valid 10 mm PartDesign Pad', async () => {
   const bridge = new CapturingBridge([
     { documentId: 'Part100x60', bodyId: 'Part100x60::Body' },
     { sketchId: 'Part100x60::Sketch' },
+    {},
     {},
     {},
     {},
@@ -93,10 +94,11 @@ test('FreeCAD integration: Document -> Body -> Sketch and fully constrained 100 
   }, bridge);
   await handleHighLevelCadTool('cad_inspect_sketch', { sketch: 'Part100x60::Sketch' }, bridge);
   await handleHighLevelCadTool('cad_validate_sketch', { sketch: 'Part100x60::Sketch' }, bridge);
+  await handleHighLevelCadTool('cad_pad', { sketch: 'Part100x60::Sketch', length: 10 }, bridge);
 
   const execution = runFreeCadScript(bridge.commands);
   assert.equal(execution.ok, true, execution.traceback);
-  const [part, sketch, rectangle, inspection, validation] = execution.results;
+  const [part, sketch, rectangle, inspection, validation, pad] = execution.results;
 
   assert.equal(part.bodyCount, 1);
   assert.equal(part.documentId, 'Part100x60');
@@ -129,4 +131,29 @@ test('FreeCAD integration: Document -> Body -> Sketch and fully constrained 100 
   assert.equal(validation.suitableForPad, true);
   assert.deepEqual(validation.solverErrors, []);
   assert.deepEqual(validation.warnings, []);
+
+  assert.equal(pad.document, 'Part100x60');
+  assert.equal(pad.body, 'Part100x60::Body');
+  assert.equal(pad.sketch, 'Part100x60::Sketch');
+  assert.equal(pad.pad, 'Part100x60::Pad');
+  assert.equal(pad.typeId, 'PartDesign::Pad');
+  assert.equal(pad.length, 10);
+  assert.equal(pad.valid, true);
+  assert.equal(pad.error, null);
+  assert.equal(pad.solidCount, 1);
+  assert.ok(pad.volume > 0);
+  assert.ok(Math.abs(pad.boundingBox.xLength - 100) < 1e-7);
+  assert.ok(Math.abs(pad.boundingBox.yLength - 60) < 1e-7);
+  assert.ok(Math.abs(pad.boundingBox.zLength - 10) < 1e-7);
+});
+
+test('cad_pad rejects non-positive length before FreeCAD mutation', async () => {
+  for (const length of [0, -1]) {
+    const bridge = new CapturingBridge([]);
+    await assert.rejects(
+      handleHighLevelCadTool('cad_pad', { sketch: 'Part100x60::Sketch', length }, bridge),
+      /Invalid length/,
+    );
+    assert.equal(bridge.commands.length, 0);
+  }
 });

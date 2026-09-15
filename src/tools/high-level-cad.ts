@@ -73,6 +73,20 @@ export const HIGH_LEVEL_CAD_TOOLS = [
       required: ['sketch'],
     },
   },
+  {
+    name: 'cad_pad',
+    description: 'Create and validate a parametric PartDesign Pad from exactly one closed profile in an existing Body-owned sketch.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        sketch: { type: 'string', description: 'Qualified sketch ID (Document::Sketch or Document::Body::Sketch), or a globally unique sketch name' },
+        length: { type: 'number', exclusiveMinimum: 0, description: 'Pad length in mm' },
+        name: { type: 'string', description: 'Internal Pad name (default: Pad)' },
+      },
+      additionalProperties: false,
+      required: ['sketch', 'length'],
+    },
+  },
 ];
 
 function assertAllowedKeys(args: ToolArgs, allowed: string[]): void {
@@ -102,6 +116,43 @@ function validateQualifiedId(value: unknown, field: string): { document: string;
     throw new Error(`Invalid ${field}: expected a qualified ID such as Document::Object`);
   }
   return { document: match[1], object: match[2], id: value };
+}
+
+function resolvePadSketchReference(value: unknown): string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 386) {
+    throw new Error('Invalid sketch: expected a sketch name or qualified sketch ID');
+  }
+  const parts = value.split('::');
+  if (parts.length < 1 || parts.length > 3 || parts.some((part) => !IDENTIFIER.test(part))) {
+    throw new Error('Invalid sketch: expected Sketch, Document::Sketch, or Document::Body::Sketch');
+  }
+
+  if (parts.length === 1) {
+    return `
+matches = []
+for candidate_doc in FreeCAD.listDocuments().values():
+    candidate = candidate_doc.getObject(${JSON.stringify(parts[0])})
+    if candidate is not None and candidate.TypeId == "Sketcher::SketchObject":
+        matches.append((candidate_doc, candidate))
+if len(matches) == 0:
+    raise ValueError("SKETCH_NOT_FOUND: ${parts[0]}")
+if len(matches) > 1:
+    raise ValueError("SKETCH_AMBIGUOUS: ${parts[0]}")
+doc, sketch = matches[0]`;
+  }
+
+  const document = parts[0];
+  const sketchName = parts[parts.length - 1];
+  const expectedBody = parts.length === 3 ? parts[1] : undefined;
+  return `
+doc = FreeCAD.getDocument(${JSON.stringify(document)})
+sketch = doc.getObject(${JSON.stringify(sketchName)})
+if sketch is None:
+    raise ValueError("SKETCH_NOT_FOUND: ${value}")
+if sketch.TypeId != "Sketcher::SketchObject":
+    raise TypeError("OBJECT_IS_NOT_SKETCH: ${value}")
+${expectedBody ? `if sketch.getParentGeoFeatureGroup() is None or sketch.getParentGeoFeatureGroup().Name != ${JSON.stringify(expectedBody)}:
+    raise ValueError("SKETCH_PATH_BODY_MISMATCH: ${value}")` : ''}`;
 }
 
 function validateFiniteNumber(value: unknown, field: string): number {
@@ -390,6 +441,76 @@ _mcp_result["result"] = {
     "suitableForPad": bool(suitable_for_pad),
     "warnings": warnings
 }
+`);
+    }
+
+    case 'cad_pad': {
+      assertAllowedKeys(args, ['sketch', 'length', 'name']);
+      const sketchResolution = resolvePadSketchReference(args.sketch);
+      const length = validatePositiveDimension(args.length, 'length');
+      const padName = validateIdentifier(args.name, 'name', 'Pad');
+      return bridge.run(`
+${sketchResolution}
+if sketch.TypeId != "Sketcher::SketchObject":
+    raise TypeError("OBJECT_IS_NOT_SKETCH: " + sketch.Name)
+body = sketch.getParentGeoFeatureGroup()
+if body is None or body.TypeId != "PartDesign::Body" or sketch not in body.Group:
+    raise ValueError("SKETCH_NOT_IN_BODY: " + doc.Name + "::" + sketch.Name)
+${sketchInspectionPython('sketch')}
+closed_profile = inspection["geometryCount"] > 0 and inspection["closedContours"] == 1 and inspection["openContours"] == 0
+has_regular_geometry = inspection["constructionGeometryCount"] < inspection["geometryCount"]
+suitable_for_pad = closed_profile and inspection["fullyConstrained"] and not inspection["solverErrors"] and has_regular_geometry
+if not closed_profile:
+    raise ValueError("SKETCH_NOT_SINGLE_CLOSED_PROFILE: " + doc.Name + "::" + sketch.Name)
+if not suitable_for_pad:
+    raise ValueError("SKETCH_NOT_SUITABLE_FOR_PAD: " + str(inspection))
+doc.openTransaction("cad_pad")
+try:
+    pad = body.newObject("PartDesign::Pad", ${JSON.stringify(padName)})
+    pad.Profile = sketch
+    pad.Length = ${length}
+    doc.recompute()
+    error_states = [str(state) for state in pad.State if str(state) not in ("Up-to-date", "Touched")]
+    if error_states:
+        raise RuntimeError("PAD_RECOMPUTE_FAILED: " + str(error_states))
+    if pad.TypeId != "PartDesign::Pad":
+        raise RuntimeError("PAD_POSTCONDITION_FAILED: unexpected TypeId " + pad.TypeId)
+    if pad.getParentGeoFeatureGroup() != body or pad not in body.Group:
+        raise RuntimeError("PAD_POSTCONDITION_FAILED: Pad is not in the Sketch Body")
+    profile_target = pad.Profile[0] if isinstance(pad.Profile, tuple) else pad.Profile
+    if profile_target != sketch:
+        raise RuntimeError("PAD_POSTCONDITION_FAILED: Profile does not reference the requested Sketch")
+    if abs(float(pad.Length.Value) - ${length}) > 1e-7:
+        raise RuntimeError("PAD_POSTCONDITION_FAILED: Length mismatch")
+    shape = pad.Shape
+    valid = not shape.isNull() and shape.isValid() and len(shape.Solids) == 1 and shape.Volume > 0
+    if not valid:
+        raise RuntimeError("PAD_POSTCONDITION_FAILED: result is not one valid solid")
+    if body.Tip != pad:
+        raise RuntimeError("PAD_POSTCONDITION_FAILED: Pad is not the Body Tip")
+    bounds = shape.BoundBox
+    doc.commitTransaction()
+    _mcp_result["result"] = {
+        "document": doc.Name,
+        "body": doc.Name + "::" + body.Name,
+        "sketch": doc.Name + "::" + sketch.Name,
+        "pad": doc.Name + "::" + pad.Name,
+        "typeId": pad.TypeId,
+        "length": float(pad.Length.Value),
+        "valid": bool(valid),
+        "error": None,
+        "solidCount": len(shape.Solids),
+        "volume": float(shape.Volume),
+        "boundingBox": {
+            "xLength": float(bounds.XLength),
+            "yLength": float(bounds.YLength),
+            "zLength": float(bounds.ZLength)
+        }
+    }
+except Exception:
+    doc.abortTransaction()
+    doc.recompute()
+    raise
 `);
     }
 
