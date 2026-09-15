@@ -22,9 +22,14 @@ function executionPython(plan: Record<string, unknown>, revision: number, reques
 import FreeCAD
 import Part
 import Sketcher
+import hashlib
+import json
 import math
+import uuid
 plan = ${JSON.stringify(plan)}
 plan_revision = ${revision}
+resolved_plan_json = json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+plan_digest = "sha256:" + hashlib.sha256(resolved_plan_json.encode("utf-8")).hexdigest()
 LINEAR_TOLERANCE_MM = ${LINEAR_TOLERANCE_MM}
 AREA_TOLERANCE_MM2 = ${AREA_TOLERANCE_MM2}
 VOLUME_TOLERANCE_MM3 = ${VOLUME_TOLERANCE_MM3}
@@ -252,6 +257,7 @@ try:
         raise RuntimeError("UNSUPPORTED_RESOLVED_BASE_FEATURE: " + str(base_type))
     executed_steps = []
     feature_results = []
+    feature_bindings = {}
     expected_holes = []
     failed_step = "create_part"
     doc = FreeCAD.newDocument(document_name)
@@ -273,8 +279,14 @@ try:
             left = sketch.addGeometry(Part.LineSegment(FreeCAD.Vector(0, height, 0), FreeCAD.Vector(0, 0, 0)), False)
             for first, first_point, second, second_point in ((bottom, 2, right, 1), (right, 2, top, 1), (top, 2, left, 1), (left, 2, bottom, 1)):
                 sketch.addConstraint(Sketcher.Constraint("Coincident", first, first_point, second, second_point))
-            for constraint in (Sketcher.Constraint("Horizontal", bottom), Sketcher.Constraint("Vertical", right), Sketcher.Constraint("Horizontal", top), Sketcher.Constraint("Vertical", left), Sketcher.Constraint("Distance", bottom, width), Sketcher.Constraint("Distance", right, height), Sketcher.Constraint("DistanceX", -1, 1, bottom, 1, 0.0), Sketcher.Constraint("DistanceY", -1, 1, bottom, 1, 0.0)):
+            for constraint in (Sketcher.Constraint("Horizontal", bottom), Sketcher.Constraint("Vertical", right), Sketcher.Constraint("Horizontal", top), Sketcher.Constraint("Vertical", left)):
                 sketch.addConstraint(constraint)
+            width_constraint = sketch.addConstraint(Sketcher.Constraint("Distance", bottom, width))
+            height_constraint = sketch.addConstraint(Sketcher.Constraint("Distance", right, height))
+            sketch.renameConstraint(width_constraint, "width")
+            sketch.renameConstraint(height_constraint, "height")
+            sketch.addConstraint(Sketcher.Constraint("DistanceX", -1, 1, bottom, 1, 0.0))
+            sketch.addConstraint(Sketcher.Constraint("DistanceY", -1, 1, bottom, 1, 0.0))
             solve_result = sketch.solve()
             doc.recompute()
             check_object(sketch, "BASE_SKETCH_RECOMPUTE_FAILED")
@@ -288,6 +300,17 @@ try:
             check_object(pad, "PAD_RECOMPUTE_FAILED")
             if body.Tip != pad or pad.Shape.isNull() or not pad.Shape.isValid() or len(pad.Shape.Solids) != 1:
                 raise RuntimeError("PAD_POSTCONDITION_FAILED")
+            feature_bindings[feature_id] = {
+                "type": feature_type,
+                "feature_object": pad.Name,
+                "feature_type_id": pad.TypeId,
+                "sketch_object": sketch.Name,
+                "parameters": {
+                    "width": {"kind": "sketch_constraint", "object": sketch.Name, "constraint_name": "width", "unit": "mm"},
+                    "height": {"kind": "sketch_constraint", "object": sketch.Name, "constraint_name": "height", "unit": "mm"},
+                    "length": {"kind": "feature_property", "object": pad.Name, "property": "Length", "unit": "mm"},
+                },
+            }
             feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pad.Name, "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(sketch.DoF), "solid_valid": True})
         elif feature_type == "profile_pad":
             sketch = body.newObject("Sketcher::SketchObject", "PlanSketch_" + str(feature_index))
@@ -348,6 +371,7 @@ try:
             check_object(pad, "PROFILE_PAD_RECOMPUTE_FAILED")
             if body.Tip != pad or pad.Shape.isNull() or not pad.Shape.isValid() or len(pad.Shape.Solids) != 1 or float(pad.Shape.Volume) <= VOLUME_TOLERANCE_MM3:
                 raise RuntimeError("PROFILE_PAD_POSTCONDITION_FAILED")
+            feature_bindings[feature_id] = {"type": feature_type, "feature_object": pad.Name, "feature_type_id": pad.TypeId, "sketch_object": sketch.Name, "parameters": {"length": {"kind": "feature_property", "object": pad.Name, "property": "Length", "unit": "mm"}}}
             feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pad.Name, "object_type": pad.TypeId, "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(sketch.DoF), "segment_count": len(sketch.Geometry), "line_segment_count": actual_line_count, "arc_segment_count": len(actual_arc_geometries), "arc_radii": [float(geometry.Radius) for geometry in actual_arc_geometries], "arc_geometry_types": [geometry.__class__.__name__ for geometry in actual_arc_geometries], "solid_valid": True})
         elif feature_type == "hole_pattern":
             source_volume = float(body.Tip.Shape.Volume)
@@ -379,6 +403,7 @@ try:
             check_object(pocket, "POCKET_RECOMPUTE_FAILED")
             if body.Tip != pocket or pocket.Shape.isNull() or not pocket.Shape.isValid() or len(pocket.Shape.Solids) != 1 or float(pocket.Shape.Volume) >= source_volume:
                 raise RuntimeError("POCKET_POSTCONDITION_FAILED")
+            feature_bindings[feature_id] = {"type": feature_type, "feature_object": pocket.Name, "feature_type_id": pocket.TypeId, "sketch_object": hole_sketch.Name, "parameters": {}}
             expected_holes.append({"id": feature_id, "diameter": diameter, "centers": centers})
             feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pocket.Name, "object_type": pocket.TypeId, "verified_holes": len(centers), "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(hole_sketch.DoF), "source_volume": source_volume, "result_volume": float(pocket.Shape.Volume), "through_all": True})
         elif feature_type in ("fillet", "chamfer"):
@@ -398,6 +423,7 @@ try:
                 raise RuntimeError(feature_type.upper() + "_POSTCONDITION_FAILED")
             if abs(float(getattr(feature, property_name).Value) - float(feature_plan[dimension_name])) > LINEAR_TOLERANCE_MM:
                 raise RuntimeError(feature_type.upper() + "_DIMENSION_MISMATCH")
+            feature_bindings[feature_id] = {"type": feature_type, "feature_object": feature.Name, "feature_type_id": feature.TypeId, "parameters": {dimension_name: {"kind": "feature_property", "object": feature.Name, "property": property_name, "unit": "mm"}}}
             feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": feature.Name, dimension_name: float(getattr(feature, property_name).Value), "edges": feature_plan["edges"], "source_volume": source_volume, "result_volume": float(feature.Shape.Volume), "geometry_changed": True})
         else:
             raise RuntimeError("UNSUPPORTED_RESOLVED_FEATURE: " + str(feature_type))
@@ -588,8 +614,31 @@ try:
         doc = None
         _mcp_result["result"] = {"success": False, "status": "verification_failed", "code": "CAD_VERIFICATION_FAILED", "document": failed_document_name, "plan_revision": plan_revision, "issues": issues, "geometry_signature": geometry_signature, "verification": verification}
     else:
+        failed_step = "persist_managed_model"
+        model_id = str(uuid.uuid4())
+        metadata = doc.addObject("App::FeaturePython", "ManagedModelMetadata")
+        metadata.Label = "Managed Model Metadata"
+        metadata.addProperty("App::PropertyBool", "IsManagedModel", "ManagedModel")
+        metadata.addProperty("App::PropertyString", "ModelId", "ManagedModel")
+        metadata.addProperty("App::PropertyInteger", "ModelRevision", "ManagedModel")
+        metadata.addProperty("App::PropertyString", "PlanDigest", "ManagedModel")
+        metadata.addProperty("App::PropertyString", "ResolvedPlanJson", "ManagedModel")
+        metadata.addProperty("App::PropertyString", "FeatureBindingsJson", "ManagedModel")
+        metadata.IsManagedModel = False
+        metadata.ModelId = model_id
+        metadata.ModelRevision = 1
+        metadata.PlanDigest = plan_digest
+        metadata.ResolvedPlanJson = resolved_plan_json
+        metadata.FeatureBindingsJson = json.dumps(feature_bindings, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        doc.recompute()
+        check_object(metadata, "MANAGED_MODEL_METADATA_RECOMPUTE_FAILED")
+        if metadata.ModelId != model_id or int(metadata.ModelRevision) != 1 or metadata.PlanDigest != plan_digest or json.loads(metadata.ResolvedPlanJson) != plan or json.loads(metadata.FeatureBindingsJson) != feature_bindings:
+            raise RuntimeError("MANAGED_MODEL_METADATA_POSTCONDITION_FAILED")
+        metadata.IsManagedModel = True
+        doc.recompute()
+        check_object(metadata, "MANAGED_MODEL_ACTIVATION_FAILED")
         doc.commitTransaction()
-        _mcp_result["result"] = {"success": True, "status": "verified", "document": doc.Name, "body": doc.Name + "::" + body.Name, "plan_revision": plan_revision, "executed_steps": executed_steps, "features": feature_results, "valid": True, "solidCount": geometry_signature["solid_count"], "boundingBox": {"xLength": geometry_signature["bounding_box"]["x"], "yLength": geometry_signature["bounding_box"]["y"], "zLength": geometry_signature["bounding_box"]["z"]}, "volume": geometry_signature["volume"], "geometry_signature": geometry_signature, "verification": verification}
+        _mcp_result["result"] = {"success": True, "status": "verified", "document": doc.Name, "body": doc.Name + "::" + body.Name, "plan_revision": plan_revision, "managed_model": {"model_id": model_id, "model_revision": 1, "plan_digest": plan_digest}, "executed_steps": executed_steps, "features": feature_results, "valid": True, "solidCount": geometry_signature["solid_count"], "boundingBox": {"xLength": geometry_signature["bounding_box"]["x"], "yLength": geometry_signature["bounding_box"]["y"], "zLength": geometry_signature["bounding_box"]["z"]}, "volume": geometry_signature["volume"], "geometry_signature": geometry_signature, "verification": verification}
 except Exception as error:
     if doc is not None:
         try:

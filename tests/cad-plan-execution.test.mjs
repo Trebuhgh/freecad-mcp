@@ -409,6 +409,147 @@ test('simple plate execution returns a complete verified report', async () => {
   assert.ok(signature.surfaces.planar.every((surface) => surface.surface_type === 'plane' && surface.area > 0 && surface.center.length === 3 && surface.normal.length === 3));
 });
 
+test('verified rectangular pad persists managed-model metadata and semantic parameter bindings', async () => {
+  const planned = { shape: 'plate', size: [100, 60, 10], unit: 'mm' };
+  const { bridge, validation } = await validateAndCapture(planned, 'ManagedPlate');
+  const execution = executeFreeCad(`${bridge.commands[0]}
+_managed_result = _mcp_result["result"]
+_metadata = doc.getObject("ManagedModelMetadata")
+_bindings = json.loads(_metadata.FeatureBindingsJson)
+_base_binding = _bindings["base"]
+_bound_feature = doc.getObject(_base_binding["feature_object"])
+_bound_sketch = doc.getObject(_base_binding["sketch_object"])
+_model_id_before = _metadata.ModelId
+doc.recompute()
+_width_index = next(index for index, constraint in enumerate(_bound_sketch.Constraints) if constraint.Name == "width")
+_height_index = next(index for index, constraint in enumerate(_bound_sketch.Constraints) if constraint.Name == "height")
+_managed_result["managed_metadata_probe"] = {
+    "is_managed": bool(_metadata.IsManagedModel),
+    "model_id": str(_metadata.ModelId),
+    "model_id_after_recompute": str(_metadata.ModelId),
+    "model_revision": int(_metadata.ModelRevision),
+    "plan_digest": str(_metadata.PlanDigest),
+    "resolved_plan": json.loads(_metadata.ResolvedPlanJson),
+    "bindings": _bindings,
+    "feature_exists": _bound_feature is not None,
+    "sketch_exists": _bound_sketch is not None,
+    "feature_type_id": str(_bound_feature.TypeId),
+    "sketch_type_id": str(_bound_sketch.TypeId),
+    "constraint_names": [str(constraint.Name) for constraint in _bound_sketch.Constraints],
+    "width_value": float(_bound_sketch.getDatum(_width_index).Value),
+    "height_value": float(_bound_sketch.getDatum(_height_index).Value),
+    "length_value": float(_bound_feature.Length.Value),
+    "volume": float(body.Tip.Shape.Volume),
+}
+_mcp_result["result"] = _managed_result`);
+
+  assert.equal(execution.ok, true, execution.traceback);
+  assert.equal(execution.result.success, true, JSON.stringify(execution.result, null, 2));
+  assert.equal(execution.result.status, 'verified');
+  assert.match(execution.result.managed_model.model_id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  assert.equal(execution.result.managed_model.model_revision, 1);
+  assert.match(execution.result.managed_model.plan_digest, /^sha256:[0-9a-f]{64}$/);
+  assert.doesNotMatch(JSON.stringify(execution.result.managed_model), /constraint_index|PlanFeature_0|PlanSketch_0/);
+
+  const probe = execution.result.managed_metadata_probe;
+  assert.equal(probe.is_managed, true);
+  assert.equal(probe.model_id, execution.result.managed_model.model_id);
+  assert.equal(probe.model_id_after_recompute, probe.model_id);
+  assert.equal(probe.model_revision, 1);
+  assert.equal(probe.plan_digest, execution.result.managed_model.plan_digest);
+  assert.deepEqual(probe.resolved_plan, validation.resolved_plan);
+  assert.equal(probe.feature_exists, true);
+  assert.equal(probe.sketch_exists, true);
+  assert.equal(probe.feature_type_id, 'PartDesign::Pad');
+  assert.equal(probe.sketch_type_id, 'Sketcher::SketchObject');
+  assert.ok(probe.constraint_names.includes('width'));
+  assert.ok(probe.constraint_names.includes('height'));
+  assert.equal(probe.width_value, 100);
+  assert.equal(probe.height_value, 60);
+  assert.equal(probe.length_value, 10);
+  assert.equal(probe.volume, 60000);
+  assert.deepEqual(probe.bindings.base, {
+    type: 'rectangular_pad',
+    feature_object: 'PlanFeature_0',
+    feature_type_id: 'PartDesign::Pad',
+    sketch_object: 'PlanSketch_0',
+    parameters: {
+      width: { kind: 'sketch_constraint', object: 'PlanSketch_0', constraint_name: 'width', unit: 'mm' },
+      height: { kind: 'sketch_constraint', object: 'PlanSketch_0', constraint_name: 'height', unit: 'mm' },
+      length: { kind: 'feature_property', object: 'PlanFeature_0', property: 'Length', unit: 'mm' },
+    },
+  });
+  assert.ok(execution.documents.ManagedPlate.includes('ManagedModelMetadata'));
+  assert.deepEqual(execution.result.geometry_signature.bounding_box, { x: 100, y: 60, z: 10 });
+  assert.equal(execution.result.geometry_signature.volume, 60000);
+});
+
+test('managed model IDs are unique while canonical resolved plans have a stable digest', async () => {
+  const planned = { shape: 'plate', size: [100, 60, 10], unit: 'mm' };
+  const first = await validateAndCapture(planned, 'ManagedIdentityA');
+  const second = await validateAndCapture(planned, 'ManagedIdentityB');
+  const execution = executeFreeCad(`${first.bridge.commands[0]}
+_first_managed_model = dict(_mcp_result["result"]["managed_model"])
+${second.bridge.commands[0]}
+_mcp_result["result"]["first_managed_model"] = _first_managed_model`);
+
+  assert.equal(execution.ok, true, execution.traceback);
+  assert.equal(execution.result.success, true, JSON.stringify(execution.result, null, 2));
+  assert.notEqual(execution.result.first_managed_model.model_id, execution.result.managed_model.model_id);
+  assert.equal(execution.result.first_managed_model.plan_digest, execution.result.managed_model.plan_digest);
+  assert.equal(execution.result.first_managed_model.model_revision, 1);
+  assert.equal(execution.result.managed_model.model_revision, 1);
+});
+
+test('managed-model metadata and bindings survive a real FCStd save and reload', async () => {
+  const planned = { shape: 'plate', size: [100, 60, 10], unit: 'mm' };
+  const { bridge, validation } = await validateAndCapture(planned, 'ManagedReload');
+  const execution = executeFreeCad(`${bridge.commands[0]}
+import os
+import tempfile
+_execution_result = _mcp_result["result"]
+_file_descriptor, _fcstd_path = tempfile.mkstemp(suffix=".FCStd")
+os.close(_file_descriptor)
+doc.saveAs(_fcstd_path)
+FreeCAD.closeDocument(doc.Name)
+_reloaded = FreeCAD.openDocument(_fcstd_path)
+_reloaded_metadata = _reloaded.getObject("ManagedModelMetadata")
+_reloaded_bindings = json.loads(_reloaded_metadata.FeatureBindingsJson)
+_reloaded_base = _reloaded_bindings["base"]
+_reloaded_feature = _reloaded.getObject(_reloaded_base["feature_object"])
+_reloaded_sketch = _reloaded.getObject(_reloaded_base["sketch_object"])
+_reloaded_body = _reloaded.getObject("Body")
+_reloaded.recompute()
+_reloaded_bounds = _reloaded_body.Tip.Shape.optimalBoundingBox(False)
+_execution_result["reload_probe"] = {
+    "is_managed": bool(_reloaded_metadata.IsManagedModel),
+    "model_id": str(_reloaded_metadata.ModelId),
+    "model_revision": int(_reloaded_metadata.ModelRevision),
+    "plan_digest": str(_reloaded_metadata.PlanDigest),
+    "resolved_plan": json.loads(_reloaded_metadata.ResolvedPlanJson),
+    "feature_exists": _reloaded_feature is not None,
+    "sketch_exists": _reloaded_sketch is not None,
+    "bounding_box": {"x": float(_reloaded_bounds.XLength), "y": float(_reloaded_bounds.YLength), "z": float(_reloaded_bounds.ZLength)},
+    "volume": float(_reloaded_body.Tip.Shape.Volume),
+}
+FreeCAD.closeDocument(_reloaded.Name)
+os.remove(_fcstd_path)
+_mcp_result["result"] = _execution_result`);
+
+  assert.equal(execution.ok, true, execution.traceback);
+  assert.equal(execution.result.success, true, JSON.stringify(execution.result, null, 2));
+  const probe = execution.result.reload_probe;
+  assert.equal(probe.is_managed, true);
+  assert.equal(probe.model_id, execution.result.managed_model.model_id);
+  assert.equal(probe.model_revision, 1);
+  assert.equal(probe.plan_digest, execution.result.managed_model.plan_digest);
+  assert.deepEqual(probe.resolved_plan, validation.resolved_plan);
+  assert.equal(probe.feature_exists, true);
+  assert.equal(probe.sketch_exists, true);
+  assert.deepEqual(probe.bounding_box, { x: 100, y: 60, z: 10 });
+  assert.equal(probe.volume, 60000);
+});
+
 test('geometry signature is deterministic and contains no topological index identities', async () => {
   const simplePlan = {
     shape: 'plate', size: [100, 60, 10], unit: 'mm',
@@ -678,6 +819,9 @@ ${code}`, true);
     assert.deepEqual(issue.expected, expected);
     assert.deepEqual(issue.actual, actual);
     assert.equal(execution.openDocuments.includes(`VerificationFailure_${check}`), false);
+    assert.equal(execution.result.managed_model, undefined);
+    assert.equal(execution.documents[`VerificationFailure_${check}`], undefined);
+    assert.equal(Object.values(execution.documents).flat().includes('ManagedModelMetadata'), false);
     assert.deepEqual(execution.documents.VerificationKeep, ['KeepMarker']);
   });
 }
