@@ -1,5 +1,6 @@
 import { FreeCADBridge } from '../freecad-bridge.js';
 import { ToolArgs, ToolResult } from '../types.js';
+import { CAD_PLAN_TOOLS, handleCadValidatePlan } from './cad-plan-validation.js';
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const QUALIFIED_ID = /^([A-Za-z_][A-Za-z0-9_]*)::([A-Za-z_][A-Za-z0-9_]*)$/;
@@ -205,6 +206,7 @@ export const HIGH_LEVEL_CAD_TOOLS = [
       required: ['body', 'size', 'edges'],
     },
   },
+  ...CAD_PLAN_TOOLS,
 ];
 
 type EdgeSelection =
@@ -619,6 +621,9 @@ export async function handleHighLevelCadTool(
   bridge: FreeCADBridge,
 ): Promise<ToolResult> {
   switch (name) {
+    case 'cad_validate_plan':
+      return handleCadValidatePlan(args);
+
     case 'cad_create_part': {
       assertAllowedKeys(args, ['name', 'bodyName']);
       const documentName = validateIdentifier(args.name, 'name', 'Part');
