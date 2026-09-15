@@ -9,6 +9,14 @@ import { CadPlanValidationGate } from '../dist/tools/cad-plan-validation.js';
 
 const freecadPython = process.env.FREECAD_PYTHON || 'C:\\Program Files\\FreeCAD 1.1\\bin\\python.exe';
 const platePlan = { shape: 'plate', size: [100, 60, 10], unit: 'mm' };
+const holeCenters = [{ x: 20, y: 20 }, { x: 80, y: 40 }];
+const holedPlatePlan = {
+  unit: 'mm',
+  features: [
+    { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+    { id: 'holes', type: 'hole_pattern', diameter: 6, placement: { type: 'explicit', centers: holeCenters }, operation: 'through_all', after: 'base' },
+  ],
+};
 
 function payload(toolResult) {
   return JSON.parse(toolResult.content[0].text);
@@ -100,6 +108,68 @@ async function createManagedPlate(t, documentName) {
   assert.equal(created.success, true, JSON.stringify(created, null, 2));
   assert.equal(created.status, 'verified');
   return { bridge, planGate, editGate, created };
+}
+
+async function createManagedHoledPlate(t, documentName, plan = holedPlatePlan) {
+  const bridge = new PersistentFreeCadBridge();
+  t.after(() => bridge.destroy());
+  const planGate = new CadPlanValidationGate();
+  const editGate = new CadEditValidationGate();
+  const validation = payload(await handleHighLevelCadTool('cad_validate_plan', { plan }, bridge, planGate, editGate));
+  assert.equal(validation.status, 'valid', JSON.stringify(validation, null, 2));
+  const created = payload(await handleHighLevelCadTool('cad_execute_plan', { documentName }, bridge, planGate, editGate));
+  assert.equal(created.success, true, JSON.stringify(created, null, 2));
+  return { bridge, planGate, editGate, created, validation };
+}
+
+function diameterEdit(created, overrides = {}) {
+  return {
+    model_id: created.managed_model.model_id,
+    model_revision: 1,
+    target_feature_id: 'holes',
+    parameter: 'diameter',
+    old_value: 6,
+    new_value: 8,
+    unit: 'mm',
+    ...overrides,
+  };
+}
+
+async function inspectManagedHoles(bridge, documentName) {
+  return payload(await bridge.run(`
+doc = FreeCAD.getDocument(${JSON.stringify(documentName)})
+metadata = doc.getObject("ManagedModelMetadata")
+plan = json.loads(metadata.ResolvedPlanJson)
+bindings = json.loads(metadata.FeatureBindingsJson)
+hole_binding = bindings["holes"]
+hole_sketch = doc.getObject(hole_binding["sketch_object"])
+pocket = doc.getObject(hole_binding["feature_object"])
+diameter_binding = hole_binding["parameters"]["diameter"]
+circles = []
+for name in diameter_binding["constraint_names"]:
+    constraint_index = next(index for index, constraint in enumerate(hole_sketch.Constraints) if constraint.Name == name)
+    geometry_index = int(hole_sketch.Constraints[constraint_index].First)
+    circle = hole_sketch.Geometry[geometry_index]
+    circles.append({"name": name, "x": float(circle.Center.x), "y": float(circle.Center.y), "diameter": float(circle.Radius) * 2.0})
+cylinders = []
+for face in pocket.Shape.Faces:
+    if face.Surface.__class__.__name__ == "Cylinder":
+        surface = face.Surface
+        axis = surface.Axis
+        if abs(axis.x) < 1e-9 and abs(axis.y) < 1e-9 and abs(abs(axis.z) - 1.0) < 1e-9:
+            cylinders.append({"x": float(surface.Center.x), "y": float(surface.Center.y), "diameter": float(surface.Radius) * 2.0})
+cylinders.sort(key=lambda item: (item["x"], item["y"], item["diameter"]))
+base_binding = bindings["base"]
+base_sketch = doc.getObject(base_binding["sketch_object"])
+base_pad = doc.getObject(base_binding["feature_object"])
+width_index = next(index for index, constraint in enumerate(base_sketch.Constraints) if constraint.Name == "width")
+height_index = next(index for index, constraint in enumerate(base_sketch.Constraints) if constraint.Name == "height")
+_mcp_result["result"] = {
+    "model_id": str(metadata.ModelId), "model_revision": int(metadata.ModelRevision), "plan_digest": str(metadata.PlanDigest),
+    "resolved_plan": plan, "bindings": bindings, "circles": circles, "cylinders": cylinders,
+    "base": {"width": float(base_sketch.getDatum(width_index).Value), "height": float(base_sketch.getDatum(height_index).Value), "length": float(base_pad.Length.Value)},
+    "tip": doc.getObject("Body").Tip.Name, "object_count": len(doc.Objects),
+}`));
 }
 
 function widthEdit(created, overrides = {}) {
@@ -638,4 +708,191 @@ os.remove(path)`));
   assert.deepEqual(reload.resolved_plan.features[0], {
     id: 'base', type: 'rectangular_pad', width: 120, height: 80, length: 15,
   });
+});
+
+test('hole_pattern diameter edit is discovered, validated, executed, and independently verified', async (t) => {
+  const { bridge, planGate, editGate, created } = await createManagedHoledPlate(t, 'HoleDiameterEdit');
+  const before = await inspectManagedHoles(bridge, 'HoleDiameterEdit');
+  assert.deepEqual(before.circles.map((circle) => circle.diameter), [6, 6]);
+  assert.deepEqual(before.cylinders.map((cylinder) => cylinder.diameter), [6, 6]);
+  assert.deepEqual(before.base, { width: 100, height: 60, length: 10 });
+  assert.deepEqual(before.bindings.holes.parameters.diameter, {
+    kind: 'sketch_constraints', object: 'PlanSketch_1', constraint_names: ['diameter_0', 'diameter_1'], unit: 'mm',
+  });
+
+  const discovery = await listManagedModels(bridge);
+  const holes = discovery.models[0].features.find((feature) => feature.id === 'holes');
+  assert.deepEqual(holes, { id: 'holes', type: 'hole_pattern', parameters: { diameter: 6 } });
+
+  const edit = diameterEdit(created);
+  const validation = payload(await handleHighLevelCadTool('cad_validate_edit_plan', edit, bridge, planGate, editGate));
+  assert.equal(validation.status, 'valid', JSON.stringify(validation, null, 2));
+  assert.equal(validation.can_execute, true);
+  const execution = payload(await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate));
+  assert.equal(execution.success, true, JSON.stringify(execution, null, 2));
+  assert.equal(execution.status, 'verified');
+  assert.equal(execution.verification.passed, true);
+  for (const check of ['hole_count', 'hole_centers', 'hole_diameter', 'hole_axes', 'base_dimensions', 'binding_valid', 'feature_chain_complete']) {
+    assert.equal(execution.verification.checks[check].passed, true, check);
+  }
+  assert.equal(execution.managed_model.model_id, created.managed_model.model_id);
+  assert.equal(execution.managed_model.model_revision, 2);
+  assert.notEqual(execution.managed_model.plan_digest, created.managed_model.plan_digest);
+  assert.deepEqual(execution.geometry_signature.surfaces.cylindrical.filter((surface) => surface.surface_role === 'hole').map((surface) => surface.radius), [4, 4]);
+
+  const after = await inspectManagedHoles(bridge, 'HoleDiameterEdit');
+  assert.deepEqual(after.circles.map((circle) => circle.diameter), [8, 8]);
+  assert.deepEqual(after.cylinders.map((cylinder) => cylinder.diameter), [8, 8]);
+  assert.deepEqual(after.cylinders.map(({ x, y }) => ({ x, y })), before.cylinders.map(({ x, y }) => ({ x, y })));
+  assert.deepEqual(after.base, before.base);
+  assert.equal(after.object_count, before.object_count);
+  assert.equal(after.tip, before.tip);
+  assert.equal(after.resolved_plan.features.find((feature) => feature.id === 'holes').diameter, 8);
+});
+
+test('hole diameter validation blocks wrong old value, actual constraint drift, and damaged binding', async (t) => {
+  const { bridge, planGate, editGate, created } = await createManagedHoledPlate(t, 'HoleDiameterInvalid');
+  const wrongOld = payload(await handleHighLevelCadTool('cad_validate_edit_plan', diameterEdit(created, { old_value: 7 }), bridge, planGate, editGate));
+  assert.equal(wrongOld.can_execute, false);
+  assert.equal(wrongOld.issues[0].code, 'OLD_VALUE_MISMATCH');
+
+  await bridge.run(`
+doc = FreeCAD.getDocument("HoleDiameterInvalid")
+metadata = doc.getObject("ManagedModelMetadata")
+bindings = json.loads(metadata.FeatureBindingsJson)
+sketch = doc.getObject(bindings["holes"]["sketch_object"])
+name = bindings["holes"]["parameters"]["diameter"]["constraint_names"][0]
+index = next(index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == name)
+sketch.setDatum(index, FreeCAD.Units.Quantity("7 mm"))
+doc.recompute()
+_mcp_result["result"] = True`);
+  const drift = payload(await handleHighLevelCadTool('cad_validate_edit_plan', diameterEdit(created), bridge, planGate, editGate));
+  assert.equal(drift.can_execute, false);
+  assert.equal(drift.issues[0].code, 'MODEL_STATE_MISMATCH');
+
+  await bridge.run(`
+doc = FreeCAD.getDocument("HoleDiameterInvalid")
+metadata = doc.getObject("ManagedModelMetadata")
+bindings = json.loads(metadata.FeatureBindingsJson)
+sketch = doc.getObject(bindings["holes"]["sketch_object"])
+name = bindings["holes"]["parameters"]["diameter"]["constraint_names"][0]
+index = next(index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == name)
+sketch.setDatum(index, FreeCAD.Units.Quantity("6 mm"))
+bindings["holes"]["parameters"]["diameter"]["constraint_names"][0] = "missing_diameter"
+metadata.FeatureBindingsJson = json.dumps(bindings, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+doc.recompute()
+_mcp_result["result"] = True`);
+  const damaged = payload(await handleHighLevelCadTool('cad_validate_edit_plan', diameterEdit(created), bridge, planGate, editGate));
+  assert.equal(damaged.can_execute, false);
+  assert.equal(damaged.issues[0].code, 'FEATURE_BINDING_INVALID');
+});
+
+test('hole diameter geometric validation blocks boundary intersection and hole contact without mutation', async (t) => {
+  const first = await createManagedHoledPlate(t, 'HoleDiameterBoundary');
+  const firstBefore = await inspectManagedHoles(first.bridge, 'HoleDiameterBoundary');
+  const boundary = payload(await handleHighLevelCadTool('cad_validate_edit_plan', diameterEdit(first.created, { new_value: 42 }), first.bridge, first.planGate, first.editGate));
+  assert.equal(boundary.can_execute, false);
+  assert.ok(boundary.issues.some((item) => item.code === 'HOLE_OUTSIDE_BASE'));
+  assert.deepEqual(await inspectManagedHoles(first.bridge, 'HoleDiameterBoundary'), firstBefore);
+
+  const closeCentersPlan = {
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { id: 'holes', type: 'hole_pattern', diameter: 6, placement: { type: 'explicit', centers: [{ x: 30, y: 30 }, { x: 42, y: 30 }] }, operation: 'through_all', after: 'base' },
+    ],
+  };
+  const second = await createManagedHoledPlate(t, 'HoleDiameterContact', closeCentersPlan);
+  const secondBefore = await inspectManagedHoles(second.bridge, 'HoleDiameterContact');
+  const overlap = payload(await handleHighLevelCadTool('cad_validate_edit_plan', diameterEdit(second.created, { new_value: 12 }), second.bridge, second.planGate, second.editGate));
+  assert.equal(overlap.can_execute, false);
+  assert.ok(overlap.issues.some((item) => item.code === 'HOLES_OVERLAP'));
+  assert.deepEqual(await inspectManagedHoles(second.bridge, 'HoleDiameterContact'), secondBefore);
+});
+
+test('hole diameter verification failure explicitly restores geometry and managed metadata', async (t) => {
+  const { bridge, planGate, editGate, created } = await createManagedHoledPlate(t, 'HoleDiameterRollback');
+  const before = await inspectManagedHoles(bridge, 'HoleDiameterRollback');
+  const validation = payload(await handleHighLevelCadTool('cad_validate_edit_plan', diameterEdit(created), bridge, planGate, editGate));
+  assert.equal(validation.can_execute, true);
+  bridge.mutateNextCode((code) => {
+    const marker = '    # edit_verification_snapshot_complete';
+    assert.ok(code.includes(marker));
+    return code.replace(marker, '    actual_snapshot["holes"][0]["radius"] = 99.0\n' + marker);
+  });
+  const failedResult = await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate);
+  const failed = payload(failedResult);
+  assert.equal(failedResult.isError, true);
+  assert.equal(failed.code, 'CAD_EDIT_VERIFICATION_FAILED');
+  assert.equal(failed.rollback.passed, true, JSON.stringify(failed, null, 2));
+  assert.equal(failed.rollback.diameter, 6);
+  assert.equal(failed.rollback.model_revision, 1);
+  assert.equal(failed.rollback.plan_digest, created.managed_model.plan_digest);
+  const after = await inspectManagedHoles(bridge, 'HoleDiameterRollback');
+  assert.deepEqual(after.circles, before.circles);
+  assert.deepEqual(after.cylinders, before.cylinders);
+  assert.deepEqual(after.base, before.base);
+  assert.equal(after.model_revision, before.model_revision);
+  assert.equal(after.plan_digest, before.plan_digest);
+});
+
+test('hole diameter execution failure after mutation explicitly restores original BREP', async (t) => {
+  const { bridge, planGate, editGate, created } = await createManagedHoledPlate(t, 'HoleDiameterExecutionRollback');
+  const before = await inspectManagedHoles(bridge, 'HoleDiameterExecutionRollback');
+  const validation = payload(await handleHighLevelCadTool('cad_validate_edit_plan', diameterEdit(created), bridge, planGate, editGate));
+  assert.equal(validation.can_execute, true);
+  bridge.mutateNextCode((code) => {
+    const marker = '    # edit_verification_snapshot_start';
+    assert.ok(code.includes(marker));
+    return code.replace(marker, '    raise RuntimeError("SIMULATED_POST_MUTATION_FAILURE")\n' + marker);
+  });
+  const failedResult = await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate);
+  const failed = payload(failedResult);
+  assert.equal(failedResult.isError, true);
+  assert.equal(failed.code, 'CAD_EDIT_EXECUTION_FAILED');
+  assert.match(failed.error, /SIMULATED_POST_MUTATION_FAILURE/);
+  assert.equal(failed.rollback.passed, true, JSON.stringify(failed, null, 2));
+  const after = await inspectManagedHoles(bridge, 'HoleDiameterExecutionRollback');
+  assert.deepEqual(after.circles, before.circles);
+  assert.deepEqual(after.cylinders, before.cylinders);
+  assert.deepEqual(after.base, before.base);
+  assert.equal(after.model_revision, 1);
+  assert.equal(after.plan_digest, created.managed_model.plan_digest);
+});
+
+test('successful hole diameter edit persists model identity, revision, digest, plan, binding, and BREP after save/reload', async (t) => {
+  const { bridge, planGate, editGate, created } = await createManagedHoledPlate(t, 'HoleDiameterReload');
+  const validation = payload(await handleHighLevelCadTool('cad_validate_edit_plan', diameterEdit(created), bridge, planGate, editGate));
+  assert.equal(validation.can_execute, true);
+  const execution = payload(await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate));
+  assert.equal(execution.status, 'verified', JSON.stringify(execution, null, 2));
+  const reload = payload(await bridge.run(`
+import os
+import tempfile
+doc = FreeCAD.getDocument("HoleDiameterReload")
+descriptor, path = tempfile.mkstemp(suffix=".FCStd")
+os.close(descriptor)
+doc.saveAs(path)
+FreeCAD.closeDocument(doc.Name)
+reloaded = FreeCAD.openDocument(path)
+metadata = reloaded.getObject("ManagedModelMetadata")
+bindings = json.loads(metadata.FeatureBindingsJson)
+binding = bindings["holes"]
+sketch = reloaded.getObject(binding["sketch_object"])
+diameters = []
+for name in binding["parameters"]["diameter"]["constraint_names"]:
+    index = next(index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == name)
+    geometry = sketch.Geometry[int(sketch.Constraints[index].First)]
+    diameters.append(float(geometry.Radius) * 2.0)
+cylinder_diameters = sorted([float(face.Surface.Radius) * 2.0 for face in reloaded.getObject(binding["feature_object"]).Shape.Faces if face.Surface.__class__.__name__ == "Cylinder"])
+_mcp_result["result"] = {"model_id": str(metadata.ModelId), "model_revision": int(metadata.ModelRevision), "plan_digest": str(metadata.PlanDigest), "resolved_plan": json.loads(metadata.ResolvedPlanJson), "binding": binding, "diameters": diameters, "cylinder_diameters": cylinder_diameters}
+FreeCAD.closeDocument(reloaded.Name)
+os.remove(path)`));
+  assert.equal(reload.model_id, created.managed_model.model_id);
+  assert.equal(reload.model_revision, 2);
+  assert.equal(reload.plan_digest, execution.managed_model.plan_digest);
+  assert.equal(reload.resolved_plan.features.find((feature) => feature.id === 'holes').diameter, 8);
+  assert.deepEqual(reload.binding.parameters.diameter.constraint_names, ['diameter_0', 'diameter_1']);
+  assert.deepEqual(reload.diameters, [8, 8]);
+  assert.deepEqual(reload.cylinder_diameters, [8, 8]);
 });

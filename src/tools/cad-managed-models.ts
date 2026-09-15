@@ -4,7 +4,7 @@ import { LINEAR_TOLERANCE_MM } from './cad-geometry-tolerances.js';
 
 export const CAD_MANAGED_MODEL_TOOLS = [{
   name: 'cad_list_managed_models',
-  description: 'Read-only discovery of every valid managed model currently open in FreeCAD. Returns semantic feature IDs and parameters. For rectangular_pad: width is X sketch extent, height is Y sketch extent, and length is Pad.Length / Z thickness. Never selects a model automatically.',
+  description: 'Read-only discovery of every valid managed model currently open in FreeCAD. Returns rectangular_pad width/height/length and hole_pattern diameter through persistent semantic bindings. Never selects a model automatically.',
   inputSchema: {
     type: 'object' as const,
     properties: {},
@@ -99,6 +99,32 @@ for document_name in sorted(FreeCAD.listDocuments().keys()):
                 require(isinstance(length_binding, dict) and length_binding.get("kind") == "feature_property" and length_binding.get("property") == "Length" and length_binding.get("object") == binding.get("feature_object") and length_binding.get("unit") == "mm", "FEATURE_BINDING_INVALID", "The rectangular_pad length binding is invalid.")
                 parameters["length"] = float(feature_object.Length.Value)
                 require(all(name in feature_plan and abs(parameters[name] - float(feature_plan[name])) <= LINEAR_TOLERANCE_MM for name in ("width", "height", "length")), "MODEL_STATE_MISMATCH", "Actual rectangular_pad parameters differ from the persistent resolved plan.")
+            elif feature_type == "hole_pattern":
+                require(feature_object.TypeId == "PartDesign::Pocket" and binding.get("feature_type_id") == "PartDesign::Pocket", "BOUND_OBJECT_TYPE_MISMATCH", "The hole_pattern binding does not reference a PartDesign Pocket.")
+                sketch = doc.getObject(binding.get("sketch_object", ""))
+                require(sketch is not None and sketch.TypeId == "Sketcher::SketchObject", "BOUND_OBJECT_NOT_FOUND", "The bound hole_pattern Sketch no longer exists.")
+                body = feature_object.getParentGeoFeatureGroup()
+                profile_value = feature_object.Profile
+                profile_object = profile_value[0] if isinstance(profile_value, tuple) else profile_value
+                require(body is not None and body.TypeId == "PartDesign::Body" and feature_object in body.Group and sketch in body.Group and profile_object == sketch, "FEATURE_CHAIN_MISMATCH", "The hole_pattern binding no longer matches its Body feature chain.")
+                diameter_binding = binding.get("parameters", {}).get("diameter")
+                centers = feature_plan.get("centers", [])
+                names = diameter_binding.get("constraint_names") if isinstance(diameter_binding, dict) else None
+                require(isinstance(diameter_binding, dict) and diameter_binding.get("kind") == "sketch_constraints" and diameter_binding.get("object") == binding.get("sketch_object") and diameter_binding.get("unit") == "mm" and isinstance(names, list) and len(names) == len(centers) and len(names) > 0 and len(set(names)) == len(names), "FEATURE_BINDING_INVALID", "The hole_pattern diameter binding is invalid.")
+                diameters = []
+                geometry_indices = []
+                for center, name in zip(centers, names):
+                    indices = [index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == name]
+                    require(len(indices) == 1, "FEATURE_BINDING_INVALID", "A named hole diameter constraint does not exist exactly once.")
+                    constraint = sketch.Constraints[indices[0]]
+                    geometry_index = int(constraint.First)
+                    require(constraint.Type == "Diameter" and geometry_index >= 0 and geometry_index < len(sketch.Geometry) and geometry_index not in geometry_indices, "FEATURE_BINDING_INVALID", "A hole diameter constraint is not bound to one unique circle.")
+                    circle = sketch.Geometry[geometry_index]
+                    require(circle.__class__.__name__ == "Circle" and abs(float(circle.Center.x) - float(center["x"])) <= LINEAR_TOLERANCE_MM and abs(float(circle.Center.y) - float(center["y"])) <= LINEAR_TOLERANCE_MM, "FEATURE_BINDING_INVALID", "A bound hole circle center differs from the resolved plan.")
+                    geometry_indices.append(geometry_index)
+                    diameters.append(float(circle.Radius) * 2.0)
+                require(len([geometry for geometry in sketch.Geometry if geometry.__class__.__name__ == "Circle"]) == len(centers) and all(abs(value - float(feature_plan.get("diameter"))) <= LINEAR_TOLERANCE_MM for value in diameters), "MODEL_STATE_MISMATCH", "Actual hole diameters differ from the persistent resolved plan.")
+                parameters["diameter"] = diameters[0]
             semantic_features.append({"id": feature_id, "type": feature_type, "parameters": parameters})
         models.append({"model_id": model_id, "model_revision": model_revision, "document": doc.Name, "features": semantic_features})
     except ManagedModelIssue as error:
@@ -121,4 +147,3 @@ export async function handleCadListManagedModels(args: ToolArgs, bridge: FreeCAD
   }
   return bridge.run(discoveryPython());
 }
-

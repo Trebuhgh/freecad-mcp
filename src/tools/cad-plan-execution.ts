@@ -301,9 +301,13 @@ try:
             centers = feature_plan["centers"]
             hole_sketch = body.newObject("Sketcher::SketchObject", "PlanSketch_" + str(feature_index))
             attach_xy(hole_sketch, body)
-            for center in centers:
+            diameter_constraint_names = []
+            for center_index, center in enumerate(centers):
                 circle = hole_sketch.addGeometry(Part.Circle(FreeCAD.Vector(center["x"], center["y"], 0), FreeCAD.Vector(0, 0, 1), diameter / 2.0), False)
-                hole_sketch.addConstraint(Sketcher.Constraint("Diameter", circle, diameter))
+                diameter_constraint = hole_sketch.addConstraint(Sketcher.Constraint("Diameter", circle, diameter))
+                diameter_constraint_name = "diameter_" + str(center_index)
+                hole_sketch.renameConstraint(diameter_constraint, diameter_constraint_name)
+                diameter_constraint_names.append(diameter_constraint_name)
                 hole_sketch.addConstraint(Sketcher.Constraint("DistanceX", -1, 1, circle, 3, center["x"]))
                 hole_sketch.addConstraint(Sketcher.Constraint("DistanceY", -1, 1, circle, 3, center["y"]))
             solve_result = hole_sketch.solve()
@@ -325,7 +329,7 @@ try:
             check_object(pocket, "POCKET_RECOMPUTE_FAILED")
             if body.Tip != pocket or pocket.Shape.isNull() or not pocket.Shape.isValid() or len(pocket.Shape.Solids) != 1 or float(pocket.Shape.Volume) >= source_volume:
                 raise RuntimeError("POCKET_POSTCONDITION_FAILED")
-            feature_bindings[feature_id] = {"type": feature_type, "feature_object": pocket.Name, "feature_type_id": pocket.TypeId, "sketch_object": hole_sketch.Name, "parameters": {}}
+            feature_bindings[feature_id] = {"type": feature_type, "feature_object": pocket.Name, "feature_type_id": pocket.TypeId, "sketch_object": hole_sketch.Name, "parameters": {"diameter": {"kind": "sketch_constraints", "object": hole_sketch.Name, "constraint_names": diameter_constraint_names, "unit": "mm"}}}
             expected_holes.append({"id": feature_id, "diameter": diameter, "centers": centers})
             feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pocket.Name, "object_type": pocket.TypeId, "verified_holes": len(centers), "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(hole_sketch.DoF), "source_volume": source_volume, "result_volume": float(pocket.Shape.Volume), "through_all": True})
         elif feature_type in ("fillet", "chamfer"):
