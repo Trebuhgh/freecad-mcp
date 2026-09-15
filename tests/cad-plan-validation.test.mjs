@@ -234,3 +234,66 @@ test('hole placement numeric fields reject empty arrays, non-finite coordinates,
     assert.equal(result.can_execute, false);
   }
 });
+
+test('minimal feature inputs derive IDs, dependencies, and counts server-side', async () => {
+  const grid = await validate({
+    unit: 'mm',
+    features: [
+      { type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { type: 'hole_pattern', diameter: 6, placement: { type: 'rectangular_grid', origin: { x: 20, y: 15 }, columns: 3, rows: 2, spacing_x: 30, spacing_y: 20 } },
+    ],
+  });
+  assert.equal(grid.result.status, 'valid');
+  assert.equal(grid.result.can_execute, true);
+  assert.equal(grid.result.resolved_plan.features[0].id, 'base');
+  assert.equal(grid.result.resolved_plan.features[1].id, 'holes');
+  assert.equal(grid.result.resolved_plan.features[1].after, 'base');
+  assert.equal(grid.result.resolved_plan.features[1].centers.length, 6);
+
+  const explicitCenters = [{ x: 10, y: 10 }, { x: 50, y: 30 }, { x: 85, y: 45 }];
+  const explicit = await validate({
+    unit: 'mm',
+    features: [
+      { type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { type: 'hole_pattern', diameter: 6, placement: { type: 'explicit', centers: explicitCenters } },
+    ],
+  });
+  assert.equal(explicit.result.status, 'valid');
+  assert.deepEqual(explicit.result.resolved_plan.features[1], { id: 'holes', type: 'hole_pattern', diameter: 6, centers: explicitCenters, operation: 'through_all', after: 'base' });
+
+  const edgeOffset = await validate({
+    unit: 'mm',
+    features: [
+      { type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { type: 'hole_pattern', diameter: 8, placement: { type: 'edge_offset', distance: 10, reference: 'center' } },
+    ],
+  });
+  assert.equal(edgeOffset.result.status, 'valid');
+  assert.equal(edgeOffset.result.resolved_plan.features[1].centers.length, 4);
+});
+
+test('explicit IDs are preserved and an invented incomplete feature is never discarded', async () => {
+  const explicit = await validate({
+    unit: 'mm',
+    features: [
+      { id: 'plate_core', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { id: 'mounting_pattern', type: 'hole_pattern', diameter: 6, placement: { type: 'explicit', centers: [{ x: 20, y: 20 }] } },
+    ],
+  });
+  assert.equal(explicit.result.status, 'valid');
+  assert.deepEqual(explicit.result.resolved_plan.features.map((feature) => feature.id), ['plate_core', 'mounting_pattern']);
+  assert.equal(explicit.result.resolved_plan.features[1].after, 'plate_core');
+
+  const invented = await validate({
+    unit: 'mm',
+    features: [
+      { type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { type: 'hole_pattern', diameter: 6, placement: { type: 'explicit', centers: [{ x: 20, y: 20 }] } },
+      { type: 'chamfer' },
+    ],
+  });
+  assert.equal(invented.result.status, 'incomplete');
+  assert.equal(invented.result.can_execute, false);
+  assert.ok(invented.result.issues.some((issue) => issue.path.endsWith('.size')));
+  assert.ok(invented.result.issues.some((issue) => issue.path.endsWith('.edges')));
+});

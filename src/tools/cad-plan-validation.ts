@@ -109,7 +109,7 @@ export const CAD_PLAN_TOOLS = [{
             items: {
               type: 'object',
               properties: {
-                id: { type: ['string', 'null'], description: 'Required stable, unique semantic feature ID.' },
+                id: { type: ['string', 'null'], description: 'Optional stable semantic feature ID. If omitted, the server deterministically generates base, holes, fillet, chamfer, then suffixed variants.' },
                 type: { type: ['string', 'null'], enum: ['rectangular_pad', 'hole_pattern', 'fillet', 'chamfer', null] },
                 width: { type: ['number', 'null'] },
                 height: { type: ['number', 'null'] },
@@ -559,6 +559,28 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
   if (!isRecord(value)) return validateLegacyCadPlan(value);
   const normalized = normalizeToFeaturePlan(value);
   const structuralIssues = normalized.issues;
+  const generatedTypeCounts = new Map<string, number>();
+  normalized.features = normalized.features.map((feature) => {
+    const copy = { ...feature };
+    const type = typeof copy.type === 'string' ? copy.type : undefined;
+    if (type !== undefined && ['rectangular_pad', 'hole_pattern', 'fillet', 'chamfer'].includes(type)) {
+      const count = (generatedTypeCounts.get(type) ?? 0) + 1;
+      generatedTypeCounts.set(type, count);
+      if (copy.id === undefined || copy.id === null || copy.id === '') {
+        const baseId = type === 'rectangular_pad' ? 'base' : type === 'hole_pattern' ? 'holes' : type;
+        copy.id = count === 1 ? baseId : `${baseId}_${count}`;
+      }
+    }
+    return copy;
+  });
+  let previousSolidId: string | undefined;
+  normalized.features = normalized.features.map((feature) => {
+    const copy = { ...feature };
+    const supported = typeof copy.type === 'string' && ['rectangular_pad', 'hole_pattern', 'fillet', 'chamfer'].includes(copy.type);
+    if (supported && previousSolidId !== undefined && (copy.after === undefined || copy.after === null) && (copy.target === undefined || copy.target === null)) copy.after = previousSolidId;
+    if (supported && typeof copy.id === 'string' && FEATURE_ID.test(copy.id)) previousSolidId = copy.id;
+    return copy;
+  });
   const seenIds = new Set<string>();
   const earlierIds = new Set<string>();
   const seenTypes = new Set<string>();
@@ -567,14 +589,14 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
   normalized.features.forEach((feature, index) => {
     const path = normalized.paths[index];
     const id = feature.id;
-    if (id === undefined || id === null || id === '') structuralIssues.push({ kind: 'incomplete', code: 'MISSING_REQUIRED_VALUE', path: `${path}.id`, message: 'Feature ID is required.' });
+    if (id === undefined || id === null || id === '') structuralIssues.push({ kind: 'incomplete', code: 'MISSING_REQUIRED_VALUE', path: `${path}.id`, message: 'Feature ID could not be derived without a supported feature type.' });
     else if (typeof id !== 'string' || !FEATURE_ID.test(id) || id.length > 128) structuralIssues.push({ kind: 'invalid', code: 'INVALID_FEATURE_ID', path: `${path}.id`, message: 'Feature ID must use letters, digits, and underscores and start with a letter or underscore.' });
     else {
       if (seenIds.has(id)) structuralIssues.push({ kind: 'invalid', code: 'DUPLICATE_FEATURE_ID', path: `${path}.id`, message: `Feature ID "${id}" occurs more than once.` });
       seenIds.add(id);
     }
     for (const dependency of ['after', 'target'] as const) {
-      if (feature[dependency] !== undefined && (typeof feature[dependency] !== 'string' || !earlierIds.has(feature[dependency] as string))) {
+      if (feature[dependency] !== undefined && feature[dependency] !== null && (typeof feature[dependency] !== 'string' || !earlierIds.has(feature[dependency] as string))) {
         structuralIssues.push({ kind: 'invalid', code: 'INVALID_FEATURE_REFERENCE', path: `${path}.${dependency}`, message: `${dependency} must reference an earlier feature ID.` });
       }
     }
@@ -630,8 +652,8 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
   const legacyResolved = validated.resolved_plan;
   const resolvedFeatures = normalized.features.map((feature) => {
     const dependencies: Record<string, unknown> = {};
-    if (feature.after !== undefined) dependencies.after = feature.after;
-    if (feature.target !== undefined) dependencies.target = feature.target;
+    if (typeof feature.after === 'string') dependencies.after = feature.after;
+    if (typeof feature.target === 'string') dependencies.target = feature.target;
     if (feature.type === 'rectangular_pad') {
       const resolvedBase = legacyResolved.base as Record<string, unknown>;
       return { id: feature.id, type: 'rectangular_pad', width: resolvedBase.width, height: resolvedBase.height, length: resolvedBase.thickness, ...dependencies };

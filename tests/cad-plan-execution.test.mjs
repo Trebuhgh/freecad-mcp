@@ -309,10 +309,10 @@ test('executor creates six grid holes followed by fillet and inner chamfer', asy
   const gridPlan = {
     unit: 'mm',
     features: [
-      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
-      { id: 'grid_holes', type: 'hole_pattern', diameter: 6, placement: { type: 'rectangular_grid', origin: { x: 20, y: 15 }, columns: 3, rows: 2, spacing_x: 30, spacing_y: 20 } },
-      { id: 'outer_rounding', type: 'fillet', radius: 5, edges: 'all_vertical' },
-      { id: 'hole_chamfers', type: 'chamfer', size: 0.5, edges: 'all_top_inner' },
+      { type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { type: 'hole_pattern', diameter: 6, placement: { type: 'rectangular_grid', origin: { x: 20, y: 15 }, columns: 3, rows: 2, spacing_x: 30, spacing_y: 20 } },
+      { type: 'fillet', radius: 5, edges: 'all_vertical' },
+      { type: 'chamfer', size: 0.5, edges: 'all_top_inner' },
     ],
   };
   const expected = [
@@ -324,7 +324,7 @@ test('executor creates six grid holes followed by fillet and inner chamfer', asy
   assert.doesNotMatch(bridge.commands[0], /rectangular_grid|spacing_x|spacing_y|"origin"/);
   const execution = executeFreeCad(bridge.commands[0]);
   assert.equal(execution.ok, true, execution.traceback);
-  assert.deepEqual(execution.result.executed_steps, ['base', 'grid_holes', 'outer_rounding', 'hole_chamfers']);
+  assert.deepEqual(execution.result.executed_steps, ['base', 'holes', 'fillet', 'chamfer']);
   assert.equal(execution.result.features[1].verified_holes, 6);
   assert.deepEqual(execution.result.verification.verifiedHoleCenters, expected);
   assert.equal(execution.result.solidCount, 1);
