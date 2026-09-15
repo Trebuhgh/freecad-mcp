@@ -8,6 +8,12 @@ import {
   validateCadPlanArgs,
 } from './cad-plan-validation.js';
 import { handleCadExecutePlan } from './cad-plan-execution.js';
+import {
+  CAD_EDIT_TOOLS,
+  CadEditValidationGate,
+  handleCadExecuteEditPlan,
+  handleCadValidateEditPlan,
+} from './cad-edit.js';
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const QUALIFIED_ID = /^([A-Za-z_][A-Za-z0-9_]*)::([A-Za-z_][A-Za-z0-9_]*)$/;
@@ -219,7 +225,20 @@ export const HIGH_LEVEL_CAD_TOOLS = [
     },
   },
   ...CAD_PLAN_TOOLS,
+  ...CAD_EDIT_TOOLS,
 ];
+
+const fallbackEditGates = new WeakMap<CadPlanValidationGate, CadEditValidationGate>();
+
+function editGateFor(planGate: CadPlanValidationGate, supplied?: CadEditValidationGate): CadEditValidationGate {
+  if (supplied !== undefined) return supplied;
+  let gate = fallbackEditGates.get(planGate);
+  if (gate === undefined) {
+    gate = new CadEditValidationGate();
+    fallbackEditGates.set(planGate, gate);
+  }
+  return gate;
+}
 
 type EdgeSelection =
   | 'all_vertical'
@@ -632,7 +651,11 @@ export async function handleHighLevelCadTool(
   args: ToolArgs,
   bridge: FreeCADBridge,
   validationGate: CadPlanValidationGate,
+  suppliedEditGate?: CadEditValidationGate,
 ): Promise<ToolResult> {
+  const editValidationGate = editGateFor(validationGate, suppliedEditGate);
+  if (name === 'cad_validate_edit_plan') return handleCadValidateEditPlan(args, bridge, editValidationGate);
+  if (name === 'cad_execute_edit_plan') return handleCadExecuteEditPlan(args, bridge, editValidationGate);
   if (MUTATING_HIGH_LEVEL_CAD_TOOLS.has(name) && validationGate.state !== 'validated') {
     return cadPlanNotValidatedToolResult();
   }

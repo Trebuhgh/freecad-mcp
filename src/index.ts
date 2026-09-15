@@ -27,6 +27,7 @@ import { SURFACE_TOOLS, handleSurfaceTool } from './tools/surface.js';
 import { ASSEMBLY_TOOLS, handleAssemblyTool } from './tools/assembly.js';
 import { HIGH_LEVEL_CAD_TOOLS, handleHighLevelCadTool } from './tools/high-level-cad.js';
 import { CadPlanValidationGate } from './tools/cad-plan-validation.js';
+import { CadEditValidationGate } from './tools/cad-edit.js';
 
 const FREECAD_CMD = process.env.FREECAD_CMD || '/Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd';
 const TOOL_MODE = resolveToolMode(process.env.FREECAD_MCP_TOOL_MODE);
@@ -55,10 +56,12 @@ class FreeCADMCPServer {
   private server: Server;
   private bridge: FreeCADBridge;
   private validationGate: CadPlanValidationGate;
+  private editValidationGate: CadEditValidationGate;
 
   constructor() {
     this.bridge = new FreeCADBridge(FREECAD_CMD);
     this.validationGate = new CadPlanValidationGate();
+    this.editValidationGate = new CadEditValidationGate();
 
     this.server = new Server(
       {
@@ -96,7 +99,7 @@ class FreeCADMCPServer {
       try {
         switch (module) {
           case 'high-level-cad':
-            return await handleHighLevelCadTool(name, safeArgs, this.bridge, this.validationGate);
+            return await handleHighLevelCadTool(name, safeArgs, this.bridge, this.validationGate, this.editValidationGate);
           case 'document':
             return await handleDocumentTool(name, safeArgs, this.bridge);
           case 'primitives':
