@@ -79,7 +79,7 @@ test('invalid dimensions and geometrically impossible holes are rejected', async
   });
   assert.equal(impossible.result.status, 'invalid');
   assert.equal(impossible.result.can_execute, false);
-  assert.ok(impossible.result.issues.some((issue) => issue.code === 'HOLE_OUTSIDE_PLATE'));
+  assert.ok(impossible.result.issues.some((issue) => issue.code === 'HOLE_OUTSIDE_BASE'));
 });
 
 test('missing thickness is incomplete', async () => {
@@ -168,4 +168,69 @@ test('feature IDs are unique and construction order requires rectangular_pad fir
   });
   assert.equal(order.result.status, 'invalid');
   assert.ok(order.result.issues.some((issue) => issue.code === 'INVALID_FEATURE_ORDER'));
+});
+
+function featureHolePlan(placement, options = {}) {
+  return {
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { id: 'holes', type: 'hole_pattern', diameter: 6, placement, ...options },
+    ],
+  };
+}
+
+test('explicit placement resolves arbitrary finite centers without placement metadata', async () => {
+  const centers = [{ x: 10, y: 10 }, { x: 50, y: 30 }, { x: 85, y: 45 }];
+  const { result } = await validate(featureHolePlan({ type: 'explicit', centers }));
+  assert.equal(result.status, 'valid');
+  const resolved = result.resolved_plan.features[1];
+  assert.deepEqual(resolved.centers, centers);
+  assert.equal(resolved.diameter, 6);
+  assert.equal(resolved.operation, 'through_all');
+  assert.equal(Object.hasOwn(resolved, 'placement'), false);
+});
+
+test('rectangular_grid resolves row-major centers without placement metadata', async () => {
+  const { result } = await validate(featureHolePlan({
+    type: 'rectangular_grid', origin: { x: 20, y: 15 }, columns: 3, rows: 2, spacing_x: 30, spacing_y: 20,
+  }));
+  assert.equal(result.status, 'valid');
+  const resolved = result.resolved_plan.features[1];
+  assert.deepEqual(resolved.centers, [
+    { x: 20, y: 15 }, { x: 50, y: 15 }, { x: 80, y: 15 },
+    { x: 20, y: 35 }, { x: 50, y: 35 }, { x: 80, y: 35 },
+  ]);
+  assert.equal(Object.hasOwn(resolved, 'placement'), false);
+});
+
+test('hole geometry rejects outside, overlapping, touching, and count-mismatched patterns', async () => {
+  const cases = [
+    [featureHolePlan({ type: 'explicit', centers: [{ x: 2, y: 20 }] }, { diameter: 8 }), 'HOLE_OUTSIDE_BASE'],
+    [featureHolePlan({ type: 'explicit', centers: [{ x: 20, y: 20 }, { x: 27, y: 20 }] }, { diameter: 8 }), 'HOLES_OVERLAP'],
+    [featureHolePlan({ type: 'explicit', centers: [{ x: 20, y: 20 }, { x: 28, y: 20 }] }, { diameter: 8 }), 'HOLES_OVERLAP'],
+    [featureHolePlan({ type: 'explicit', centers: [{ x: 10, y: 10 }, { x: 50, y: 30 }, { x: 85, y: 45 }] }, { count: 4 }), 'HOLE_COUNT_MISMATCH'],
+    [featureHolePlan({ type: 'rectangular_grid', origin: { x: 20, y: 15 }, columns: 4, rows: 2, spacing_x: 30, spacing_y: 20 }), 'HOLE_OUTSIDE_BASE'],
+  ];
+  for (const [candidate, code] of cases) {
+    const { result, bridge } = await validate(candidate);
+    assert.equal(result.status, 'invalid');
+    assert.equal(result.can_execute, false);
+    assert.ok(result.issues.some((issue) => issue.code === code), code);
+    assert.equal(bridge.calls, 0);
+  }
+});
+
+test('hole placement numeric fields reject empty arrays, non-finite coordinates, and invalid grids', async () => {
+  const cases = [
+    featureHolePlan({ type: 'explicit', centers: [] }),
+    featureHolePlan({ type: 'explicit', centers: [{ x: Number.NaN, y: 10 }] }),
+    featureHolePlan({ type: 'rectangular_grid', origin: { x: 10, y: 10 }, columns: 0, rows: 2, spacing_x: 20, spacing_y: 20 }),
+    featureHolePlan({ type: 'rectangular_grid', origin: { x: 10, y: 10 }, columns: 2, rows: 2, spacing_x: 0, spacing_y: 20 }),
+  ];
+  for (const candidate of cases) {
+    const { result } = await validate(candidate);
+    assert.equal(result.status, 'invalid');
+    assert.equal(result.can_execute, false);
+  }
 });

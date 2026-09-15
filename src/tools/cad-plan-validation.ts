@@ -94,7 +94,7 @@ export class CadPlanValidationGate {
 
 export const CAD_PLAN_TOOLS = [{
   name: 'cad_validate_plan',
-  description: 'Mandatory, non-mutating gate before CAD construction. Validates a structured plan deterministically. holes.placement.type supports only "edge_offset". holes.placement.reference supports "center", "boundary", or null. Use null when wording such as "10 mm from the outer edges" does not explicitly identify center versus hole boundary; this tool never interprets that ambiguity.',
+  description: 'Mandatory, non-mutating gate before CAD construction. hole_pattern placement supports edge_offset, explicit, and rectangular_grid. edge_offset.reference supports center, boundary, or null. Use null when wording such as "10 mm from the outer edges" does not explicitly identify center versus hole boundary; this tool never interprets that ambiguity.',
   inputSchema: {
     type: 'object' as const,
     properties: {
@@ -119,9 +119,15 @@ export const CAD_PLAN_TOOLS = [{
                 placement: {
                   type: ['object', 'null'],
                   properties: {
-                    type: { type: ['string', 'null'], enum: ['edge_offset', null] },
+                    type: { type: ['string', 'null'], enum: ['edge_offset', 'explicit', 'rectangular_grid', null] },
                     distance: { type: ['number', 'null'] },
                     reference: { type: ['string', 'null'], enum: ['center', 'boundary', null], description: 'Use null when center versus boundary is not explicit.' },
+                    centers: { type: ['array', 'null'], items: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'], additionalProperties: false } },
+                    origin: { type: ['object', 'null'], properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'], additionalProperties: false },
+                    columns: { type: ['integer', 'null'] },
+                    rows: { type: ['integer', 'null'] },
+                    spacing_x: { type: ['number', 'null'] },
+                    spacing_y: { type: ['number', 'null'] },
                   },
                 },
                 radius: { type: ['number', 'null'] },
@@ -149,11 +155,17 @@ export const CAD_PLAN_TOOLS = [{
               diameter: { type: ['number', 'null'] },
               placement: {
                 type: ['object', 'null'],
-                description: 'Required hole placement. Only edge_offset is currently supported.',
+                description: 'Required hole placement: edge_offset, explicit centers, or rectangular_grid.',
                 properties: {
-                  type: { type: ['string', 'null'], enum: ['edge_offset', null], description: 'Placement strategy; currently only edge_offset.' },
+                  type: { type: ['string', 'null'], enum: ['edge_offset', 'explicit', 'rectangular_grid', null], description: 'Supported strategies: edge_offset, explicit, rectangular_grid.' },
                   distance: { type: ['number', 'null'] },
                   reference: { type: ['string', 'null'], enum: ['center', 'boundary', null], description: 'center means distance to hole center; boundary means distance to hole rim; use null whenever the user did not explicitly disambiguate.' },
+                  centers: { type: ['array', 'null'], items: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'], additionalProperties: false } },
+                  origin: { type: ['object', 'null'], properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'], additionalProperties: false },
+                  columns: { type: ['integer', 'null'] },
+                  rows: { type: ['integer', 'null'] },
+                  spacing_x: { type: ['number', 'null'] },
+                  spacing_y: { type: ['number', 'null'] },
                 },
               },
             },
@@ -459,6 +471,90 @@ function translateIssuePath(path: string, normalized: NormalizedFeaturePlan): st
   return path === 'base.unit' ? 'unit' : path;
 }
 
+interface HoleResolution {
+  diameter?: number;
+  centers?: Point2D[];
+  issues: InternalIssue[];
+  ambiguityDistance?: number;
+}
+
+function resolveHolePattern(feature: Record<string, unknown>, path: string, width: unknown, height: unknown): HoleResolution {
+  const issues: InternalIssue[] = [];
+  const diameter = positiveNumber(feature, 'diameter', `${path}.diameter`, 'Hole diameter', issues);
+  const countValue = feature.count;
+  let requestedCount: number | undefined;
+  if (countValue !== undefined && countValue !== null) {
+    if (typeof countValue !== 'number' || !Number.isInteger(countValue) || countValue <= 0) issues.push({ kind: 'invalid', code: 'INVALID_HOLE_COUNT', path: `${path}.count`, message: 'Optional count must be a positive integer.' });
+    else requestedCount = countValue;
+  }
+  const placement = feature.placement;
+  let centers: Point2D[] | undefined;
+  let ambiguityDistance: number | undefined;
+  if (placement === undefined || placement === null) addMissing(issues, `${path}.placement`, 'Hole placement');
+  else if (!isRecord(placement)) issues.push({ kind: 'invalid', code: 'INVALID_PLACEMENT', path: `${path}.placement`, message: 'Hole placement must be an object.' });
+  else if (placement.type === 'edge_offset') {
+    const distance = positiveNumber(placement, 'distance', `${path}.placement.distance`, 'Edge distance', issues);
+    let reference: 'center' | 'boundary' | undefined;
+    if (placement.reference === undefined) addMissing(issues, `${path}.placement.reference`, 'Distance reference');
+    else if (placement.reference === null) {
+      ambiguityDistance = distance;
+      issues.push({ kind: 'ambiguous', code: 'AMBIGUOUS_DISTANCE_REFERENCE', path: `${path}.placement.reference`, message: 'The edge distance can refer either to the hole center or to the hole boundary.', question: 'Worauf beziehen sich die angegebenen Abstände zur Außenkante?', options: [{ id: 'A', value: 'center', label: `${distance ?? '?'} mm bis zum Bohrungsmittelpunkt` }, { id: 'B', value: 'boundary', label: `${distance ?? '?'} mm bis zum Bohrungsrand` }] });
+    } else if (placement.reference === 'center' || placement.reference === 'boundary') reference = placement.reference;
+    else issues.push({ kind: 'invalid', code: 'INVALID_DISTANCE_REFERENCE', path: `${path}.placement.reference`, message: 'Distance reference must be center, boundary, or null.' });
+    if (typeof width === 'number' && typeof height === 'number' && diameter !== undefined && distance !== undefined && reference !== undefined) {
+      const offset = reference === 'center' ? distance : distance + diameter / 2;
+      centers = [{ x: offset, y: offset }, { x: width - offset, y: offset }, { x: offset, y: height - offset }, { x: width - offset, y: height - offset }];
+    }
+  } else if (placement.type === 'explicit') {
+    if (!Array.isArray(placement.centers) || placement.centers.length === 0) issues.push({ kind: placement.centers === undefined || placement.centers === null ? 'incomplete' : 'invalid', code: placement.centers === undefined || placement.centers === null ? 'MISSING_REQUIRED_VALUE' : 'EMPTY_HOLE_CENTERS', path: `${path}.placement.centers`, message: 'explicit placement requires a non-empty centers array.' });
+    else if (placement.centers.length > 1000) issues.push({ kind: 'invalid', code: 'TOO_MANY_HOLES', path: `${path}.placement.centers`, message: 'At most 1000 hole centers are supported.' });
+    else {
+      const parsed: Point2D[] = [];
+      placement.centers.forEach((center, index) => {
+        if (!isRecord(center) || typeof center.x !== 'number' || !Number.isFinite(center.x) || typeof center.y !== 'number' || !Number.isFinite(center.y)) issues.push({ kind: 'invalid', code: 'INVALID_HOLE_CENTER', path: `${path}.placement.centers.${index}`, message: 'Each center requires finite x and y coordinates.' });
+        else parsed.push({ x: center.x, y: center.y });
+      });
+      if (parsed.length === placement.centers.length) centers = parsed;
+    }
+  } else if (placement.type === 'rectangular_grid') {
+    let origin: Point2D | undefined;
+    if (!isRecord(placement.origin) || typeof placement.origin.x !== 'number' || !Number.isFinite(placement.origin.x) || typeof placement.origin.y !== 'number' || !Number.isFinite(placement.origin.y)) issues.push({ kind: placement.origin === undefined || placement.origin === null ? 'incomplete' : 'invalid', code: placement.origin === undefined || placement.origin === null ? 'MISSING_REQUIRED_VALUE' : 'INVALID_GRID_ORIGIN', path: `${path}.placement.origin`, message: 'Grid origin requires finite x and y coordinates.' });
+    else origin = { x: placement.origin.x, y: placement.origin.y };
+    const positiveInteger = (key: 'columns' | 'rows'): number | undefined => {
+      const value = placement[key];
+      if (value === undefined || value === null) { addMissing(issues, `${path}.placement.${key}`, key); return undefined; }
+      if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) { issues.push({ kind: 'invalid', code: 'INVALID_GRID_COUNT', path: `${path}.placement.${key}`, message: `${key} must be a positive integer.` }); return undefined; }
+      return value;
+    };
+    const columns = positiveInteger('columns');
+    const rows = positiveInteger('rows');
+    const spacingX = positiveNumber(placement, 'spacing_x', `${path}.placement.spacing_x`, 'Grid X spacing', issues);
+    const spacingY = positiveNumber(placement, 'spacing_y', `${path}.placement.spacing_y`, 'Grid Y spacing', issues);
+    if (origin !== undefined && columns !== undefined && rows !== undefined && spacingX !== undefined && spacingY !== undefined) {
+      if (columns * rows > 1000) issues.push({ kind: 'invalid', code: 'TOO_MANY_HOLES', path: `${path}.placement`, message: 'At most 1000 grid holes are supported.' });
+      else {
+        centers = [];
+        for (let row = 0; row < rows; row += 1) for (let column = 0; column < columns; column += 1) centers.push({ x: origin.x + column * spacingX, y: origin.y + row * spacingY });
+      }
+    }
+  } else if (placement.type === undefined || placement.type === null) addMissing(issues, `${path}.placement.type`, 'Placement type');
+  else issues.push({ kind: 'unsupported', code: 'UNSUPPORTED_PLACEMENT', path: `${path}.placement.type`, message: `Placement type "${String(placement.type)}" is not supported.` });
+
+  if (centers !== undefined && requestedCount !== undefined && requestedCount !== centers.length) issues.push({ kind: 'invalid', code: 'HOLE_COUNT_MISMATCH', path: `${path}.count`, message: `count ${requestedCount} does not match ${centers.length} resolved centers.` });
+  if (centers !== undefined && diameter !== undefined && typeof width === 'number' && typeof height === 'number') {
+    const radius = diameter / 2;
+    if (!centers.every((center) => radius <= center.x && center.x <= width - radius && radius <= center.y && center.y <= height - radius)) issues.push({ kind: 'invalid', code: 'HOLE_OUTSIDE_BASE', path: `${path}.placement`, message: 'At least one hole is not completely inside the rectangular base.' });
+    for (let first = 0; first < centers.length; first += 1) for (let second = first + 1; second < centers.length; second += 1) {
+      if (Math.hypot(centers[first].x - centers[second].x, centers[first].y - centers[second].y) <= diameter) {
+        issues.push({ kind: 'invalid', code: 'HOLES_OVERLAP', path: `${path}.placement`, message: 'Hole profiles overlap or touch.' });
+        first = centers.length;
+        break;
+      }
+    }
+  }
+  return { diameter, centers, issues, ambiguityDistance };
+}
+
 export function validateCadPlan(value: unknown): CadPlanValidationResult {
   if (!isRecord(value)) return validateLegacyCadPlan(value);
   const normalized = normalizeToFeaturePlan(value);
@@ -508,15 +604,28 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
   const holeFeature = normalized.features.find((feature) => feature.type === 'hole_pattern');
   const filletFeature = normalized.features.find((feature) => feature.type === 'fillet');
   const chamferFeature = normalized.features.find((feature) => feature.type === 'chamfer');
+  const holePath = holeFeature === undefined ? undefined : normalized.paths[normalized.features.indexOf(holeFeature)];
+  const holeResolution = holeFeature === undefined || holePath === undefined
+    ? undefined
+    : resolveHolePattern(holeFeature, holePath, baseFeature?.width, baseFeature?.height);
   const legacyPlan: Record<string, unknown> = {
     base: baseFeature === undefined ? undefined : { type: 'rectangular_plate', width: baseFeature.width, height: baseFeature.height, thickness: baseFeature.length, unit: normalized.unit },
   };
-  if (holeFeature !== undefined) legacyPlan.holes = { count: holeFeature.count, diameter: holeFeature.diameter, placement: holeFeature.placement };
   if (filletFeature !== undefined) legacyPlan.fillet = { radius: filletFeature.radius, edges: filletFeature.edges };
   if (chamferFeature !== undefined) legacyPlan.chamfer = { size: chamferFeature.size, edges: chamferFeature.edges };
   const validated = validateLegacyCadPlan(legacyPlan);
   validated.issues = validated.issues.map((issue) => ({ ...issue, path: translateIssuePath(issue.path, normalized) }));
-  if (validated.status !== 'valid' || validated.resolved_plan === undefined) return validated;
+  if (holeResolution !== undefined) validated.issues.push(...holeResolution.issues.map(({ kind: _kind, ...issue }) => issue));
+  const combinedInternalIssues: InternalIssue[] = [
+    ...validated.issues.map((issue) => ({ ...issue, kind: issue.code === 'AMBIGUOUS_DISTANCE_REFERENCE' ? 'ambiguous' as const : issue.code === 'MISSING_REQUIRED_VALUE' ? 'incomplete' as const : issue.code.startsWith('UNSUPPORTED_') ? 'unsupported' as const : 'invalid' as const })),
+  ];
+  validated.status = statusFor(combinedInternalIssues);
+  validated.can_execute = validated.status === 'valid';
+  if (validated.status !== 'valid' || validated.resolved_plan === undefined || (holeFeature !== undefined && (holeResolution?.centers === undefined || holeResolution.diameter === undefined))) {
+    delete validated.resolved_plan;
+    if (holeResolution?.ambiguityDistance !== undefined) validated.clarification_visual = { type: 'svg', content: ambiguitySvg(holeResolution.ambiguityDistance) };
+    return validated;
+  }
 
   const legacyResolved = validated.resolved_plan;
   const resolvedFeatures = normalized.features.map((feature) => {
@@ -528,8 +637,7 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
       return { id: feature.id, type: 'rectangular_pad', width: resolvedBase.width, height: resolvedBase.height, length: resolvedBase.thickness, ...dependencies };
     }
     if (feature.type === 'hole_pattern') {
-      const resolvedHoles = legacyResolved.holes as Record<string, unknown>;
-      return { id: feature.id, type: 'hole_pattern', diameter: resolvedHoles.diameter, centers: resolvedHoles.centers, operation: 'through_all', ...dependencies };
+      return { id: feature.id, type: 'hole_pattern', diameter: holeResolution!.diameter, centers: holeResolution!.centers, operation: 'through_all', ...dependencies };
     }
     const dimension = feature.type === 'fillet' ? 'radius' : 'size';
     const resolvedOperation = legacyResolved[String(feature.type)] as Record<string, unknown>;

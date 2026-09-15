@@ -280,3 +280,53 @@ ${oversized.bridge.commands[0]}`, true);
   assert.deepEqual(execution.documents.KeepMe, ['KeepMarker']);
   assert.equal(execution.openDocuments.includes('CADPlan_1'), false);
 });
+
+test('executor creates actual through holes for one and three explicit centers', async () => {
+  const cases = [
+    [{ x: 50, y: 30 }],
+    [{ x: 10, y: 10 }, { x: 50, y: 30 }, { x: 85, y: 45 }],
+  ];
+  for (const [index, centers] of cases.entries()) {
+    const explicitPlan = {
+      unit: 'mm',
+      features: [
+        { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+        { id: 'free_holes', type: 'hole_pattern', diameter: 6, placement: { type: 'explicit', centers } },
+      ],
+    };
+    const { bridge, validation } = await validateAndCapture(explicitPlan, `Explicit_${index + 1}`);
+    assert.deepEqual(validation.resolved_plan.features[1].centers, centers);
+    assert.doesNotMatch(bridge.commands[0], /"placement"|"explicit"/);
+    const execution = executeFreeCad(bridge.commands[0]);
+    assert.equal(execution.ok, true, execution.traceback);
+    assert.equal(execution.result.features[1].verified_holes, centers.length);
+    assert.deepEqual(execution.result.verification.verifiedHoleCenters, centers);
+    assert.equal(execution.result.solidCount, 1);
+  }
+});
+
+test('executor creates six grid holes followed by fillet and inner chamfer', async () => {
+  const gridPlan = {
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { id: 'grid_holes', type: 'hole_pattern', diameter: 6, placement: { type: 'rectangular_grid', origin: { x: 20, y: 15 }, columns: 3, rows: 2, spacing_x: 30, spacing_y: 20 } },
+      { id: 'outer_rounding', type: 'fillet', radius: 5, edges: 'all_vertical' },
+      { id: 'hole_chamfers', type: 'chamfer', size: 0.5, edges: 'all_top_inner' },
+    ],
+  };
+  const expected = [
+    { x: 20, y: 15 }, { x: 50, y: 15 }, { x: 80, y: 15 },
+    { x: 20, y: 35 }, { x: 50, y: 35 }, { x: 80, y: 35 },
+  ];
+  const { bridge, validation } = await validateAndCapture(gridPlan, 'GridFeatures');
+  assert.deepEqual(validation.resolved_plan.features[1].centers, expected);
+  assert.doesNotMatch(bridge.commands[0], /rectangular_grid|spacing_x|spacing_y|"origin"/);
+  const execution = executeFreeCad(bridge.commands[0]);
+  assert.equal(execution.ok, true, execution.traceback);
+  assert.deepEqual(execution.result.executed_steps, ['base', 'grid_holes', 'outer_rounding', 'hole_chamfers']);
+  assert.equal(execution.result.features[1].verified_holes, 6);
+  assert.deepEqual(execution.result.verification.verifiedHoleCenters, expected);
+  assert.equal(execution.result.solidCount, 1);
+  assert.equal(execution.result.valid, true);
+});
