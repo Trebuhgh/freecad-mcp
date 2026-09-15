@@ -28,9 +28,50 @@ export interface CadPlanValidationResult {
   clarification_visual?: { type: 'svg'; content: string };
 }
 
+export type CadPlanState = 'unvalidated' | 'blocked' | 'validated';
+
+export class CadPlanValidationGate {
+  private currentState: CadPlanState = 'unvalidated';
+  private revision = 0;
+  private currentResult?: CadPlanValidationResult;
+  private currentResolvedPlan?: Record<string, unknown>;
+
+  get state(): CadPlanState {
+    return this.currentState;
+  }
+
+  get validationResult(): CadPlanValidationResult | undefined {
+    return this.currentResult;
+  }
+
+  get resolvedPlan(): Record<string, unknown> | undefined {
+    return this.currentResolvedPlan;
+  }
+
+  beginValidation(): number {
+    this.revision += 1;
+    this.currentState = 'blocked';
+    this.currentResult = undefined;
+    this.currentResolvedPlan = undefined;
+    return this.revision;
+  }
+
+  completeValidation(revision: number, result: CadPlanValidationResult): void {
+    if (revision !== this.revision) return;
+    this.currentResult = result;
+    if (result.status === 'valid' && result.can_execute === true && result.resolved_plan !== undefined) {
+      this.currentState = 'validated';
+      this.currentResolvedPlan = result.resolved_plan;
+    } else {
+      this.currentState = 'blocked';
+      this.currentResolvedPlan = undefined;
+    }
+  }
+}
+
 export const CAD_PLAN_TOOLS = [{
   name: 'cad_validate_plan',
-  description: 'Deterministically validate a structured CAD plan before any FreeCAD mutation. Reports missing, ambiguous, unsupported, or invalid input and may return an explanatory SVG.',
+  description: 'Mandatory, non-mutating gate before CAD construction. Validates a structured plan deterministically. holes.placement.type supports only "edge_offset". holes.placement.reference supports "center", "boundary", or null. Use null when wording such as "10 mm from the outer edges" does not explicitly identify center versus hole boundary; this tool never interprets that ambiguity.',
   inputSchema: {
     type: 'object' as const,
     properties: {
@@ -55,10 +96,11 @@ export const CAD_PLAN_TOOLS = [{
               diameter: { type: ['number', 'null'] },
               placement: {
                 type: ['object', 'null'],
+                description: 'Required hole placement. Only edge_offset is currently supported.',
                 properties: {
-                  type: { type: ['string', 'null'] },
+                  type: { type: ['string', 'null'], enum: ['edge_offset', null], description: 'Placement strategy; currently only edge_offset.' },
                   distance: { type: ['number', 'null'] },
-                  reference: { type: ['string', 'null'], enum: ['center', 'boundary', null] },
+                  reference: { type: ['string', 'null'], enum: ['center', 'boundary', null], description: 'center means distance to hole center; boundary means distance to hole rim; use null whenever the user did not explicitly disambiguate.' },
                 },
               },
             },
@@ -282,9 +324,26 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
   return result;
 }
 
-export function handleCadValidatePlan(args: ToolArgs): ToolResult {
+export function validateCadPlanArgs(args: ToolArgs): CadPlanValidationResult {
   const unexpected = Object.keys(args).filter((key) => key !== 'plan');
   if (unexpected.length > 0) throw new Error(`Unexpected argument(s): ${unexpected.join(', ')}`);
-  const result = validateCadPlan(args.plan);
+  return validateCadPlan(args.plan);
+}
+
+export function cadPlanValidationToolResult(result: CadPlanValidationResult): ToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+}
+
+export function cadPlanNotValidatedToolResult(): ToolResult {
+  return {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        success: false,
+        code: 'CAD_PLAN_NOT_VALIDATED',
+        message: 'CAD construction is blocked until cad_validate_plan returns status=valid and can_execute=true.',
+      }),
+    }],
+    isError: true,
+  };
 }

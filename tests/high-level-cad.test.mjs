@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { HIGH_LEVEL_CAD_TOOLS, handleHighLevelCadTool } from '../dist/tools/high-level-cad.js';
+import { HIGH_LEVEL_CAD_TOOLS, handleHighLevelCadTool as dispatchHighLevelCadTool } from '../dist/tools/high-level-cad.js';
+import { CadPlanValidationGate, validateCadPlan } from '../dist/tools/cad-plan-validation.js';
 
 const freecadPython = process.env.FREECAD_PYTHON || 'C:\\Program Files\\FreeCAD 1.1\\bin\\python.exe';
 
@@ -13,6 +14,11 @@ class CapturingBridge {
   constructor(results) {
     this.results = [...results];
     this.commands = [];
+    this.validationGate = new CadPlanValidationGate();
+    const revision = this.validationGate.beginValidation();
+    this.validationGate.completeValidation(revision, validateCadPlan({
+      base: { type: 'rectangular_plate', width: 100, height: 60, thickness: 10, unit: 'mm' },
+    }));
   }
 
   async run(code) {
@@ -20,6 +26,10 @@ class CapturingBridge {
     const result = this.results.shift() ?? {};
     return { content: [{ type: 'text', text: JSON.stringify(result) }] };
   }
+}
+
+function handleHighLevelCadTool(name, args, bridge) {
+  return dispatchHighLevelCadTool(name, args, bridge, bridge.validationGate);
 }
 
 function runFreeCadScript(commands, allowFailure = false) {

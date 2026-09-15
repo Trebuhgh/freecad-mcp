@@ -1,10 +1,20 @@
 import { FreeCADBridge } from '../freecad-bridge.js';
 import { ToolArgs, ToolResult } from '../types.js';
-import { CAD_PLAN_TOOLS, handleCadValidatePlan } from './cad-plan-validation.js';
+import {
+  CAD_PLAN_TOOLS,
+  CadPlanValidationGate,
+  cadPlanNotValidatedToolResult,
+  cadPlanValidationToolResult,
+  validateCadPlanArgs,
+} from './cad-plan-validation.js';
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const QUALIFIED_ID = /^([A-Za-z_][A-Za-z0-9_]*)::([A-Za-z_][A-Za-z0-9_]*)$/;
 const MAX_DIMENSION = 1e6;
+const MUTATING_HIGH_LEVEL_CAD_TOOLS = new Set([
+  'cad_create_part', 'cad_create_sketch', 'cad_sketch_rectangle', 'cad_pad',
+  'cad_create_hole_sketch', 'cad_pocket', 'cad_fillet', 'cad_chamfer',
+]);
 
 export const HIGH_LEVEL_CAD_TOOLS = [
   {
@@ -619,10 +629,20 @@ export async function handleHighLevelCadTool(
   name: string,
   args: ToolArgs,
   bridge: FreeCADBridge,
+  validationGate: CadPlanValidationGate,
 ): Promise<ToolResult> {
+  if (MUTATING_HIGH_LEVEL_CAD_TOOLS.has(name) && validationGate.state !== 'validated') {
+    return cadPlanNotValidatedToolResult();
+  }
+
   switch (name) {
-    case 'cad_validate_plan':
-      return handleCadValidatePlan(args);
+    case 'cad_validate_plan': {
+      const revision = validationGate.beginValidation();
+      await Promise.resolve();
+      const result = validateCadPlanArgs(args);
+      validationGate.completeValidation(revision, result);
+      return cadPlanValidationToolResult(result);
+    }
 
     case 'cad_create_part': {
       assertAllowedKeys(args, ['name', 'bodyName']);

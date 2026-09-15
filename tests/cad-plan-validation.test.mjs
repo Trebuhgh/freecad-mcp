@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { handleHighLevelCadTool } from '../dist/tools/high-level-cad.js';
+import { CadPlanValidationGate } from '../dist/tools/cad-plan-validation.js';
 
 const base = {
   type: 'rectangular_plate', width: 100, height: 60, thickness: 10, unit: 'mm',
@@ -23,8 +24,9 @@ async function validate(plan) {
       throw new Error('cad_validate_plan must never call FreeCAD');
     },
   };
-  const response = await handleHighLevelCadTool('cad_validate_plan', { plan }, bridge);
-  return { result: JSON.parse(response.content[0].text), bridge };
+  const gate = new CadPlanValidationGate();
+  const response = await handleHighLevelCadTool('cad_validate_plan', { plan }, bridge, gate);
+  return { result: JSON.parse(response.content[0].text), bridge, gate };
 }
 
 test('ambiguous distance reference returns A/B clarification and deterministic SVG without mutation', async () => {
