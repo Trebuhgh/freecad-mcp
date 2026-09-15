@@ -21,7 +21,7 @@ interface EditPlan {
   model_id: string;
   model_revision: number;
   target_feature_id: string;
-  parameter: 'width';
+  parameter: 'width' | 'height' | 'length';
   old_value: number;
   new_value: number;
   unit: 'mm';
@@ -93,15 +93,15 @@ const editPlanProperties = {
   model_id: { type: 'string', description: 'Persistent managed-model UUID returned by cad_execute_plan.' },
   model_revision: { type: 'integer', description: 'Exact optimistic-concurrency revision currently stored by the managed model.' },
   target_feature_id: { type: 'string', description: 'Semantic feature ID from the resolved plan, for V1: base.' },
-  parameter: { type: 'string', description: 'Requested semantic parameter. Validation currently accepts only rectangular_pad width.' },
-  old_value: { type: 'number', description: 'Expected current width in mm.' },
-  new_value: { type: 'number', description: 'Requested new width in mm; validation requires a positive finite value.' },
+  parameter: { type: 'string', description: 'Requested semantic parameter. Validation accepts rectangular_pad width, height, or length.' },
+  old_value: { type: 'number', description: 'Expected current parameter value in mm.' },
+  new_value: { type: 'number', description: 'Requested new parameter value in mm; validation requires a positive finite value.' },
   unit: { type: 'string', description: 'Requested unit. Validation currently accepts only millimetres.' },
 };
 
 export const CAD_EDIT_TOOLS = [{
   name: 'cad_validate_edit_plan',
-  description: 'Non-mutating validation gate for one semantic edit of an existing managed model. V1 supports only rectangular_pad width. Never provide FreeCAD object names or constraint indices.',
+  description: 'Non-mutating validation gate for one semantic edit of an existing managed model. Supports rectangular_pad width, height, or length. Never provide FreeCAD object names or constraint indices.',
   inputSchema: {
     type: 'object' as const,
     properties: editPlanProperties,
@@ -140,7 +140,7 @@ function validateInput(args: ToolArgs): EditValidationResult | EditPlan {
   if (typeof args.model_id !== 'string' || args.model_id.length === 0) return issue('invalid', 'INVALID_MODEL_ID', 'model_id', 'model_id must be a non-empty string.');
   if (!Number.isInteger(args.model_revision) || (args.model_revision as number) < 1) return issue('invalid', 'INVALID_MODEL_REVISION', 'model_revision', 'model_revision must be a positive integer.');
   if (typeof args.target_feature_id !== 'string' || args.target_feature_id.length === 0) return issue('invalid', 'INVALID_FEATURE_ID', 'target_feature_id', 'target_feature_id must be a non-empty semantic feature ID.');
-  if (args.parameter !== 'width') return issue('unsupported', 'UNSUPPORTED_EDIT_PARAMETER', 'parameter', 'V1 supports only the width parameter of rectangular_pad.');
+  if (args.parameter !== 'width' && args.parameter !== 'height' && args.parameter !== 'length') return issue('unsupported', 'UNSUPPORTED_EDIT_PARAMETER', 'parameter', 'Supported rectangular_pad parameters are width, height, and length.');
   if (args.unit !== 'mm') return issue('unsupported', 'UNSUPPORTED_EDIT_UNIT', 'unit', 'V1 supports only millimetres.');
   if (typeof args.old_value !== 'number' || !Number.isFinite(args.old_value) || args.old_value <= 0) return issue('invalid', 'INVALID_OLD_VALUE', 'old_value', 'old_value must be finite and greater than zero.');
   if (typeof args.new_value !== 'number' || !Number.isFinite(args.new_value) || args.new_value <= 0) return issue('invalid', 'INVALID_NEW_VALUE', 'new_value', 'new_value must be finite and greater than zero.');
@@ -148,7 +148,7 @@ function validateInput(args: ToolArgs): EditValidationResult | EditPlan {
     model_id: args.model_id,
     model_revision: args.model_revision as number,
     target_feature_id: args.target_feature_id,
-    parameter: 'width',
+    parameter: args.parameter,
     old_value: args.old_value,
     new_value: args.new_value,
     unit: 'mm',
@@ -207,19 +207,17 @@ else:
                     fail("invalid", "TARGET_FEATURE_NOT_FOUND", "target_feature_id", "The target feature ID does not exist exactly once in the persistent resolved plan.")
                 elif features[0].get("type") != "rectangular_pad":
                     fail("unsupported", "UNSUPPORTED_EDIT_FEATURE", "target_feature_id", "V1 supports edits only on rectangular_pad features.")
-                elif features[0].get("width") is None or abs(float(features[0]["width"]) - float(edit["old_value"])) > LINEAR_TOLERANCE_MM:
-                    fail("invalid", "OLD_VALUE_MISMATCH", "old_value", "old_value does not match the persistent resolved plan.", {"expected": features[0].get("width"), "actual": edit["old_value"]})
-                elif edit["target_feature_id"] not in bindings or "width" not in bindings[edit["target_feature_id"]].get("parameters", {}):
-                    fail("invalid", "FEATURE_BINDING_MISSING", "target_feature_id", "The persistent width binding is missing.")
+                elif features[0].get(edit["parameter"]) is None or abs(float(features[0][edit["parameter"]]) - float(edit["old_value"])) > LINEAR_TOLERANCE_MM:
+                    fail("invalid", "OLD_VALUE_MISMATCH", "old_value", "old_value does not match the persistent resolved plan.", {"expected": features[0].get(edit["parameter"]), "actual": edit["old_value"]})
+                elif edit["target_feature_id"] not in bindings or edit["parameter"] not in bindings[edit["target_feature_id"]].get("parameters", {}):
+                    fail("invalid", "FEATURE_BINDING_MISSING", "target_feature_id", "The persistent parameter binding is missing.")
                 else:
                     binding = bindings[edit["target_feature_id"]]
-                    parameter_binding = binding["parameters"]["width"]
-                    sketch = doc.getObject(parameter_binding.get("object", ""))
+                    parameter_binding = binding["parameters"][edit["parameter"]]
+                    sketch = doc.getObject(binding.get("sketch_object", ""))
                     feature = doc.getObject(binding.get("feature_object", ""))
                     if binding.get("type") != "rectangular_pad" or binding.get("feature_type_id") != "PartDesign::Pad":
                         fail("invalid", "FEATURE_BINDING_INVALID", "target_feature_id", "The persistent feature binding does not describe a rectangular Pad.")
-                    elif parameter_binding.get("kind") != "sketch_constraint" or parameter_binding.get("constraint_name") != "width" or parameter_binding.get("unit") != "mm" or parameter_binding.get("object") != binding.get("sketch_object"):
-                        fail("invalid", "FEATURE_BINDING_INVALID", "parameter", "The persistent width binding is not a semantic named Sketch constraint.")
                     elif sketch is None or feature is None:
                         fail("invalid", "BOUND_OBJECT_NOT_FOUND", "target_feature_id", "The bound Sketch or feature no longer exists.")
                     elif sketch.TypeId != "Sketcher::SketchObject" or feature.TypeId != "PartDesign::Pad":
@@ -231,25 +229,28 @@ else:
                         if body is None or sketch not in body.Group or feature not in body.Group or profile_object != sketch:
                             fail("invalid", "FEATURE_BINDING_INVALID", "target_feature_id", "The bound Sketch is not the profile of the bound Pad in the same Body.")
                         else:
-                            indices = [index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == parameter_binding["constraint_name"]]
-                            if len(indices) != 1:
-                                fail("invalid", "FEATURE_BINDING_INVALID", "parameter", "The named width constraint does not exist exactly once.")
+                            if edit["parameter"] in ("width", "height"):
+                                expected_binding = parameter_binding.get("kind") == "sketch_constraint" and parameter_binding.get("constraint_name") == edit["parameter"] and parameter_binding.get("unit") == "mm" and parameter_binding.get("object") == binding.get("sketch_object")
+                                indices = [index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == parameter_binding.get("constraint_name")]
+                                binding_valid = expected_binding and len(indices) == 1
+                                actual_value = float(sketch.getDatum(indices[0]).Value) if binding_valid else None
                             else:
-                                actual_width = float(sketch.getDatum(indices[0]).Value)
-                                if abs(actual_width - float(features[0]["width"])) > LINEAR_TOLERANCE_MM:
-                                    fail("invalid", "MODEL_STATE_MISMATCH", "old_value", "The actual FreeCAD width differs from the persistent resolved plan.", {"expected": float(features[0]["width"]), "actual": actual_width})
-                                elif abs(actual_width - float(edit["old_value"])) > LINEAR_TOLERANCE_MM:
-                                    fail("invalid", "MODEL_STATE_MISMATCH", "old_value", "The actual FreeCAD width differs from old_value.", {"expected": float(edit["old_value"]), "actual": actual_width})
-                                else:
-                                    expected_plan = json.loads(canonical_source)
-                                    expected_feature = next(feature for feature in expected_plan["features"] if feature["id"] == edit["target_feature_id"])
-                                    expected_feature["width"] = edit["new_value"]
-                                    expected_json = json.dumps(expected_plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
-                                    expected_digest = "sha256:" + hashlib.sha256(expected_json.encode("utf-8")).hexdigest()
-                                    _mcp_result["result"] = {
-                                        "status": "valid", "can_execute": True, "issues": [], "edit_plan": edit,
-                                        "_validated_edit": {"source_resolved_plan": source_plan, "source_plan_digest": actual_digest, "expected_resolved_plan": expected_plan, "expected_plan_digest": expected_digest},
-                                    }
+                                binding_valid = parameter_binding.get("kind") == "feature_property" and parameter_binding.get("property") == "Length" and parameter_binding.get("unit") == "mm" and parameter_binding.get("object") == binding.get("feature_object")
+                                actual_value = float(feature.Length.Value) if binding_valid else None
+                            if not binding_valid:
+                                fail("invalid", "FEATURE_BINDING_INVALID", "parameter", "The persistent parameter binding does not match its rectangular_pad semantic.")
+                            elif abs(actual_value - float(features[0][edit["parameter"]])) > LINEAR_TOLERANCE_MM or abs(actual_value - float(edit["old_value"])) > LINEAR_TOLERANCE_MM:
+                                fail("invalid", "MODEL_STATE_MISMATCH", "old_value", "The actual FreeCAD parameter differs from the persistent resolved plan or old_value.", {"expected": float(features[0][edit["parameter"]]), "actual": actual_value})
+                            else:
+                                expected_plan = json.loads(canonical_source)
+                                expected_feature = next(feature for feature in expected_plan["features"] if feature["id"] == edit["target_feature_id"])
+                                expected_feature[edit["parameter"]] = edit["new_value"]
+                                expected_json = json.dumps(expected_plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                                expected_digest = "sha256:" + hashlib.sha256(expected_json.encode("utf-8")).hexdigest()
+                                _mcp_result["result"] = {
+                                    "status": "valid", "can_execute": True, "issues": [], "edit_plan": edit,
+                                    "_validated_edit": {"source_resolved_plan": source_plan, "source_plan_digest": actual_digest, "expected_resolved_plan": expected_plan, "expected_plan_digest": expected_digest},
+                                }
 `;
 }
 
@@ -273,7 +274,8 @@ doc = None
 transaction_open = False
 metadata = None
 sketch = None
-width_index = None
+feature = None
+parameter_indices = {}
 
 ${cadGeometryInspectionPython()}
 
@@ -299,17 +301,11 @@ try:
     require(edit["target_feature_id"] in bindings, "FEATURE_BINDING_MISSING")
     binding = bindings[edit["target_feature_id"]]
     require(binding.get("type") == "rectangular_pad" and binding.get("feature_type_id") == "PartDesign::Pad", "FEATURE_BINDING_INVALID")
-    require("width" in binding.get("parameters", {}), "FEATURE_BINDING_MISSING")
-    width_binding = binding["parameters"]["width"]
-    require(width_binding.get("kind") == "sketch_constraint" and width_binding.get("constraint_name") == "width" and width_binding.get("unit") == "mm" and width_binding.get("object") == binding.get("sketch_object"), "FEATURE_BINDING_INVALID")
-    sketch = doc.getObject(width_binding.get("object", ""))
+    require(all(name in binding.get("parameters", {}) for name in ("width", "height", "length")), "FEATURE_BINDING_MISSING")
+    sketch = doc.getObject(binding.get("sketch_object", ""))
     feature = doc.getObject(binding.get("feature_object", ""))
     require(sketch is not None and feature is not None, "BOUND_OBJECT_NOT_FOUND")
     require(sketch.TypeId == "Sketcher::SketchObject" and feature.TypeId == "PartDesign::Pad", "BOUND_OBJECT_TYPE_MISMATCH")
-    indices = [index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == width_binding["constraint_name"]]
-    require(len(indices) == 1, "FEATURE_BINDING_INVALID")
-    width_index = indices[0]
-    require(abs(float(sketch.getDatum(width_index).Value) - float(edit["old_value"])) <= LINEAR_TOLERANCE_MM, "MODEL_STATE_CHANGED_AFTER_VALIDATION")
     body = feature.getParentGeoFeatureGroup()
     require(body is not None and body.TypeId == "PartDesign::Body", "BOUND_BODY_NOT_FOUND")
     profile_value = feature.Profile
@@ -317,33 +313,37 @@ try:
     require(feature in body.Group and sketch in body.Group and profile_object == sketch and body.Tip == feature, "FEATURE_CHAIN_MISMATCH")
     source_feature = next(item for item in source_plan["features"] if item["id"] == edit["target_feature_id"])
     expected_feature = next(item for item in expected_plan["features"] if item["id"] == edit["target_feature_id"])
-    height_before = float(source_feature["height"])
-    length_before = float(source_feature["length"])
-    height_binding = binding["parameters"].get("height")
-    length_binding = binding["parameters"].get("length")
-    require(height_binding is not None and length_binding is not None, "FEATURE_BINDING_MISSING")
-    height_indices = [index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == height_binding.get("constraint_name")]
-    require(len(height_indices) == 1, "FEATURE_BINDING_INVALID")
-    require(abs(float(sketch.getDatum(height_indices[0]).Value) - height_before) <= LINEAR_TOLERANCE_MM, "MODEL_STATE_CHANGED_AFTER_VALIDATION")
-    require(length_binding.get("kind") == "feature_property" and length_binding.get("property") == "Length", "FEATURE_BINDING_INVALID")
-    require(abs(float(feature.Length.Value) - length_before) <= LINEAR_TOLERANCE_MM, "MODEL_STATE_CHANGED_AFTER_VALIDATION")
+    parameter_bindings = binding["parameters"]
+    for name in ("width", "height"):
+        item = parameter_bindings[name]
+        require(item.get("kind") == "sketch_constraint" and item.get("constraint_name") == name and item.get("unit") == "mm" and item.get("object") == binding.get("sketch_object"), "FEATURE_BINDING_INVALID")
+        indices = [index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == name]
+        require(len(indices) == 1, "FEATURE_BINDING_INVALID")
+        parameter_indices[name] = indices[0]
+    length_binding = parameter_bindings["length"]
+    require(length_binding.get("kind") == "feature_property" and length_binding.get("property") == "Length" and length_binding.get("unit") == "mm" and length_binding.get("object") == binding.get("feature_object"), "FEATURE_BINDING_INVALID")
+    source_values = {"width": float(source_feature["width"]), "height": float(source_feature["height"]), "length": float(source_feature["length"])}
+    actual_before = {"width": float(sketch.getDatum(parameter_indices["width"]).Value), "height": float(sketch.getDatum(parameter_indices["height"]).Value), "length": float(feature.Length.Value)}
+    require(all(abs(actual_before[name] - source_values[name]) <= LINEAR_TOLERANCE_MM for name in source_values), "MODEL_STATE_CHANGED_AFTER_VALIDATION")
+    require(abs(actual_before[edit["parameter"]] - float(edit["old_value"])) <= LINEAR_TOLERANCE_MM, "MODEL_STATE_CHANGED_AFTER_VALIDATION")
 
     doc.openTransaction("cad_execute_edit_plan_r" + str(edit["model_revision"]))
     transaction_open = True
-    sketch.setDatum(width_index, FreeCAD.Units.Quantity(str(edit["new_value"]) + " mm"))
+    if edit["parameter"] in ("width", "height"):
+        sketch.setDatum(parameter_indices[edit["parameter"]], FreeCAD.Units.Quantity(str(edit["new_value"]) + " mm"))
+    else:
+        feature.Length = float(edit["new_value"])
     doc.recompute()
     # edit_verification_snapshot_start
     shape = body.Tip.Shape
     geometry_signature = inspect_geometry(shape)
-    actual_width = float(sketch.getDatum(width_index).Value)
-    actual_height = float(sketch.getDatum(height_indices[0]).Value)
-    actual_length = float(feature.Length.Value)
+    actual_values = {"width": float(sketch.getDatum(parameter_indices["width"]).Value), "height": float(sketch.getDatum(parameter_indices["height"]).Value), "length": float(feature.Length.Value)}
     recompute_errors = [{"object": obj.Name, "states": [str(state) for state in obj.State if str(state) not in ("Up-to-date", "Touched")]} for obj in doc.Objects]
     recompute_errors = [entry for entry in recompute_errors if entry["states"]]
     actual_snapshot = {
         "solid_count": geometry_signature["solid_count"], "shape_valid": geometry_signature["shape_valid"],
         "bounding_box": geometry_signature["bounding_box"], "volume": geometry_signature["volume"],
-        "width": actual_width, "height": actual_height, "length": actual_length,
+        "width": actual_values["width"], "height": actual_values["height"], "length": actual_values["length"],
         "body_tip": body.Tip.Name if body.Tip is not None else None,
         "feature_chain_complete": feature in body.Group and sketch in body.Group and profile_object == sketch and body.Tip == feature,
         "binding_valid": doc.getObject(binding["feature_object"]) == feature and doc.getObject(binding["sketch_object"]) == sketch,
@@ -357,28 +357,32 @@ try:
         "shape_valid": {"expected": True, "actual": actual_snapshot["shape_valid"], "passed": actual_snapshot["shape_valid"] is True},
         "bounding_box": {"expected": expected_bounds, "actual": actual_snapshot["bounding_box"], "passed": all(abs(float(actual_snapshot["bounding_box"][axis]) - expected_bounds[axis]) <= LINEAR_TOLERANCE_MM for axis in ("x", "y", "z"))},
         "volume": {"expected": expected_volume, "actual": actual_snapshot["volume"], "passed": abs(float(actual_snapshot["volume"]) - expected_volume) <= VOLUME_TOLERANCE_MM3},
-        "width": {"expected": float(expected_feature["width"]), "actual": actual_snapshot["width"], "passed": abs(actual_snapshot["width"] - float(expected_feature["width"])) <= LINEAR_TOLERANCE_MM},
-        "height_unchanged": {"expected": height_before, "actual": actual_snapshot["height"], "passed": abs(actual_snapshot["height"] - height_before) <= LINEAR_TOLERANCE_MM},
-        "length_unchanged": {"expected": length_before, "actual": actual_snapshot["length"], "passed": abs(actual_snapshot["length"] - length_before) <= LINEAR_TOLERANCE_MM},
+    }
+    for name in ("width", "height", "length"):
+        checks["parameter_" + name] = {"expected": float(expected_feature[name]), "actual": actual_snapshot[name], "passed": abs(actual_snapshot[name] - float(expected_feature[name])) <= LINEAR_TOLERANCE_MM}
+    checks.update({
         "body_tip": {"expected": feature.Name, "actual": actual_snapshot["body_tip"], "passed": actual_snapshot["body_tip"] == feature.Name},
         "feature_chain_complete": {"expected": True, "actual": actual_snapshot["feature_chain_complete"], "passed": actual_snapshot["feature_chain_complete"] is True},
         "binding_valid": {"expected": True, "actual": actual_snapshot["binding_valid"], "passed": actual_snapshot["binding_valid"] is True},
         "recompute_errors": {"expected": [], "actual": actual_snapshot["recompute_errors"], "passed": len(actual_snapshot["recompute_errors"]) == 0},
-    }
+    })
     issues = [{"code": "EDIT_VERIFICATION_MISMATCH", "check": name, "expected": check["expected"], "actual": check["actual"], "message": "The edited FreeCAD model does not match the validated expected plan."} for name, check in checks.items() if not check["passed"]]
     verification = {"passed": len(issues) == 0, "checks": checks}
     if issues:
         doc.abortTransaction()
         transaction_open = False
-        sketch.setDatum(width_index, FreeCAD.Units.Quantity(str(edit["old_value"]) + " mm"))
+        if edit["parameter"] in ("width", "height"):
+            sketch.setDatum(parameter_indices[edit["parameter"]], FreeCAD.Units.Quantity(str(edit["old_value"]) + " mm"))
+        else:
+            feature.Length = float(edit["old_value"])
         metadata.IsManagedModel = True
         metadata.ResolvedPlanJson = json.dumps(source_plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
         metadata.PlanDigest = source_plan_digest
         metadata.ModelRevision = int(edit["model_revision"])
         doc.recompute()
-        rollback_width = float(sketch.getDatum(width_index).Value)
-        rollback_ok = abs(rollback_width - float(edit["old_value"])) <= LINEAR_TOLERANCE_MM and int(metadata.ModelRevision) == int(edit["model_revision"]) and str(metadata.PlanDigest) == source_plan_digest and json.loads(metadata.ResolvedPlanJson) == source_plan
-        _mcp_result["result"] = {"success": False, "status": "verification_failed", "code": "CAD_EDIT_VERIFICATION_FAILED", "issues": issues, "geometry_signature": geometry_signature, "verification": verification, "rollback": {"passed": rollback_ok, "width": rollback_width, "model_revision": int(metadata.ModelRevision), "plan_digest": str(metadata.PlanDigest)}}
+        rollback_values = {"width": float(sketch.getDatum(parameter_indices["width"]).Value), "height": float(sketch.getDatum(parameter_indices["height"]).Value), "length": float(feature.Length.Value)}
+        rollback_ok = all(abs(rollback_values[name] - source_values[name]) <= LINEAR_TOLERANCE_MM for name in source_values) and int(metadata.ModelRevision) == int(edit["model_revision"]) and str(metadata.PlanDigest) == source_plan_digest and json.loads(metadata.ResolvedPlanJson) == source_plan
+        _mcp_result["result"] = {"success": False, "status": "verification_failed", "code": "CAD_EDIT_VERIFICATION_FAILED", "issues": issues, "geometry_signature": geometry_signature, "verification": verification, "rollback": {"passed": rollback_ok, "parameter": edit["parameter"], "value": rollback_values[edit["parameter"]], "width": rollback_values["width"], "height": rollback_values["height"], "length": rollback_values["length"], "model_revision": int(metadata.ModelRevision), "plan_digest": str(metadata.PlanDigest)}}
     else:
         metadata.IsManagedModel = False
         metadata.ResolvedPlanJson = json.dumps(expected_plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -398,8 +402,10 @@ except Exception as error:
     if doc is not None and transaction_open:
         try:
             doc.abortTransaction()
-            if sketch is not None and width_index is not None:
-                sketch.setDatum(width_index, FreeCAD.Units.Quantity(str(edit["old_value"]) + " mm"))
+            if sketch is not None and feature is not None and edit["parameter"] in parameter_indices:
+                sketch.setDatum(parameter_indices[edit["parameter"]], FreeCAD.Units.Quantity(str(edit["old_value"]) + " mm"))
+            elif feature is not None and edit["parameter"] == "length":
+                feature.Length = float(edit["old_value"])
             if metadata is not None:
                 metadata.IsManagedModel = True
                 metadata.ResolvedPlanJson = json.dumps(source_plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)

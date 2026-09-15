@@ -115,6 +115,37 @@ function widthEdit(created, overrides = {}) {
   };
 }
 
+function parameterEdit(created, modelRevision, parameter, oldValue, newValue, overrides = {}) {
+  return {
+    model_id: created.managed_model.model_id,
+    model_revision: modelRevision,
+    target_feature_id: 'base',
+    parameter,
+    old_value: oldValue,
+    new_value: newValue,
+    unit: 'mm',
+    ...overrides,
+  };
+}
+
+async function setActualParameter(bridge, documentName, parameter, value) {
+  return payload(await bridge.run(`
+doc = FreeCAD.getDocument(${JSON.stringify(documentName)})
+metadata = doc.getObject("ManagedModelMetadata")
+bindings = json.loads(metadata.FeatureBindingsJson)
+binding = bindings["base"]
+parameter_binding = binding["parameters"][${JSON.stringify(parameter)}]
+sketch = doc.getObject(binding["sketch_object"])
+feature = doc.getObject(binding["feature_object"])
+if parameter_binding["kind"] == "sketch_constraint":
+    parameter_index = next(index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == parameter_binding["constraint_name"])
+    sketch.setDatum(parameter_index, FreeCAD.Units.Quantity(${JSON.stringify(`${value} mm`)}))
+else:
+    feature.Length = ${value}
+doc.recompute()
+_mcp_result["result"] = {"parameter": ${JSON.stringify(parameter)}, "value": ${value}}`));
+}
+
 test('edit tool schemas expose only semantic fields and allow invalid intents to reach deterministic validation', () => {
   const validateTool = HIGH_LEVEL_CAD_TOOLS.find((tool) => tool.name === 'cad_validate_edit_plan');
   const executeTool = HIGH_LEVEL_CAD_TOOLS.find((tool) => tool.name === 'cad_execute_edit_plan');
@@ -222,6 +253,50 @@ os.remove(path)`));
   assert.equal(reload.width, 120);
 });
 
+for (const scenario of [
+  { parameter: 'height', oldValue: 60, newValue: 80, driftValue: 70, bounds: { x: 100, y: 80, z: 10 }, volume: 80000 },
+  { parameter: 'length', oldValue: 10, newValue: 15, driftValue: 12, bounds: { x: 100, y: 60, z: 15 }, volume: 90000 },
+]) {
+  test(`${scenario.parameter} edit validates plan and actual state, then changes only the bound parameter`, async (t) => {
+    const documentName = `Edit_${scenario.parameter}`;
+    const { bridge, planGate, editGate, created } = await createManagedPlate(t, documentName);
+    const edit = parameterEdit(created, 1, scenario.parameter, scenario.oldValue, scenario.newValue);
+
+    const wrongOld = payload(await handleHighLevelCadTool(
+      'cad_validate_edit_plan', { ...edit, old_value: scenario.oldValue + 1 }, bridge, planGate, editGate,
+    ));
+    assert.equal(wrongOld.can_execute, false);
+    assert.equal(wrongOld.issues[0].code, 'OLD_VALUE_MISMATCH');
+
+    await setActualParameter(bridge, documentName, scenario.parameter, scenario.driftValue);
+    const drift = payload(await handleHighLevelCadTool('cad_validate_edit_plan', edit, bridge, planGate, editGate));
+    assert.equal(drift.can_execute, false);
+    assert.equal(drift.issues[0].code, 'MODEL_STATE_MISMATCH');
+    await setActualParameter(bridge, documentName, scenario.parameter, scenario.oldValue);
+
+    const validation = payload(await handleHighLevelCadTool('cad_validate_edit_plan', edit, bridge, planGate, editGate));
+    assert.equal(validation.status, 'valid', JSON.stringify(validation, null, 2));
+    assert.equal(validation.can_execute, true);
+    const executionResult = await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate);
+    const execution = payload(executionResult);
+    assert.equal(executionResult.isError, undefined);
+    assert.equal(execution.status, 'verified', JSON.stringify(execution, null, 2));
+    assert.deepEqual(execution.geometry_signature.bounding_box, scenario.bounds);
+    assert.equal(execution.geometry_signature.volume, scenario.volume);
+    assert.equal(execution.managed_model.model_revision, 2);
+    assert.equal(execution.managed_model.model_id, created.managed_model.model_id);
+    assert.equal(execution.verification.checks[`parameter_${scenario.parameter}`].passed, true);
+
+    const state = await inspectManagedModel(bridge);
+    assert.deepEqual(state.documents, [documentName]);
+    assert.equal(state[scenario.parameter], scenario.newValue);
+    for (const unchanged of ['width', 'height', 'length'].filter((name) => name !== scenario.parameter)) {
+      assert.equal(state[unchanged], { width: 100, height: 60, length: 10 }[unchanged]);
+    }
+    assert.equal(state.resolved_plan.features[0][scenario.parameter], scenario.newValue);
+  });
+}
+
 test('V1 edit validation blocks invalid identities, revisions, targets, parameters and values without mutation', async (t) => {
   const { bridge, planGate, editGate, created } = await createManagedPlate(t, 'EditValidationFailures');
   const cases = [
@@ -229,7 +304,7 @@ test('V1 edit validation blocks invalid identities, revisions, targets, paramete
     [{ model_revision: 2 }, 'STALE_MODEL_REVISION'],
     [{ model_id: '00000000-0000-4000-8000-000000000000' }, 'MANAGED_MODEL_NOT_FOUND'],
     [{ target_feature_id: 'missing' }, 'TARGET_FEATURE_NOT_FOUND'],
-    [{ parameter: 'height' }, 'UNSUPPORTED_EDIT_PARAMETER'],
+    [{ parameter: 'radius' }, 'UNSUPPORTED_EDIT_PARAMETER'],
     [{ unit: 'cm' }, 'UNSUPPORTED_EDIT_UNIT'],
     [{ new_value: 0 }, 'INVALID_NEW_VALUE'],
   ];
@@ -342,4 +417,115 @@ test('V1 edit verification failure aborts the transaction and restores width and
   assert.equal(state.resolved_plan.features[0].width, 100);
   const retry = await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate);
   assert.equal(payload(retry).code, 'CAD_EDIT_NOT_VALIDATED');
+});
+
+for (const scenario of [
+  { parameter: 'height', oldValue: 60, newValue: 80 },
+  { parameter: 'length', oldValue: 10, newValue: 15 },
+]) {
+  test(`${scenario.parameter} verification failure rolls back the parameter and all managed metadata`, async (t) => {
+    const documentName = `EditRollback_${scenario.parameter}`;
+    const { bridge, planGate, editGate, created } = await createManagedPlate(t, documentName);
+    const edit = parameterEdit(created, 1, scenario.parameter, scenario.oldValue, scenario.newValue);
+    const validation = payload(await handleHighLevelCadTool('cad_validate_edit_plan', edit, bridge, planGate, editGate));
+    assert.equal(validation.can_execute, true);
+    bridge.mutateNextCode((code) => {
+      const marker = '    # edit_verification_snapshot_complete';
+      assert.ok(code.includes(marker));
+      return code.replace(marker, '    actual_snapshot["volume"] = 1.0\n' + marker);
+    });
+    const failedResult = await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate);
+    const failed = payload(failedResult);
+    assert.equal(failedResult.isError, true);
+    assert.equal(failed.code, 'CAD_EDIT_VERIFICATION_FAILED');
+    assert.equal(failed.rollback.passed, true, JSON.stringify(failed, null, 2));
+    assert.equal(failed.rollback.parameter, scenario.parameter);
+    assert.equal(failed.rollback.value, scenario.oldValue);
+    assert.deepEqual(
+      { width: failed.rollback.width, height: failed.rollback.height, length: failed.rollback.length },
+      { width: 100, height: 60, length: 10 },
+    );
+    assert.equal(failed.rollback.model_revision, 1);
+    assert.equal(failed.rollback.plan_digest, created.managed_model.plan_digest);
+    const state = await inspectManagedModel(bridge);
+    assert.equal(state[scenario.parameter], scenario.oldValue);
+    assert.deepEqual(
+      { width: state.width, height: state.height, length: state.length },
+      { width: 100, height: 60, length: 10 },
+    );
+    assert.equal(state.model_revision, 1);
+    assert.equal(state.plan_digest, created.managed_model.plan_digest);
+    assert.deepEqual(state.resolved_plan.features[0], {
+      id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10,
+    });
+  });
+}
+
+test('sequential width, height, and length edits reach revision four and persist across save/reload', async (t) => {
+  const { bridge, planGate, editGate, created } = await createManagedPlate(t, 'EditSequence');
+  const modelId = created.managed_model.model_id;
+  let previousDigest = created.managed_model.plan_digest;
+  const edits = [
+    parameterEdit(created, 1, 'width', 100, 120),
+    parameterEdit(created, 2, 'height', 60, 80),
+    parameterEdit(created, 3, 'length', 10, 15),
+  ];
+  for (const [index, edit] of edits.entries()) {
+    const validation = payload(await handleHighLevelCadTool('cad_validate_edit_plan', edit, bridge, planGate, editGate));
+    assert.equal(validation.can_execute, true, JSON.stringify(validation, null, 2));
+    const execution = payload(await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate));
+    assert.equal(execution.status, 'verified', JSON.stringify(execution, null, 2));
+    assert.equal(execution.managed_model.model_id, modelId);
+    assert.equal(execution.managed_model.model_revision, index + 2);
+    assert.notEqual(execution.managed_model.plan_digest, previousDigest);
+    previousDigest = execution.managed_model.plan_digest;
+    const stale = payload(await handleHighLevelCadTool('cad_validate_edit_plan', edit, bridge, planGate, editGate));
+    assert.equal(stale.can_execute, false);
+    assert.equal(stale.issues[0].code, 'STALE_MODEL_REVISION');
+  }
+
+  const finalState = await inspectManagedModel(bridge);
+  assert.deepEqual(
+    { width: finalState.width, height: finalState.height, length: finalState.length },
+    { width: 120, height: 80, length: 15 },
+  );
+  assert.equal(finalState.model_revision, 4);
+  assert.equal(finalState.plan_digest, previousDigest);
+  assert.deepEqual(finalState.resolved_plan.features[0], {
+    id: 'base', type: 'rectangular_pad', width: 120, height: 80, length: 15,
+  });
+
+  const reload = payload(await bridge.run(`
+import os
+import tempfile
+doc = FreeCAD.getDocument("EditSequence")
+descriptor, path = tempfile.mkstemp(suffix=".FCStd")
+os.close(descriptor)
+doc.saveAs(path)
+FreeCAD.closeDocument(doc.Name)
+reloaded = FreeCAD.openDocument(path)
+metadata = reloaded.getObject("ManagedModelMetadata")
+bindings = json.loads(metadata.FeatureBindingsJson)
+binding = bindings["base"]
+sketch = reloaded.getObject(binding["sketch_object"])
+feature = reloaded.getObject(binding["feature_object"])
+width_index = next(index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == "width")
+height_index = next(index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == "height")
+_mcp_result["result"] = {
+    "model_id": str(metadata.ModelId), "model_revision": int(metadata.ModelRevision), "plan_digest": str(metadata.PlanDigest),
+    "resolved_plan": json.loads(metadata.ResolvedPlanJson), "width": float(sketch.getDatum(width_index).Value),
+    "height": float(sketch.getDatum(height_index).Value), "length": float(feature.Length.Value), "volume": float(feature.Shape.Volume),
+}
+FreeCAD.closeDocument(reloaded.Name)
+os.remove(path)`));
+  assert.equal(reload.model_id, modelId);
+  assert.equal(reload.model_revision, 4);
+  assert.equal(reload.plan_digest, previousDigest);
+  assert.deepEqual(
+    { width: reload.width, height: reload.height, length: reload.length, volume: reload.volume },
+    { width: 120, height: 80, length: 15, volume: 144000 },
+  );
+  assert.deepEqual(reload.resolved_plan.features[0], {
+    id: 'base', type: 'rectangular_pad', width: 120, height: 80, length: 15,
+  });
 });
