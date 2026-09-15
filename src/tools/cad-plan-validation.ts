@@ -143,7 +143,7 @@ const simplePlanSchema = {
     shape: { type: ['string', 'null'], enum: ['plate', 'profile', null], description: 'Required discriminator: plate or profile.' },
     size: { type: ['array', 'null'], minItems: 3, maxItems: 3, items: { type: 'number' }, description: 'For shape:"plate": [width,height,thickness] in mm.' },
     profile: { type: ['array', 'null'], minItems: 3, items: coordinatePairSchema, description: 'For shape:"profile": polygon vertices [[x,y],...]; closure is automatic.' },
-    segments: { type: ['array', 'null'], minItems: 2, items: profileSegmentSchema, description: 'For a mixed line/arc profile. Segments must form one explicitly closed outer contour. Never combine with profile.' },
+    segments: { type: ['array', 'null'], minItems: 1, items: profileSegmentSchema, description: 'For a mixed line/arc profile. Incomplete segment chains are accepted for non-mutating validation, but execution requires one explicitly closed outer contour. Never combine with profile and never invent closing segments.' },
     thickness: { type: ['number', 'null'], exclusiveMinimum: 0, description: 'For shape:"profile": extrusion length in +Z.' },
     unit: { type: ['string', 'null'], enum: ['mm', null], description: 'Currently mm.' },
     holes: simpleHolesSchema,
@@ -176,7 +176,7 @@ const featurePlanSchema = {
           id: { type: ['string', 'null'] },
           type: { type: ['string', 'null'], enum: ['rectangular_pad', 'profile_pad', 'hole_pattern', 'fillet', 'chamfer', null] },
           points: { type: ['array', 'null'], minItems: 3, items: coordinatePairSchema },
-          segments: { type: ['array', 'null'], minItems: 2, items: profileSegmentSchema },
+          segments: { type: ['array', 'null'], minItems: 1, items: profileSegmentSchema },
           width: { type: ['number', 'null'] }, height: { type: ['number', 'null'] }, length: { type: ['number', 'null'] },
           diameter: { type: ['number', 'null'] }, count: { type: ['integer', 'null'] },
           placement: {
@@ -526,7 +526,12 @@ function validateProfilePad(feature: Record<string, unknown>, path: string): Val
   }
   if (hasSegments) {
     const validated = validateProfileSegments(feature.segments, `${path}.segments`);
-    issues.push(...validated.issues.map((issue) => ({ ...issue, kind: issue.code.startsWith('UNSUPPORTED_') ? 'unsupported' as const : 'invalid' as const })));
+    issues.push(...validated.issues.map((issue) => ({
+      ...issue,
+      kind: issue.code === 'PROFILE_NOT_CLOSED'
+        ? 'ambiguous' as const
+        : issue.code.startsWith('UNSUPPORTED_') ? 'unsupported' as const : 'invalid' as const,
+    })));
     return {
       segments: validated.segments, length, area: validated.area, bounds: validated.bounds,
       lineCount: validated.lineCount, arcCount: validated.arcCount, arcRadii: validated.arcRadii, issues,

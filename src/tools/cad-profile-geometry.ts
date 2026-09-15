@@ -209,7 +209,7 @@ function profileBounds(segments: CanonicalProfileSegment[]): { minX: number; min
 export function validateProfileSegments(value: unknown, path: string): ValidatedSegmentProfile {
   const issues: ProfileSegmentIssue[] = [];
   if (!Array.isArray(value)) return { issues: [{ code: 'INVALID_PROFILE_SEGMENTS', path, message: 'segments must be an array.' }] };
-  if (value.length < 2) return { issues: [{ code: 'PROFILE_TOO_FEW_SEGMENTS', path, message: 'A closed segment profile requires at least two segments.' }] };
+  if (value.length === 0) return { issues: [{ code: 'PROFILE_TOO_FEW_SEGMENTS', path, message: 'A segment profile requires at least one explicitly provided segment for validation.' }] };
   if (value.length > 1000) return { issues: [{ code: 'PROFILE_TOO_MANY_SEGMENTS', path, message: 'At most 1000 profile segments are supported.' }] };
   const segments: CanonicalProfileSegment[] = [];
   value.forEach((candidate, index) => {
@@ -234,8 +234,8 @@ export function validateProfileSegments(value: unknown, path: string): Validated
   });
   if (issues.length > 0 || segments.length !== value.length) return { issues };
 
-  for (let index = 0; index < segments.length; index += 1) {
-    const next = (index + 1) % segments.length;
+  for (let index = 0; index < segments.length - 1; index += 1) {
+    const next = index + 1;
     const gap = distance(segments[index].end, segments[next].start);
     if (gap > LINEAR_TOLERANCE_MM) issues.push({
       code: 'PROFILE_SEGMENT_GAP', path: `${path}.${index}.end`, message: 'Adjacent profile segments are not continuous.',
@@ -243,6 +243,22 @@ export function validateProfileSegments(value: unknown, path: string): Validated
     });
   }
   if (issues.length > 0) return { issues };
+
+  const lastSegmentIndex = segments.length - 1;
+  const closureDistance = distance(segments[lastSegmentIndex].end, segments[0].start);
+  if (closureDistance > LINEAR_TOLERANCE_MM) return {
+    segments,
+    issues: [{
+      code: 'PROFILE_NOT_CLOSED', path: `${path}.${lastSegmentIndex}.end`,
+      message: 'The provided contour is open; one or more explicitly supplied segments must connect the final endpoint to the first start point.',
+      details: {
+        lastSegmentIndex,
+        expectedPoint: segments[0].start,
+        actualPoint: segments[lastSegmentIndex].end,
+        distance: closureDistance,
+      },
+    }],
+  };
 
   for (let first = 0; first < segments.length; first += 1) for (let second = first + 1; second < segments.length; second += 1) {
     const result = intersections(segments[first], segments[second]);

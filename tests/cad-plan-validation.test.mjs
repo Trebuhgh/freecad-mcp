@@ -41,12 +41,59 @@ test('cad_validate_plan schema presents Simple Intent first and isolates compati
   assert.equal(Object.hasOwn(simple.properties, 'base'), false);
   assert.equal(Object.hasOwn(simple.properties.holes.properties, 'placement'), false);
   assert.equal(Object.hasOwn(simple.properties.holes.properties, 'count'), false);
+  assert.equal(simple.properties.segments.minItems, 1);
   assert.equal(feature.title, 'Advanced Feature Plan (compatibility)');
   assert.deepEqual(feature.required, ['features']);
+  assert.equal(feature.properties.features.items.properties.segments.minItems, 1);
   assert.equal(legacy.title, 'Legacy Plan (compatibility)');
   assert.deepEqual(legacy.required, ['base']);
   assert.match(tool.description, /Only include features explicitly requested by the user/);
   assert.match(tool.description, /Do not mix formats/);
+});
+
+test('single explicit arc reaches validation without invented closure and blocks execution', async () => {
+  const plan = {
+    shape: 'profile',
+    segments: [{ type: 'arc', start: [80, 0], end: [80, 40], center: [80, 20], direction: 'ccw' }],
+    thickness: 10,
+    unit: 'mm',
+  };
+  const originalPlan = structuredClone(plan);
+  const { result, bridge, gate } = await validate(plan);
+  assert.deepEqual(plan, originalPlan);
+  assert.equal(result.status, 'ambiguous');
+  assert.equal(result.can_execute, false);
+  assert.equal(Object.hasOwn(result, 'resolved_plan'), false);
+  const issue = result.issues.find((candidate) => candidate.code === 'PROFILE_NOT_CLOSED');
+  assert.ok(issue, JSON.stringify(result));
+  assert.equal(issue.path, 'segments.0.end');
+  assert.deepEqual(issue.details.expectedPoint, { x: 80, y: 0 });
+  assert.deepEqual(issue.details.actualPoint, { x: 80, y: 40 });
+  assert.equal(bridge.calls, 0);
+  assert.equal(gate.state, 'blocked');
+  assert.equal(gate.resolvedPlan, undefined);
+
+  const execution = await handleHighLevelCadTool('cad_execute_plan', {}, bridge, gate);
+  assert.equal(JSON.parse(execution.content[0].text).code, 'CAD_PLAN_NOT_VALIDATED');
+  assert.equal(bridge.calls, 0);
+});
+
+test('continuous multi-segment chain with an open final endpoint is ambiguous', async () => {
+  const segments = [
+    { type: 'line', start: [0, 0], end: [10, 0] },
+    { type: 'line', start: [10, 0], end: [10, 10] },
+  ];
+  const { result, bridge, gate } = await validate({ shape: 'profile', segments, thickness: 10, unit: 'mm' });
+  assert.equal(result.status, 'ambiguous');
+  assert.equal(result.can_execute, false);
+  assert.equal(Object.hasOwn(result, 'resolved_plan'), false);
+  const issue = result.issues.find((candidate) => candidate.code === 'PROFILE_NOT_CLOSED');
+  assert.ok(issue, JSON.stringify(result));
+  assert.equal(issue.path, 'segments.1.end');
+  assert.deepEqual(issue.details.expectedPoint, { x: 0, y: 0 });
+  assert.deepEqual(issue.details.actualPoint, { x: 10, y: 10 });
+  assert.equal(bridge.calls, 0);
+  assert.equal(gate.state, 'blocked');
 });
 
 test('all seven preferred Simple Intent happy paths validate on the first call', async () => {
