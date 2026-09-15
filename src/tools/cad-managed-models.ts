@@ -4,7 +4,7 @@ import { LINEAR_TOLERANCE_MM } from './cad-geometry-tolerances.js';
 
 export const CAD_MANAGED_MODEL_TOOLS = [{
   name: 'cad_list_managed_models',
-  description: 'Read-only discovery of every valid managed model currently open in FreeCAD. Returns rectangular_pad width/height/length and hole_pattern diameter through persistent semantic bindings. Never selects a model automatically.',
+  description: 'Read-only discovery of every valid managed model currently open in FreeCAD. Returns rectangular_pad width/height/length, hole_pattern diameter, and center_x/center_y for a positions-editable singleton explicit hole through persistent semantic bindings. Never selects a model automatically.',
   inputSchema: {
     type: 'object' as const,
     properties: {},
@@ -125,6 +125,18 @@ for document_name in sorted(FreeCAD.listDocuments().keys()):
                     diameters.append(float(circle.Radius) * 2.0)
                 require(len([geometry for geometry in sketch.Geometry if geometry.__class__.__name__ == "Circle"]) == len(centers) and all(abs(value - float(feature_plan.get("diameter"))) <= LINEAR_TOLERANCE_MM for value in diameters), "MODEL_STATE_MISMATCH", "Actual hole diameters differ from the persistent resolved plan.")
                 parameters["diameter"] = diameters[0]
+                if feature_plan.get("center_editable") is True:
+                    require(len(centers) == 1, "RESOLVED_PLAN_INVALID", "A positions-editable hole_pattern must contain exactly one center.")
+                    circle = sketch.Geometry[geometry_indices[0]]
+                    for name, constraint_type, coordinate in (("center_x", "DistanceX", float(circle.Center.x)), ("center_y", "DistanceY", float(circle.Center.y))):
+                        position_binding = binding.get("parameters", {}).get(name)
+                        constraint_name = position_binding.get("constraint_name") if isinstance(position_binding, dict) else None
+                        indices = [index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == constraint_name]
+                        require(isinstance(position_binding, dict) and position_binding.get("kind") == "sketch_constraint" and position_binding.get("object") == binding.get("sketch_object") and position_binding.get("unit") == "mm" and isinstance(constraint_name, str) and len(indices) == 1, "FEATURE_BINDING_INVALID", "A singleton hole position binding is invalid.")
+                        constraint = sketch.Constraints[indices[0]]
+                        require(constraint.Type == constraint_type and int(constraint.Second) == geometry_indices[0] and abs(float(sketch.getDatum(indices[0]).Value) - coordinate) <= LINEAR_TOLERANCE_MM, "FEATURE_BINDING_INVALID", "A singleton hole position constraint does not match its circle center.")
+                        require(abs(coordinate - float(centers[0]["x" if name == "center_x" else "y"])) <= LINEAR_TOLERANCE_MM, "MODEL_STATE_MISMATCH", "Actual hole position differs from the persistent resolved plan.")
+                        parameters[name] = coordinate
             semantic_features.append({"id": feature_id, "type": feature_type, "parameters": parameters})
         models.append({"model_id": model_id, "model_revision": model_revision, "document": doc.Name, "features": semantic_features})
     except ManagedModelIssue as error:

@@ -785,6 +785,7 @@ function translateIssuePath(path: string, normalized: NormalizedFeaturePlan): st
 interface HoleResolution {
   diameter?: number;
   centers?: Point2D[];
+  placementSource?: 'explicit' | 'rectangular_grid';
   issues: InternalIssue[];
   ambiguityDistance?: number;
 }
@@ -921,7 +922,7 @@ function resolveHolePattern(feature: Record<string, unknown>, path: string, widt
       }
     }
   }
-  return { diameter, centers, issues, ambiguityDistance };
+  return { diameter, centers, placementSource, issues, ambiguityDistance };
 }
 
 interface ResolvedHoleGroup {
@@ -1079,6 +1080,7 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
         type: 'hole_pattern',
         diameter: holeResolution.diameter,
         centers: holeResolution.centers,
+        ...(holeResolution.placementSource === 'explicit' && holeResolution.centers?.length === 1 ? { center_editable: true } : {}),
         operation: 'through_all',
         ...(typeof holeFeature.after === 'string' ? { after: holeFeature.after } : {}),
         ...(typeof holeFeature.target === 'string' ? { target: holeFeature.target } : {}),
@@ -1139,7 +1141,7 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
     }
     if (feature.type === 'hole_pattern') {
       const resolution = resolutionByFeature.get(feature)!;
-      return { id: feature.id, type: 'hole_pattern', diameter: resolution.diameter, centers: resolution.centers, operation: 'through_all', ...dependencies };
+      return { id: feature.id, type: 'hole_pattern', diameter: resolution.diameter, centers: resolution.centers, ...(resolution.placementSource === 'explicit' && resolution.centers?.length === 1 ? { center_editable: true } : {}), operation: 'through_all', ...dependencies };
     }
     const dimension = feature.type === 'fillet' ? 'radius' : 'size';
     const resolvedOperation = legacyResolved[String(feature.type)] as Record<string, unknown>;

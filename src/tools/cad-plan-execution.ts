@@ -28,7 +28,7 @@ import hashlib
 import json
 import math
 import uuid
-plan = ${JSON.stringify(plan)}
+plan = json.loads(${JSON.stringify(JSON.stringify(plan))})
 plan_revision = ${revision}
 resolved_plan_json = json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 plan_digest = "sha256:" + hashlib.sha256(resolved_plan_json.encode("utf-8")).hexdigest()
@@ -304,14 +304,22 @@ try:
             hole_sketch = body.newObject("Sketcher::SketchObject", "PlanSketch_" + str(feature_index))
             attach_xy(hole_sketch, body)
             diameter_constraint_names = []
+            center_x_constraint_names = []
+            center_y_constraint_names = []
             for center_index, center in enumerate(centers):
                 circle = hole_sketch.addGeometry(Part.Circle(FreeCAD.Vector(center["x"], center["y"], 0), FreeCAD.Vector(0, 0, 1), diameter / 2.0), False)
                 diameter_constraint = hole_sketch.addConstraint(Sketcher.Constraint("Diameter", circle, diameter))
                 diameter_constraint_name = "diameter_" + str(center_index)
                 hole_sketch.renameConstraint(diameter_constraint, diameter_constraint_name)
                 diameter_constraint_names.append(diameter_constraint_name)
-                hole_sketch.addConstraint(Sketcher.Constraint("DistanceX", -1, 1, circle, 3, center["x"]))
-                hole_sketch.addConstraint(Sketcher.Constraint("DistanceY", -1, 1, circle, 3, center["y"]))
+                center_x_constraint = hole_sketch.addConstraint(Sketcher.Constraint("DistanceX", -1, 1, circle, 3, center["x"]))
+                center_y_constraint = hole_sketch.addConstraint(Sketcher.Constraint("DistanceY", -1, 1, circle, 3, center["y"]))
+                center_x_constraint_name = "center_x_" + str(center_index)
+                center_y_constraint_name = "center_y_" + str(center_index)
+                hole_sketch.renameConstraint(center_x_constraint, center_x_constraint_name)
+                hole_sketch.renameConstraint(center_y_constraint, center_y_constraint_name)
+                center_x_constraint_names.append(center_x_constraint_name)
+                center_y_constraint_names.append(center_y_constraint_name)
             solve_result = hole_sketch.solve()
             doc.recompute()
             check_object(hole_sketch, "HOLE_SKETCH_RECOMPUTE_FAILED")
@@ -331,7 +339,11 @@ try:
             check_object(pocket, "POCKET_RECOMPUTE_FAILED")
             if body.Tip != pocket or pocket.Shape.isNull() or not pocket.Shape.isValid() or len(pocket.Shape.Solids) != 1 or float(pocket.Shape.Volume) >= source_volume:
                 raise RuntimeError("POCKET_POSTCONDITION_FAILED")
-            feature_bindings[feature_id] = {"type": feature_type, "feature_object": pocket.Name, "feature_type_id": pocket.TypeId, "sketch_object": hole_sketch.Name, "parameters": {"diameter": {"kind": "sketch_constraints", "object": hole_sketch.Name, "constraint_names": diameter_constraint_names, "unit": "mm"}}}
+            hole_parameters = {"diameter": {"kind": "sketch_constraints", "object": hole_sketch.Name, "constraint_names": diameter_constraint_names, "unit": "mm"}}
+            if feature_plan.get("center_editable") is True and len(centers) == 1:
+                hole_parameters["center_x"] = {"kind": "sketch_constraint", "object": hole_sketch.Name, "constraint_name": center_x_constraint_names[0], "unit": "mm"}
+                hole_parameters["center_y"] = {"kind": "sketch_constraint", "object": hole_sketch.Name, "constraint_name": center_y_constraint_names[0], "unit": "mm"}
+            feature_bindings[feature_id] = {"type": feature_type, "feature_object": pocket.Name, "feature_type_id": pocket.TypeId, "sketch_object": hole_sketch.Name, "parameters": hole_parameters}
             expected_holes.append({"id": feature_id, "diameter": diameter, "centers": centers})
             feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pocket.Name, "object_type": pocket.TypeId, "verified_holes": len(centers), "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(hole_sketch.DoF), "source_volume": source_volume, "result_volume": float(pocket.Shape.Volume), "through_all": True})
         elif feature_type in ("fillet", "chamfer"):

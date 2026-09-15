@@ -23,7 +23,7 @@ interface EditPlan {
   model_id: string;
   model_revision: number;
   target_feature_id: string;
-  parameter: 'width' | 'height' | 'length' | 'diameter';
+  parameter: 'width' | 'height' | 'length' | 'diameter' | 'center_x' | 'center_y';
   old_value: number;
   new_value: number;
   unit: 'mm';
@@ -95,15 +95,15 @@ const editPlanProperties = {
   model_id: { type: 'string', description: 'Persistent managed-model UUID returned by cad_execute_plan.' },
   model_revision: { type: 'integer', description: 'Exact optimistic-concurrency revision currently stored by the managed model.' },
   target_feature_id: { type: 'string', description: 'Semantic feature ID from the persistent resolved plan.' },
-  parameter: { type: 'string', description: 'rectangular_pad: width is X Sketch extent, height is Y Sketch extent, length is Pad.Length / Z thickness. hole_pattern: diameter is the diameter of every existing hole in that feature.' },
-  old_value: { type: 'number', description: 'Expected current parameter value in mm.' },
-  new_value: { type: 'number', description: 'Requested new parameter value in mm; validation requires a positive finite value.' },
+  parameter: { type: 'string', description: 'rectangular_pad: width, height, or length. hole_pattern: diameter, or center_x/center_y only for one explicitly positioned hole with persistent position bindings.' },
+  old_value: { type: 'number', description: 'Expected current parameter value in mm; center coordinates may be any finite value.' },
+  new_value: { type: 'number', description: 'Requested new parameter value in mm; dimensions require a positive finite value and center coordinates require a finite value.' },
   unit: { type: 'string', description: 'Requested unit. Validation currently accepts only millimetres.' },
 };
 
 export const CAD_EDIT_TOOLS = [{
   name: 'cad_validate_edit_plan',
-  description: 'Non-mutating validation gate for one semantic edit: rectangular_pad width/height/length or hole_pattern diameter. Never provide FreeCAD object names or constraint indices.',
+  description: 'Non-mutating validation gate for one semantic edit: rectangular_pad width/height/length; hole_pattern diameter; or center_x/center_y for one explicitly positioned hole. Never provide FreeCAD object names or constraint indices.',
   inputSchema: {
     type: 'object' as const,
     properties: editPlanProperties,
@@ -142,10 +142,11 @@ function validateInput(args: ToolArgs): EditValidationResult | EditPlan {
   if (typeof args.model_id !== 'string' || args.model_id.length === 0) return issue('invalid', 'INVALID_MODEL_ID', 'model_id', 'model_id must be a non-empty string.');
   if (!Number.isInteger(args.model_revision) || (args.model_revision as number) < 1) return issue('invalid', 'INVALID_MODEL_REVISION', 'model_revision', 'model_revision must be a positive integer.');
   if (typeof args.target_feature_id !== 'string' || args.target_feature_id.length === 0) return issue('invalid', 'INVALID_FEATURE_ID', 'target_feature_id', 'target_feature_id must be a non-empty semantic feature ID.');
-  if (args.parameter !== 'width' && args.parameter !== 'height' && args.parameter !== 'length' && args.parameter !== 'diameter') return issue('unsupported', 'UNSUPPORTED_EDIT_PARAMETER', 'parameter', 'Supported parameters are rectangular_pad width/height/length and hole_pattern diameter.');
+  if (args.parameter !== 'width' && args.parameter !== 'height' && args.parameter !== 'length' && args.parameter !== 'diameter' && args.parameter !== 'center_x' && args.parameter !== 'center_y') return issue('unsupported', 'UNSUPPORTED_EDIT_PARAMETER', 'parameter', 'Supported parameters are rectangular_pad width/height/length and hole_pattern diameter/center_x/center_y.');
   if (args.unit !== 'mm') return issue('unsupported', 'UNSUPPORTED_EDIT_UNIT', 'unit', 'V1 supports only millimetres.');
-  if (typeof args.old_value !== 'number' || !Number.isFinite(args.old_value) || args.old_value <= 0) return issue('invalid', 'INVALID_OLD_VALUE', 'old_value', 'old_value must be finite and greater than zero.');
-  if (typeof args.new_value !== 'number' || !Number.isFinite(args.new_value) || args.new_value <= 0) return issue('invalid', 'INVALID_NEW_VALUE', 'new_value', 'new_value must be finite and greater than zero.');
+  const positionParameter = args.parameter === 'center_x' || args.parameter === 'center_y';
+  if (typeof args.old_value !== 'number' || !Number.isFinite(args.old_value) || (!positionParameter && args.old_value <= 0)) return issue('invalid', 'INVALID_OLD_VALUE', 'old_value', positionParameter ? 'old_value must be finite.' : 'old_value must be finite and greater than zero.');
+  if (typeof args.new_value !== 'number' || !Number.isFinite(args.new_value) || (!positionParameter && args.new_value <= 0)) return issue('invalid', 'INVALID_NEW_VALUE', 'new_value', positionParameter ? 'new_value must be finite.' : 'new_value must be finite and greater than zero.');
   return {
     model_id: args.model_id,
     model_revision: args.model_revision as number,
@@ -205,16 +206,26 @@ else:
                 fail("unsupported", "UNSUPPORTED_EDIT_UNIT", "unit", "The persistent resolved plan is not expressed in millimetres.")
             else:
                 features = [feature for feature in source_plan.get("features", []) if feature.get("id") == edit["target_feature_id"]]
+                target_feature = features[0] if len(features) == 1 else None
+                position_edit = edit["parameter"] in ("center_x", "center_y")
+                expected_parameter_value = None
+                if target_feature is not None:
+                    if position_edit and len(target_feature.get("centers", [])) == 1:
+                        expected_parameter_value = target_feature["centers"][0]["x" if edit["parameter"] == "center_x" else "y"]
+                    elif not position_edit:
+                        expected_parameter_value = target_feature.get(edit["parameter"])
                 if len(features) != 1:
                     fail("invalid", "TARGET_FEATURE_NOT_FOUND", "target_feature_id", "The target feature ID does not exist exactly once in the persistent resolved plan.")
-                elif not ((features[0].get("type") == "rectangular_pad" and edit["parameter"] in ("width", "height", "length")) or (features[0].get("type") == "hole_pattern" and edit["parameter"] == "diameter")):
+                elif not ((target_feature.get("type") == "rectangular_pad" and edit["parameter"] in ("width", "height", "length")) or (target_feature.get("type") == "hole_pattern" and edit["parameter"] in ("diameter", "center_x", "center_y"))):
                     fail("unsupported", "UNSUPPORTED_EDIT_PARAMETER", "parameter", "The requested parameter is not supported for the target feature type.")
-                elif features[0].get("type") == "hole_pattern" and (not source_plan.get("features") or source_plan["features"][0].get("type") != "rectangular_pad"):
-                    fail("unsupported", "UNSUPPORTED_EDIT_BASE", "target_feature_id", "hole_pattern diameter editing currently requires a rectangular_pad base.")
-                elif features[0].get(edit["parameter"]) is None or abs(float(features[0][edit["parameter"]]) - float(edit["old_value"])) > LINEAR_TOLERANCE_MM:
-                    fail("invalid", "OLD_VALUE_MISMATCH", "old_value", "old_value does not match the persistent resolved plan.", {"expected": features[0].get(edit["parameter"]), "actual": edit["old_value"]})
+                elif target_feature.get("type") == "hole_pattern" and (not source_plan.get("features") or source_plan["features"][0].get("type") != "rectangular_pad"):
+                    fail("unsupported", "UNSUPPORTED_EDIT_BASE", "target_feature_id", "hole_pattern editing currently requires a rectangular_pad base.")
+                elif position_edit and (target_feature.get("center_editable") is not True or len(target_feature.get("centers", [])) != 1):
+                    fail("unsupported", "SINGLE_EXPLICIT_HOLE_REQUIRED", "target_feature_id", "center_x/center_y editing requires exactly one explicitly positioned hole.")
+                elif expected_parameter_value is None or abs(float(expected_parameter_value) - float(edit["old_value"])) > LINEAR_TOLERANCE_MM:
+                    fail("invalid", "OLD_VALUE_MISMATCH", "old_value", "old_value does not match the persistent resolved plan.", {"expected": expected_parameter_value, "actual": edit["old_value"]})
                 elif edit["target_feature_id"] not in bindings or edit["parameter"] not in bindings[edit["target_feature_id"]].get("parameters", {}):
-                    fail("invalid", "FEATURE_BINDING_MISSING", "target_feature_id", "The persistent parameter binding is missing.")
+                    fail("unsupported" if position_edit else "invalid", "POSITION_BINDING_UNAVAILABLE" if position_edit else "FEATURE_BINDING_MISSING", "target_feature_id", "The persistent parameter binding is missing.")
                 else:
                     binding = bindings[edit["target_feature_id"]]
                     parameter_binding = binding["parameters"][edit["parameter"]]
@@ -246,7 +257,7 @@ else:
                             elif feature_type == "rectangular_pad":
                                 binding_valid = parameter_binding.get("kind") == "feature_property" and parameter_binding.get("property") == "Length" and parameter_binding.get("unit") == "mm" and parameter_binding.get("object") == binding.get("feature_object")
                                 actual_value = float(feature.Length.Value) if binding_valid else None
-                            else:
+                            elif edit["parameter"] == "diameter":
                                 centers = features[0].get("centers", [])
                                 names = parameter_binding.get("constraint_names") if isinstance(parameter_binding, dict) else None
                                 binding_valid = parameter_binding.get("kind") == "sketch_constraints" and parameter_binding.get("unit") == "mm" and parameter_binding.get("object") == binding.get("sketch_object") and isinstance(names, list) and len(names) == len(centers) and len(names) > 0 and len(set(names)) == len(names)
@@ -273,14 +284,37 @@ else:
                                     actual_value = actual_diameters[0]
                                     if any(abs(value - actual_value) > LINEAR_TOLERANCE_MM for value in actual_diameters):
                                         actual_state_valid = False
+                            else:
+                                centers = target_feature.get("centers", [])
+                                constraint_name = parameter_binding.get("constraint_name") if isinstance(parameter_binding, dict) else None
+                                indices = [index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == constraint_name]
+                                expected_constraint_type = "DistanceX" if edit["parameter"] == "center_x" else "DistanceY"
+                                binding_valid = parameter_binding.get("kind") == "sketch_constraint" and parameter_binding.get("unit") == "mm" and parameter_binding.get("object") == binding.get("sketch_object") and isinstance(constraint_name, str) and len(indices) == 1 and len(centers) == 1
+                                if binding_valid:
+                                    constraint = sketch.Constraints[indices[0]]
+                                    geometry_index = int(constraint.Second)
+                                    binding_valid = constraint.Type == expected_constraint_type and geometry_index >= 0 and geometry_index < len(sketch.Geometry)
+                                    if binding_valid:
+                                        geometry = sketch.Geometry[geometry_index]
+                                        binding_valid = geometry.__class__.__name__ == "Circle"
+                                    if binding_valid:
+                                        coordinate = float(geometry.Center.x if edit["parameter"] == "center_x" else geometry.Center.y)
+                                        other_coordinate = float(geometry.Center.y if edit["parameter"] == "center_x" else geometry.Center.x)
+                                        expected_other = float(centers[0]["y" if edit["parameter"] == "center_x" else "x"])
+                                        actual_value = coordinate
+                                        if abs(float(sketch.getDatum(indices[0]).Value) - coordinate) > LINEAR_TOLERANCE_MM or abs(other_coordinate - expected_other) > LINEAR_TOLERANCE_MM:
+                                            actual_state_valid = False
                             if not binding_valid:
                                 fail("invalid", "FEATURE_BINDING_INVALID", "parameter", "The persistent parameter binding does not match the requested semantic.")
-                            elif not actual_state_valid or abs(actual_value - float(features[0][edit["parameter"]])) > LINEAR_TOLERANCE_MM or abs(actual_value - float(edit["old_value"])) > LINEAR_TOLERANCE_MM:
-                                fail("invalid", "MODEL_STATE_MISMATCH", "old_value", "The actual FreeCAD parameter differs from the persistent resolved plan or old_value.", {"expected": float(features[0][edit["parameter"]]), "actual": actual_value})
+                            elif not actual_state_valid or abs(actual_value - float(expected_parameter_value)) > LINEAR_TOLERANCE_MM or abs(actual_value - float(edit["old_value"])) > LINEAR_TOLERANCE_MM:
+                                fail("invalid", "MODEL_STATE_MISMATCH", "old_value", "The actual FreeCAD parameter differs from the persistent resolved plan or old_value.", {"expected": float(expected_parameter_value), "actual": actual_value})
                             else:
                                 expected_plan = json.loads(canonical_source)
                                 expected_feature = next(feature for feature in expected_plan["features"] if feature["id"] == edit["target_feature_id"])
-                                expected_feature[edit["parameter"]] = edit["new_value"]
+                                if position_edit:
+                                    expected_feature["centers"][0]["x" if edit["parameter"] == "center_x" else "y"] = edit["new_value"]
+                                else:
+                                    expected_feature[edit["parameter"]] = edit["new_value"]
                                 expected_json = json.dumps(expected_plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
                                 expected_digest = "sha256:" + hashlib.sha256(expected_json.encode("utf-8")).hexdigest()
                                 _mcp_result["result"] = {
@@ -297,10 +331,10 @@ import Part
 import hashlib
 import json
 import math
-edit = ${JSON.stringify(validated.editPlan)}
-source_plan = ${JSON.stringify(validated.sourceResolvedPlan)}
+edit = json.loads(${JSON.stringify(JSON.stringify(validated.editPlan))})
+source_plan = json.loads(${JSON.stringify(JSON.stringify(validated.sourceResolvedPlan))})
 source_plan_digest = ${JSON.stringify(validated.sourcePlanDigest)}
-expected_plan = ${JSON.stringify(validated.expectedResolvedPlan)}
+expected_plan = json.loads(${JSON.stringify(JSON.stringify(validated.expectedResolvedPlan))})
 expected_plan_digest = ${JSON.stringify(validated.expectedPlanDigest)}
 LINEAR_TOLERANCE_MM = ${LINEAR_TOLERANCE_MM}
 AREA_TOLERANCE_MM2 = ${AREA_TOLERANCE_MM2}
@@ -314,6 +348,8 @@ sketch = None
 feature = None
 parameter_indices = {}
 diameter_constraint_names = []
+position_constraint_name = None
+target_circle_index = None
 source_geometry_signature = None
 source_holes = []
 source_target_holes = []
@@ -360,7 +396,7 @@ try:
     source_feature = next(item for item in source_plan["features"] if item["id"] == edit["target_feature_id"])
     expected_feature = next(item for item in expected_plan["features"] if item["id"] == edit["target_feature_id"])
     feature_type = source_feature["type"]
-    require((feature_type == "rectangular_pad" and edit["parameter"] in ("width", "height", "length")) or (feature_type == "hole_pattern" and edit["parameter"] == "diameter"), "UNSUPPORTED_EDIT_PARAMETER")
+    require((feature_type == "rectangular_pad" and edit["parameter"] in ("width", "height", "length")) or (feature_type == "hole_pattern" and edit["parameter"] in ("diameter", "center_x", "center_y")), "UNSUPPORTED_EDIT_PARAMETER")
     expected_type_id = "PartDesign::Pad" if feature_type == "rectangular_pad" else "PartDesign::Pocket"
     require(binding.get("type") == feature_type and binding.get("feature_type_id") == expected_type_id, "FEATURE_BINDING_INVALID")
     sketch = doc.getObject(binding.get("sketch_object", ""))
@@ -423,8 +459,25 @@ try:
             actual_diameters.append(float(circle.Radius) * 2.0)
         require(len([geometry for geometry in sketch.Geometry if geometry.__class__.__name__ == "Circle"]) == len(centers), "MODEL_STATE_CHANGED_AFTER_VALIDATION")
         require(all(abs(value - float(source_feature["diameter"])) <= LINEAR_TOLERANCE_MM for value in actual_diameters), "MODEL_STATE_CHANGED_AFTER_VALIDATION")
-        source_values = {"diameter": float(source_feature["diameter"])}
-        actual_before = {"diameter": actual_diameters[0]}
+        if edit["parameter"] == "diameter":
+            source_values = {"diameter": float(source_feature["diameter"])}
+            actual_before = {"diameter": actual_diameters[0]}
+        else:
+            require(source_feature.get("center_editable") is True and len(centers) == 1, "SINGLE_EXPLICIT_HOLE_REQUIRED")
+            position_binding = parameter_bindings.get(edit["parameter"], {})
+            position_constraint_name = position_binding.get("constraint_name")
+            position_indices = [index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == position_constraint_name]
+            require(position_binding.get("kind") == "sketch_constraint" and position_binding.get("object") == binding.get("sketch_object") and position_binding.get("unit") == "mm" and isinstance(position_constraint_name, str) and len(position_indices) == 1, "FEATURE_BINDING_INVALID")
+            position_constraint = sketch.Constraints[position_indices[0]]
+            expected_constraint_type = "DistanceX" if edit["parameter"] == "center_x" else "DistanceY"
+            require(position_constraint.Type == expected_constraint_type and int(position_constraint.Second) == circle_indices[0], "FEATURE_BINDING_INVALID")
+            parameter_indices[edit["parameter"]] = position_indices[0]
+            target_circle_index = circle_indices[0]
+            axis_name = "x" if edit["parameter"] == "center_x" else "y"
+            actual_coordinate = float(sketch.Geometry[target_circle_index].Center.x if axis_name == "x" else sketch.Geometry[target_circle_index].Center.y)
+            require(abs(float(sketch.getDatum(position_indices[0]).Value) - actual_coordinate) <= LINEAR_TOLERANCE_MM, "MODEL_STATE_CHANGED_AFTER_VALIDATION")
+            source_values = {edit["parameter"]: float(centers[0][axis_name])}
+            actual_before = {edit["parameter"]: actual_coordinate}
     require(abs(actual_before[edit["parameter"]] - float(edit["old_value"])) <= LINEAR_TOLERANCE_MM, "MODEL_STATE_CHANGED_AFTER_VALIDATION")
     source_geometry_signature = inspect_geometry(body.Tip.Shape)
     source_holes = inspect_holes(source_geometry_signature)
@@ -443,9 +496,11 @@ try:
         sketch.setDatum(parameter_indices[edit["parameter"]], FreeCAD.Units.Quantity(str(edit["new_value"]) + " mm"))
     elif edit["parameter"] == "length":
         feature.Length = float(edit["new_value"])
-    else:
+    elif edit["parameter"] == "diameter":
         for name in diameter_constraint_names:
             sketch.setDatum(parameter_indices[name], FreeCAD.Units.Quantity(str(edit["new_value"]) + " mm"))
+    else:
+        sketch.setDatum(parameter_indices[edit["parameter"]], FreeCAD.Units.Quantity(str(edit["new_value"]) + " mm"))
     doc.recompute()
     # edit_verification_snapshot_start
     shape = body.Tip.Shape
@@ -454,7 +509,8 @@ try:
         actual_values = {"width": float(sketch.getDatum(parameter_indices["width"]).Value), "height": float(sketch.getDatum(parameter_indices["height"]).Value), "length": float(feature.Length.Value)}
     else:
         actual_diameters = [float(sketch.Geometry[int(sketch.Constraints[parameter_indices[name]].First)].Radius) * 2.0 for name in diameter_constraint_names]
-        actual_values = {"diameter": actual_diameters[0] if actual_diameters else None}
+        actual_circle = sketch.Geometry[target_circle_index if target_circle_index is not None else int(sketch.Constraints[parameter_indices[diameter_constraint_names[0]]].First)]
+        actual_values = {"diameter": actual_diameters[0] if actual_diameters else None, "center_x": float(actual_circle.Center.x), "center_y": float(actual_circle.Center.y)}
     recompute_errors = [{"object": obj.Name, "states": cad_object_error_states(obj)} for obj in doc.Objects]
     recompute_errors = [entry for entry in recompute_errors if entry["states"]]
     actual_snapshot = {
@@ -501,13 +557,7 @@ try:
         actual_centers = sorted([{"x": hole["x"], "y": hole["y"]} for hole in actual_holes], key=lambda item: (item["x"], item["y"]))
         centers_passed = len(actual_centers) == len(expected_centers) and all(abs(actual_centers[index]["x"] - expected_centers[index]["x"]) <= LINEAR_TOLERANCE_MM and abs(actual_centers[index]["y"] - expected_centers[index]["y"]) <= LINEAR_TOLERANCE_MM for index in range(len(expected_centers)))
         groups_passed = len(matched_holes) == len(expected_specs) and all(result["actual_count"] == result["expected_count"] and all(abs(value - result["expected_diameter"]) <= LINEAR_TOLERANCE_MM for value in result["actual_diameters"]) for result in group_results.values())
-        axes_passed = len(actual_holes) == len(source_holes)
-        if axes_passed:
-            for actual in actual_holes:
-                previous = [hole for hole in source_holes if abs(hole["x"] - actual["x"]) <= LINEAR_TOLERANCE_MM and abs(hole["y"] - actual["y"]) <= LINEAR_TOLERANCE_MM]
-                if len(previous) != 1 or any(abs(actual["axis"][axis] - previous[0]["axis"][axis]) > LINEAR_TOLERANCE_MM for axis in range(3)) or abs(actual["axis_material_length"] - previous[0]["axis_material_length"]) > LINEAR_TOLERANCE_MM:
-                    axes_passed = False
-                    break
+        axes_passed = len(actual_holes) == len(source_holes) and all(abs(hole["axis"][0]) <= LINEAR_TOLERANCE_MM and abs(hole["axis"][1]) <= LINEAR_TOLERANCE_MM and abs(abs(hole["axis"][2]) - 1.0) <= LINEAR_TOLERANCE_MM and hole["axis_material_length"] <= LINEAR_TOLERANCE_MM for hole in actual_holes)
         expected_volume = base_values_before["width"] * base_values_before["height"] * base_values_before["length"] - sum(math.pi * (item["diameter"] / 2.0) ** 2 * base_values_before["length"] for item in expected_specs)
         target_actual_diameters = group_results[expected_feature["id"]]["actual_diameters"]
         target_diameter_passed = len(target_actual_diameters) == len(expected_feature["centers"]) and all(abs(value - float(expected_feature["diameter"])) <= LINEAR_TOLERANCE_MM for value in target_actual_diameters)
@@ -524,6 +574,9 @@ try:
             "parameter_diameter": {"expected": float(expected_feature["diameter"]), "actual": actual_snapshot["diameter"], "passed": actual_snapshot["diameter"] is not None and abs(actual_snapshot["diameter"] - float(expected_feature["diameter"])) <= LINEAR_TOLERANCE_MM},
             "base_dimensions": {"expected": base_values_before, "actual": actual_snapshot["base_dimensions"], "passed": all(abs(actual_snapshot["base_dimensions"][name] - base_values_before[name]) <= LINEAR_TOLERANCE_MM for name in base_values_before)},
         }
+        if edit["parameter"] in ("center_x", "center_y"):
+            expected_coordinate = float(expected_feature["centers"][0]["x" if edit["parameter"] == "center_x" else "y"])
+            checks["parameter_" + edit["parameter"]] = {"expected": expected_coordinate, "actual": actual_snapshot[edit["parameter"]], "passed": abs(actual_snapshot[edit["parameter"]] - expected_coordinate) <= LINEAR_TOLERANCE_MM}
     checks.update({
         "body_tip": {"expected": bindings[source_plan["features"][-1]["id"]]["feature_object"], "actual": actual_snapshot["body_tip"], "passed": actual_snapshot["body_tip"] == bindings[source_plan["features"][-1]["id"]]["feature_object"]},
         "feature_chain_complete": {"expected": True, "actual": actual_snapshot["feature_chain_complete"], "passed": actual_snapshot["feature_chain_complete"] is True},
@@ -539,9 +592,11 @@ try:
             sketch.setDatum(parameter_indices[edit["parameter"]], FreeCAD.Units.Quantity(str(edit["old_value"]) + " mm"))
         elif edit["parameter"] == "length":
             feature.Length = float(edit["old_value"])
-        else:
+        elif edit["parameter"] == "diameter":
             for name in diameter_constraint_names:
                 sketch.setDatum(parameter_indices[name], FreeCAD.Units.Quantity(str(edit["old_value"]) + " mm"))
+        else:
+            sketch.setDatum(parameter_indices[edit["parameter"]], FreeCAD.Units.Quantity(str(edit["old_value"]) + " mm"))
         metadata.IsManagedModel = True
         metadata.ResolvedPlanJson = json.dumps(source_plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
         metadata.PlanDigest = source_plan_digest
@@ -552,12 +607,13 @@ try:
             rollback_geometry_ok = True
         else:
             rollback_diameters = [float(sketch.Geometry[int(sketch.Constraints[parameter_indices[name]].First)].Radius) * 2.0 for name in diameter_constraint_names]
-            rollback_values = {"diameter": rollback_diameters[0] if rollback_diameters else None, "width": float(base_sketch.getDatum(base_parameter_indices["width"]).Value), "height": float(base_sketch.getDatum(base_parameter_indices["height"]).Value), "length": float(base_feature.Length.Value)}
+            rollback_circle = sketch.Geometry[target_circle_index if target_circle_index is not None else int(sketch.Constraints[parameter_indices[diameter_constraint_names[0]]].First)]
+            rollback_values = {"diameter": rollback_diameters[0] if rollback_diameters else None, "center_x": float(rollback_circle.Center.x), "center_y": float(rollback_circle.Center.y), "width": float(base_sketch.getDatum(base_parameter_indices["width"]).Value), "height": float(base_sketch.getDatum(base_parameter_indices["height"]).Value), "length": float(base_feature.Length.Value)}
             rollback_signature = inspect_geometry(body.Tip.Shape)
             rollback_holes = inspect_holes(rollback_signature)
             rollback_geometry_ok = len(rollback_holes) == len(source_holes) and abs(float(rollback_signature["volume"]) - float(source_geometry_signature["volume"])) <= VOLUME_TOLERANCE_MM3 and all(abs(float(rollback_signature["bounding_box"][axis]) - float(source_geometry_signature["bounding_box"][axis])) <= LINEAR_TOLERANCE_MM for axis in ("x", "y", "z")) and all(abs(rollback_holes[index]["x"] - source_holes[index]["x"]) <= LINEAR_TOLERANCE_MM and abs(rollback_holes[index]["y"] - source_holes[index]["y"]) <= LINEAR_TOLERANCE_MM and abs(rollback_holes[index]["radius"] - source_holes[index]["radius"]) <= LINEAR_TOLERANCE_MM for index in range(len(source_holes)))
         rollback_ok = all(abs(rollback_values[name] - source_values[name]) <= LINEAR_TOLERANCE_MM for name in source_values) and rollback_geometry_ok and int(metadata.ModelRevision) == int(edit["model_revision"]) and str(metadata.PlanDigest) == source_plan_digest and json.loads(metadata.ResolvedPlanJson) == source_plan
-        _mcp_result["result"] = {"success": False, "status": "verification_failed", "code": "CAD_EDIT_VERIFICATION_FAILED", "issues": issues, "geometry_signature": geometry_signature, "verification": verification, "rollback": {"passed": rollback_ok, "parameter": edit["parameter"], "value": rollback_values[edit["parameter"]], "width": rollback_values.get("width"), "height": rollback_values.get("height"), "length": rollback_values.get("length"), "diameter": rollback_values.get("diameter"), "model_revision": int(metadata.ModelRevision), "plan_digest": str(metadata.PlanDigest)}}
+        _mcp_result["result"] = {"success": False, "status": "verification_failed", "code": "CAD_EDIT_VERIFICATION_FAILED", "issues": issues, "geometry_signature": geometry_signature, "verification": verification, "rollback": {"passed": rollback_ok, "parameter": edit["parameter"], "value": rollback_values[edit["parameter"]], "width": rollback_values.get("width"), "height": rollback_values.get("height"), "length": rollback_values.get("length"), "diameter": rollback_values.get("diameter"), "center_x": rollback_values.get("center_x"), "center_y": rollback_values.get("center_y"), "model_revision": int(metadata.ModelRevision), "plan_digest": str(metadata.PlanDigest)}}
     else:
         metadata.IsManagedModel = False
         metadata.ResolvedPlanJson = json.dumps(expected_plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -592,12 +648,14 @@ except Exception as error:
                 metadata.PlanDigest = source_plan_digest
                 metadata.ModelRevision = int(edit["model_revision"])
             doc.recompute()
-            if edit["parameter"] == "diameter":
+            if feature_type == "hole_pattern":
                 restored_diameters = [float(sketch.Geometry[int(sketch.Constraints[parameter_indices[name]].First)].Radius) * 2.0 for name in diameter_constraint_names]
+                restored_circle = sketch.Geometry[target_circle_index if target_circle_index is not None else int(sketch.Constraints[parameter_indices[diameter_constraint_names[0]]].First)]
                 restored_signature = inspect_geometry(body.Tip.Shape)
                 restored_holes = inspect_holes(restored_signature)
-                rollback_ok = len(restored_diameters) == len(diameter_constraint_names) and all(abs(value - float(edit["old_value"])) <= LINEAR_TOLERANCE_MM for value in restored_diameters) and len(restored_holes) == len(source_holes) and abs(float(restored_signature["volume"]) - float(source_geometry_signature["volume"])) <= VOLUME_TOLERANCE_MM3 and all(abs(restored_holes[index]["x"] - source_holes[index]["x"]) <= LINEAR_TOLERANCE_MM and abs(restored_holes[index]["y"] - source_holes[index]["y"]) <= LINEAR_TOLERANCE_MM and abs(restored_holes[index]["radius"] - source_holes[index]["radius"]) <= LINEAR_TOLERANCE_MM for index in range(len(source_holes)))
-                rollback = {"passed": rollback_ok, "diameter": restored_diameters[0] if restored_diameters else None}
+                restored_values = {"diameter": restored_diameters[0] if restored_diameters else None, "center_x": float(restored_circle.Center.x), "center_y": float(restored_circle.Center.y)}
+                rollback_ok = all(abs(restored_values[name] - source_values[name]) <= LINEAR_TOLERANCE_MM for name in source_values) and len(restored_diameters) == len(diameter_constraint_names) and len(restored_holes) == len(source_holes) and abs(float(restored_signature["volume"]) - float(source_geometry_signature["volume"])) <= VOLUME_TOLERANCE_MM3 and all(abs(restored_holes[index]["x"] - source_holes[index]["x"]) <= LINEAR_TOLERANCE_MM and abs(restored_holes[index]["y"] - source_holes[index]["y"]) <= LINEAR_TOLERANCE_MM and abs(restored_holes[index]["radius"] - source_holes[index]["radius"]) <= LINEAR_TOLERANCE_MM for index in range(len(source_holes)))
+                rollback = {"passed": rollback_ok, **restored_values}
             else:
                 restored_values = {"width": float(sketch.getDatum(parameter_indices["width"]).Value), "height": float(sketch.getDatum(parameter_indices["height"]).Value), "length": float(feature.Length.Value)}
                 rollback = {"passed": all(abs(restored_values[name] - source_values[name]) <= LINEAR_TOLERANCE_MM for name in source_values), **restored_values}
@@ -632,7 +690,7 @@ function resolvedPlanAsValidationInput(plan: Record<string, unknown>): Record<st
   if (!Array.isArray(copy.features)) return copy;
   copy.features = copy.features.map((feature) => {
     if (!isRecord(feature) || feature.type !== 'hole_pattern' || !Array.isArray(feature.centers)) return feature;
-    const { centers, ...rest } = feature;
+    const { centers, center_editable: _centerEditable, ...rest } = feature;
     return { ...rest, placement: { type: 'explicit', centers } };
   });
   return copy;
