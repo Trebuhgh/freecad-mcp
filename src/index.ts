@@ -8,6 +8,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 
 import { FreeCADBridge } from './freecad-bridge.js';
+import { getRegisteredTools, resolveToolMode } from './tool-registry.js';
 
 import { DOCUMENT_TOOLS, handleDocumentTool } from './tools/document.js';
 import { PRIMITIVE_TOOLS, handlePrimitiveTool } from './tools/primitives.js';
@@ -24,28 +25,15 @@ import { BIM_TOOLS, handleBimTool } from './tools/bim.js';
 import { FEM_TOOLS, handleFemTool } from './tools/fem.js';
 import { SURFACE_TOOLS, handleSurfaceTool } from './tools/surface.js';
 import { ASSEMBLY_TOOLS, handleAssemblyTool } from './tools/assembly.js';
+import { HIGH_LEVEL_CAD_TOOLS, handleHighLevelCadTool } from './tools/high-level-cad.js';
 
 const FREECAD_CMD = process.env.FREECAD_CMD || '/Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd';
-
-const ALL_TOOLS = [
-  ...DOCUMENT_TOOLS,
-  ...PRIMITIVE_TOOLS,
-  ...OPERATION_TOOLS,
-  ...SKETCHER_TOOLS,
-  ...PART_DESIGN_TOOLS,
-  ...IMPORT_EXPORT_TOOLS,
-  ...DRAFT_TOOLS,
-  ...MESH_TOOLS,
-  ...TECHDRAW_TOOLS,
-  ...ADVANCED_OPERATION_TOOLS,
-  ...SPREADSHEET_TOOLS,
-  ...BIM_TOOLS,
-  ...FEM_TOOLS,
-  ...SURFACE_TOOLS,
-  ...ASSEMBLY_TOOLS,
-];
+const TOOL_MODE = resolveToolMode(process.env.FREECAD_MCP_TOOL_MODE);
+const REGISTERED_TOOLS = getRegisteredTools(TOOL_MODE);
+const REGISTERED_TOOL_NAMES = new Set(REGISTERED_TOOLS.map((tool) => tool.name));
 
 const TOOL_HANDLERS: Record<string, string> = {};
+for (const tool of HIGH_LEVEL_CAD_TOOLS) TOOL_HANDLERS[tool.name] = 'high-level-cad';
 for (const tool of DOCUMENT_TOOLS) TOOL_HANDLERS[tool.name] = 'document';
 for (const tool of PRIMITIVE_TOOLS) TOOL_HANDLERS[tool.name] = 'primitives';
 for (const tool of OPERATION_TOOLS) TOOL_HANDLERS[tool.name] = 'operations';
@@ -87,7 +75,7 @@ class FreeCADMCPServer {
 
   private setupHandlers(): void {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: ALL_TOOLS,
+      tools: REGISTERED_TOOLS,
     }));
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -95,7 +83,7 @@ class FreeCADMCPServer {
       const safeArgs = (args || {}) as Record<string, unknown>;
       const module = TOOL_HANDLERS[name];
 
-      if (!module) {
+      if (!module || !REGISTERED_TOOL_NAMES.has(name)) {
         return {
           content: [{ type: 'text', text: `Unknown tool: ${name}` }],
           isError: true,
@@ -104,6 +92,8 @@ class FreeCADMCPServer {
 
       try {
         switch (module) {
+          case 'high-level-cad':
+            return await handleHighLevelCadTool(name, safeArgs, this.bridge);
           case 'document':
             return await handleDocumentTool(name, safeArgs, this.bridge);
           case 'primitives':
@@ -164,8 +154,10 @@ class FreeCADMCPServer {
   async run(): Promise<void> {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
+    console.error(`Tool mode: ${TOOL_MODE}`);
+    console.error(`Registered tools: ${REGISTERED_TOOLS.length}`);
     console.error(
-      `FreeCAD MCP Server v2.0.0 running (cmd: ${FREECAD_CMD}, tools: ${ALL_TOOLS.length})`
+      `FreeCAD MCP Server v2.0.0 running (cmd: ${FREECAD_CMD})`
     );
   }
 }
