@@ -504,6 +504,42 @@ test('profile hole SOLL/IST verification independently rejects a filled actual h
   assert.deepEqual({ expected: issue.expected, actual: issue.actual }, { expected: 1, actual: 0 });
 });
 
+test('profile_pad executes a normalized rectangular grid as verified through holes', async () => {
+  const planned = {
+    shape: 'profile', profile: lProfile, thickness: 10, unit: 'mm',
+    holes: { diameter: 6, grid: [2, 2], start: [20, 20], spacing: [30, 30] },
+  };
+  const expectedCenters = [{ x: 20, y: 20 }, { x: 50, y: 20 }, { x: 20, y: 50 }, { x: 50, y: 50 }];
+  const { bridge, validation } = await validateAndCapture(planned, 'ProfileGridHoles');
+  assert.deepEqual(validation.resolved_plan.features[1].centers, expectedCenters);
+  assert.doesNotMatch(bridge.commands[0], /rectangular_grid|"grid"|"start"|"spacing"|"placement"/);
+
+  const execution = executeFreeCad(bridge.commands[0]);
+  assert.equal(execution.ok, true, execution.traceback);
+  assert.equal(execution.result.success, true, JSON.stringify(execution.result, null, 2));
+  assert.equal(execution.result.status, 'verified');
+  assert.equal(execution.result.features[1].object_type, 'PartDesign::Pocket');
+  assert.equal(execution.result.features[1].verified_holes, 4);
+  assert.equal(execution.result.features[1].through_all, true);
+  assert.equal(execution.result.solidCount, 1);
+  assert.deepEqual(execution.result.verification.verifiedHoleCenters, expectedCenters);
+  assert.deepEqual(execution.result.verification.recomputeErrors, []);
+  const holeVerification = execution.result.verification.features[1];
+  assert.equal(holeVerification.expected_count, 4);
+  assert.equal(holeVerification.actual_count, 4);
+  assert.ok(holeVerification.centers.every((center) => center.passed && center.radius_passed && center.axis_passed && center.through_all_passed));
+  const cylinders = execution.result.geometry_signature.surfaces.cylindrical.filter(
+    (surface) => surface.axis_material_length <= 1e-6 && Math.abs(surface.radius - 3) <= 1e-6,
+  );
+  assert.equal(cylinders.length, 4);
+  const byCoordinates = (first, second) => first[1] - second[1] || first[0] - second[0];
+  assert.deepEqual(
+    cylinders.map((surface) => surface.axis_point.slice(0, 2)).sort(byCoordinates),
+    expectedCenters.map(({ x, y }) => [x, y]).sort(byCoordinates),
+  );
+  assert.ok(Math.abs(execution.result.geometry_signature.volume - (64000 - 4 * Math.PI * 3 ** 2 * 10)) <= 1e-6);
+});
+
 for (const scenario of [
   {
     name: 'five actual holes versus six expected holes',

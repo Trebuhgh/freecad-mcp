@@ -521,6 +521,59 @@ test('profile_pad accepts explicit holes and Simple Intent resolves identically'
   assert.deepEqual(simple.resolved_plan, feature.resolved_plan);
 });
 
+function profileGridFeaturePlan(columns, rows, start, spacing, diameter = 6) {
+  return {
+    unit: 'mm', features: [
+      { id: 'base', type: 'profile_pad', points: lProfile, length: 10 },
+      {
+        id: 'holes', type: 'hole_pattern', diameter,
+        placement: { type: 'rectangular_grid', columns, rows, origin: { x: start[0], y: start[1] }, spacing_x: spacing[0], spacing_y: spacing[1] },
+        operation: 'through_all',
+      },
+    ],
+  };
+}
+
+test('profile_pad rectangular_grid normalizes row-major and Simple Intent matches Feature Plan', async () => {
+  const simplePlan = {
+    shape: 'profile', profile: lProfile, thickness: 10, unit: 'mm',
+    holes: { diameter: 6, grid: [2, 2], start: [20, 20], spacing: [30, 30] },
+  };
+  const simple = await validate(simplePlan);
+  const feature = await validate(profileGridFeaturePlan(2, 2, [20, 20], [30, 30]));
+  const expectedCenters = [{ x: 20, y: 20 }, { x: 50, y: 20 }, { x: 20, y: 50 }, { x: 50, y: 50 }];
+  assert.equal(simple.result.status, 'valid');
+  assert.equal(simple.result.can_execute, true);
+  assert.equal(simple.bridge.calls, 0);
+  assert.deepEqual(simple.result.resolved_plan.features[1], {
+    id: 'holes', type: 'hole_pattern', diameter: 6, centers: expectedCenters, operation: 'through_all', after: 'base',
+  });
+  assert.deepEqual(feature.result.resolved_plan, simple.result.resolved_plan);
+  assert.equal(JSON.stringify(simple.result.resolved_plan).includes('grid'), false);
+  assert.equal(JSON.stringify(simple.result.resolved_plan).includes('spacing'), false);
+});
+
+for (const [name, grid, start, spacing, code, expectedSource] of [
+  ['point outside polygon material', [2, 2], [20, 20], [60, 40], 'PROFILE_HOLE_OUTSIDE_MATERIAL', 'rectangular_grid'],
+  ['circle intersects outer boundary', [1, 1], [2, 20], [10, 10], 'PROFILE_HOLE_INTERSECTS_BOUNDARY', 'rectangular_grid'],
+  ['circle touches outer boundary', [1, 1], [3, 20], [10, 10], 'PROFILE_HOLE_INTERSECTS_BOUNDARY', 'rectangular_grid'],
+  ['circle intersects concave corner', [1, 1], [58, 38], [10, 10], 'PROFILE_HOLE_INTERSECTS_BOUNDARY', 'rectangular_grid'],
+  ['generated circles overlap or touch', [2, 1], [20, 20], [6, 20], 'HOLES_OVERLAP', undefined],
+]) {
+  test(`profile grid rejects ${name} before FreeCAD`, async () => {
+    const { result, bridge } = await validate({
+      shape: 'profile', profile: lProfile, thickness: 10, unit: 'mm',
+      holes: { diameter: 6, grid, start, spacing },
+    });
+    assert.equal(result.status, 'invalid');
+    assert.equal(result.can_execute, false);
+    const issue = result.issues.find((candidate) => candidate.code === code);
+    assert.ok(issue, code);
+    if (expectedSource !== undefined) assert.equal(issue.details.placementSource, expectedSource);
+    assert.equal(bridge.calls, 0);
+  });
+}
+
 for (const [name, centers, code, expectedDetails] of [
   ['center in bounding-box cutout', [[80, 60]], 'PROFILE_HOLE_OUTSIDE_MATERIAL', { holeIndex: 0, center: { x: 80, y: 60 }, radius: 3 }],
   ['circle intersects outer boundary', [[2, 20]], 'PROFILE_HOLE_INTERSECTS_BOUNDARY', { holeIndex: 0, minimumBoundaryDistance: 2, radius: 3 }],
@@ -540,12 +593,12 @@ for (const [name, centers, code, expectedDetails] of [
   });
 }
 
-test('profile_pad non-explicit placement, non-through operation, fillet, and chamfer remain explicitly unsupported', async () => {
+test('profile_pad edge-offset, non-through operation, fillet, and chamfer remain explicitly unsupported', async () => {
   const plans = [
     {
       unit: 'mm', features: [
         { type: 'profile_pad', points: lProfile, length: 10 },
-        { type: 'hole_pattern', diameter: 6, placement: { type: 'rectangular_grid', origin: { x: 20, y: 20 }, columns: 2, rows: 1, spacing_x: 20, spacing_y: 20 } },
+        { type: 'hole_pattern', diameter: 6, placement: { type: 'edge_offset', distance: 10, reference: 'center' } },
       ],
     },
     {
