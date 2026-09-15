@@ -54,6 +54,7 @@ test('fresh session blocks every mutating High-Level CAD tool', async () => {
   const mutatingTools = [
     'cad_create_part', 'cad_create_sketch', 'cad_sketch_rectangle', 'cad_pad',
     'cad_create_hole_sketch', 'cad_pocket', 'cad_fillet', 'cad_chamfer',
+    'cad_execute_plan',
   ];
   const bridge = new GateBridge();
   const gate = new CadPlanValidationGate();

@@ -88,6 +88,7 @@ test('public schemas expose neither GeometryIndex nor PointPos', () => {
       'cad_fillet',
       'cad_chamfer',
       'cad_validate_plan',
+      'cad_execute_plan',
     ],
   );
 });

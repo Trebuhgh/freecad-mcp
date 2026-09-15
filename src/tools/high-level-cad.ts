@@ -7,6 +7,7 @@ import {
   cadPlanValidationToolResult,
   validateCadPlanArgs,
 } from './cad-plan-validation.js';
+import { handleCadExecutePlan } from './cad-plan-execution.js';
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const QUALIFIED_ID = /^([A-Za-z_][A-Za-z0-9_]*)::([A-Za-z_][A-Za-z0-9_]*)$/;
@@ -14,6 +15,7 @@ const MAX_DIMENSION = 1e6;
 const MUTATING_HIGH_LEVEL_CAD_TOOLS = new Set([
   'cad_create_part', 'cad_create_sketch', 'cad_sketch_rectangle', 'cad_pad',
   'cad_create_hole_sketch', 'cad_pocket', 'cad_fillet', 'cad_chamfer',
+  'cad_execute_plan',
 ]);
 
 export const HIGH_LEVEL_CAD_TOOLS = [
@@ -636,6 +638,9 @@ export async function handleHighLevelCadTool(
   }
 
   switch (name) {
+    case 'cad_execute_plan':
+      return handleCadExecutePlan(args, bridge, validationGate);
+
     case 'cad_validate_plan': {
       const revision = validationGate.beginValidation();
       await Promise.resolve();

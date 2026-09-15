@@ -35,6 +35,7 @@ export class CadPlanValidationGate {
   private revision = 0;
   private currentResult?: CadPlanValidationResult;
   private currentResolvedPlan?: Record<string, unknown>;
+  private executingRevision?: number;
 
   get state(): CadPlanState {
     return this.currentState;
@@ -48,12 +49,34 @@ export class CadPlanValidationGate {
     return this.currentResolvedPlan;
   }
 
+  get planRevision(): number | undefined {
+    return this.currentState === 'validated' ? this.revision : undefined;
+  }
+
   beginValidation(): number {
+    if (this.executingRevision !== undefined) {
+      throw new Error('CAD_PLAN_EXECUTION_IN_PROGRESS: validation cannot replace a plan during execution');
+    }
     this.revision += 1;
     this.currentState = 'blocked';
     this.currentResult = undefined;
     this.currentResolvedPlan = undefined;
     return this.revision;
+  }
+
+  beginExecution(): { revision: number; resolvedPlan: Record<string, unknown> } | undefined {
+    if (this.currentState !== 'validated' || this.currentResolvedPlan === undefined || this.executingRevision !== undefined) {
+      return undefined;
+    }
+    this.executingRevision = this.revision;
+    return {
+      revision: this.revision,
+      resolvedPlan: JSON.parse(JSON.stringify(this.currentResolvedPlan)) as Record<string, unknown>,
+    };
+  }
+
+  endExecution(revision: number): void {
+    if (this.executingRevision === revision) this.executingRevision = undefined;
   }
 
   completeValidation(revision: number, result: CadPlanValidationResult): void {
@@ -125,6 +148,17 @@ export const CAD_PLAN_TOOLS = [{
     additionalProperties: false,
     required: ['plan'],
   },
+}, {
+  name: 'cad_execute_plan',
+  description: 'Execute exactly the resolved plan stored by the latest successful cad_validate_plan call. Accepts no dimensions, positions, or other geometric overrides.',
+  inputSchema: {
+    type: 'object' as const,
+    properties: {
+      documentName: { type: 'string', description: 'Optional non-geometric FreeCAD document name.' },
+    },
+    additionalProperties: false,
+    required: [],
+  },
 }];
 
 const SUPPORTED_EDGE_SELECTORS = new Set([
@@ -164,8 +198,8 @@ function validateEdges(value: unknown, path: string, issues: InternalIssue[]): v
     addMissing(issues, path, 'Edge selection');
   } else if (typeof value === 'string' && !SUPPORTED_EDGE_SELECTORS.has(value)) {
     issues.push({ kind: 'unsupported', code: 'UNSUPPORTED_EDGE_SELECTOR', path, message: `Edge selector "${value}" is not supported.` });
-  } else if (typeof value !== 'string' && !isRecord(value)) {
-    issues.push({ kind: 'invalid', code: 'INVALID_EDGE_SELECTION', path, message: 'Edge selection must be a semantic selector or geometric query.' });
+  } else if (typeof value !== 'string') {
+    issues.push({ kind: 'unsupported', code: 'UNSUPPORTED_EDGE_SELECTION', path, message: 'Plan execution currently supports semantic edge selector strings only.' });
   }
 }
 
