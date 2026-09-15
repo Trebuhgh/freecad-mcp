@@ -94,14 +94,16 @@ export class CadPlanValidationGate {
 
 export const CAD_PLAN_TOOLS = [{
   name: 'cad_validate_plan',
-  description: 'Mandatory, non-mutating gate before CAD construction. hole_pattern placement supports edge_offset, explicit, and rectangular_grid. edge_offset.reference supports center, boundary, or null. Use null when wording such as "10 mm from the outer edges" does not explicitly identify center versus hole boundary; this tool never interprets that ambiguity.',
+  description: 'Mandatory non-mutating validation gate. PREFERRED INPUT: Simple Intent Plan. Plate: {shape:"plate",size:[100,60,10],unit:"mm"}. Explicit holes: holes:{diameter:6,centers:[[10,10],[50,30]]}. Grid: holes:{diameter:6,grid:[3,2],start:[20,15],spacing:[30,20]}. Ambiguous edge offset: holes:{diameter:8,edge_offset:10,reference:null}. Optional finishing: fillet:{radius:5,edges:"all_vertical"}, chamfer:{size:0.5,edges:"all_top_inner"}. Feature and legacy plans remain supported. Never infer center versus boundary.',
   inputSchema: {
     type: 'object' as const,
     properties: {
       plan: {
         type: 'object',
-        description: 'Either an ordered feature plan with unit + features, or the backward-compatible legacy rectangular_plate plan with base + optional holes/fillet/chamfer. Geometrically relevant values have no implicit defaults.',
+        description: 'Prefer the compact Simple Intent form with shape + size and optional holes/fillet/chamfer. Ordered feature plans and backward-compatible legacy rectangular_plate plans remain supported. Geometrically relevant values have no implicit defaults.',
         properties: {
+          shape: { type: ['string', 'null'], enum: ['plate', null], description: 'Simple Intent shape; currently plate.' },
+          size: { type: ['array', 'null'], minItems: 3, maxItems: 3, items: { type: 'number' }, description: 'Simple plate [width,height,thickness].' },
           unit: { type: ['string', 'null'], enum: ['mm', null], description: 'Unit for a feature plan; currently only mm.' },
           features: {
             type: ['array', 'null'],
@@ -153,6 +155,12 @@ export const CAD_PLAN_TOOLS = [{
             properties: {
               count: { type: ['integer', 'null'] },
               diameter: { type: ['number', 'null'] },
+              grid: { type: ['array', 'null'], minItems: 2, maxItems: 2, items: { type: 'integer' }, description: 'Simple grid [columns,rows].' },
+              start: { type: ['array', 'null'], minItems: 2, maxItems: 2, items: { type: 'number' }, description: 'Simple grid origin [x,y].' },
+              spacing: { type: ['array', 'null'], minItems: 2, maxItems: 2, items: { type: 'number' }, description: 'Simple grid spacing [x,y].' },
+              centers: { type: ['array', 'null'], minItems: 1, items: { type: 'array', minItems: 2, maxItems: 2, items: { type: 'number' } }, description: 'Simple explicit centers as [[x,y],...].' },
+              edge_offset: { type: ['number', 'null'], description: 'Simple four-corner edge offset.' },
+              reference: { type: ['string', 'null'], enum: ['center', 'boundary', null] },
               placement: {
                 type: ['object', 'null'],
                 description: 'Required hole placement: edge_offset, explicit centers, or rectangular_grid.',
@@ -403,14 +411,87 @@ function validateLegacyCadPlan(value: unknown): CadPlanValidationResult {
 const FEATURE_ID = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 interface NormalizedFeaturePlan {
-  source: 'legacy' | 'feature';
+  source: 'legacy' | 'feature' | 'simple';
   unit: unknown;
   features: Record<string, unknown>[];
   paths: string[];
   issues: InternalIssue[];
 }
 
+function simpleTuple(value: unknown, path: string, positive: boolean, integer: boolean, issues: InternalIssue[]): number[] | undefined {
+  if (value === undefined || value === null) {
+    addMissing(issues, path, path);
+    return undefined;
+  }
+  if (!Array.isArray(value) || value.length !== 2 || value.some((item) => typeof item !== 'number' || !Number.isFinite(item) || (positive && item <= 0) || (integer && !Number.isInteger(item)))) {
+    issues.push({ kind: 'invalid', code: 'INVALID_SIMPLE_ARRAY', path, message: `${path} must contain exactly two ${positive ? 'positive ' : ''}${integer ? 'integer ' : ''}finite numbers.` });
+    return undefined;
+  }
+  return value as number[];
+}
+
+function normalizeSimplePlan(value: Record<string, unknown>): NormalizedFeaturePlan {
+  const issues: InternalIssue[] = [];
+  for (const key of Object.keys(value)) {
+    if (!['shape', 'size', 'unit', 'holes', 'fillet', 'chamfer'].includes(key)) issues.push({ kind: 'invalid', code: 'UNKNOWN_SIMPLE_FIELD', path: key, message: `Unknown Simple Intent field "${key}".` });
+  }
+  if (value.shape === undefined || value.shape === null) addMissing(issues, 'shape', 'shape');
+  else if (value.shape !== 'plate') issues.push({ kind: 'unsupported', code: 'UNSUPPORTED_SHAPE', path: 'shape', message: `Shape "${String(value.shape)}" is not supported.` });
+  let size: number[] | undefined;
+  if (value.size === undefined || value.size === null) addMissing(issues, 'size', 'Plate size');
+  else if (!Array.isArray(value.size) || value.size.length !== 3 || value.size.some((item) => typeof item !== 'number' || !Number.isFinite(item) || item <= 0)) issues.push({ kind: 'invalid', code: 'INVALID_PLATE_SIZE', path: 'size', message: 'size must contain exactly three positive finite values [width,height,thickness].' });
+  else size = value.size as number[];
+
+  const features: Record<string, unknown>[] = [{ type: 'rectangular_pad', width: size?.[0], height: size?.[1], length: size?.[2] }];
+  const paths = ['shape'];
+  if (value.holes !== undefined && value.holes !== null) {
+    if (!isRecord(value.holes)) issues.push({ kind: 'invalid', code: 'INVALID_HOLES', path: 'holes', message: 'holes must be an object.' });
+    else {
+      const holes = value.holes;
+      for (const key of Object.keys(holes)) {
+        if (!['diameter', 'grid', 'start', 'spacing', 'centers', 'edge_offset', 'reference'].includes(key)) issues.push({ kind: 'invalid', code: 'UNKNOWN_SIMPLE_FIELD', path: `holes.${key}`, message: `Unknown Simple Intent hole field "${key}".` });
+      }
+      const placementKeys = ['grid', 'centers', 'edge_offset'].filter((key) => Object.hasOwn(holes, key) && holes[key] !== undefined);
+      if (placementKeys.length > 1) issues.push({ kind: 'invalid', code: 'CONFLICTING_HOLE_PLACEMENT', path: 'holes', message: `Specify exactly one hole placement form, not ${placementKeys.join(' + ')}.` });
+      let placement: Record<string, unknown> | undefined;
+      if (placementKeys.length === 0) addMissing(issues, 'holes', 'One of holes.grid, holes.centers, or holes.edge_offset');
+      else if (placementKeys.length === 1 && placementKeys[0] === 'grid') {
+        const grid = simpleTuple(holes.grid, 'holes.grid', true, true, issues);
+        const start = simpleTuple(holes.start, 'holes.start', false, false, issues);
+        const spacing = simpleTuple(holes.spacing, 'holes.spacing', true, false, issues);
+        if (grid !== undefined && start !== undefined && spacing !== undefined) placement = { type: 'rectangular_grid', columns: grid[0], rows: grid[1], origin: { x: start[0], y: start[1] }, spacing_x: spacing[0], spacing_y: spacing[1] };
+      } else if (placementKeys.length === 1 && placementKeys[0] === 'centers') {
+        if (!Array.isArray(holes.centers) || holes.centers.length === 0) issues.push({ kind: 'invalid', code: 'EMPTY_HOLE_CENTERS', path: 'holes.centers', message: 'centers must be a non-empty array.' });
+        else {
+          const centers: Point2D[] = [];
+          holes.centers.forEach((center, index) => {
+            if (!Array.isArray(center) || center.length !== 2 || center.some((item) => typeof item !== 'number' || !Number.isFinite(item))) issues.push({ kind: 'invalid', code: 'INVALID_HOLE_CENTER', path: `holes.centers.${index}`, message: 'Each center must be exactly [x,y] with finite coordinates.' });
+            else centers.push({ x: center[0] as number, y: center[1] as number });
+          });
+          if (centers.length === holes.centers.length) placement = { type: 'explicit', centers };
+        }
+      } else if (placementKeys.length === 1) {
+        placement = { type: 'edge_offset', distance: holes.edge_offset, reference: holes.reference };
+      }
+      features.push({ type: 'hole_pattern', diameter: holes.diameter, placement });
+      paths.push('holes');
+    }
+  }
+  for (const [operation, allowed] of [['fillet', ['radius', 'edges']], ['chamfer', ['size', 'edges']]] as const) {
+    const candidate = value[operation];
+    if (candidate === undefined || candidate === null) continue;
+    if (!isRecord(candidate)) issues.push({ kind: 'invalid', code: `INVALID_${operation.toUpperCase()}`, path: operation, message: `${operation} must be an object.` });
+    else {
+      for (const key of Object.keys(candidate)) if (!(allowed as readonly string[]).includes(key)) issues.push({ kind: 'invalid', code: 'UNKNOWN_SIMPLE_FIELD', path: `${operation}.${key}`, message: `Unknown ${operation} field "${key}".` });
+      features.push({ type: operation, ...candidate });
+      paths.push(operation);
+    }
+  }
+  return { source: 'simple', unit: value.unit, features, paths, issues };
+}
+
 function normalizeToFeaturePlan(value: Record<string, unknown>): NormalizedFeaturePlan {
+  if (Object.hasOwn(value, 'shape') || Object.hasOwn(value, 'size')) return normalizeSimplePlan(value);
   const issues: InternalIssue[] = [];
   if (Object.hasOwn(value, 'features') || Object.hasOwn(value, 'unit')) {
     for (const key of Object.keys(value)) {
@@ -459,6 +540,10 @@ function normalizeToFeaturePlan(value: Record<string, unknown>): NormalizedFeatu
 
 function translateIssuePath(path: string, normalized: NormalizedFeaturePlan): string {
   if (normalized.source === 'legacy') return path;
+  if (normalized.source === 'simple') {
+    if (path === 'base.unit') return 'unit';
+    if (path === 'base.width' || path === 'base.height' || path === 'base.thickness') return 'size';
+  }
   const mappings: Array<[string, string | undefined]> = [
     ['base', normalized.paths[normalized.features.findIndex((feature) => feature.type === 'rectangular_pad')]],
     ['holes', normalized.paths[normalized.features.findIndex((feature) => feature.type === 'hole_pattern')]],

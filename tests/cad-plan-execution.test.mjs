@@ -330,3 +330,25 @@ test('executor creates six grid holes followed by fillet and inner chamfer', asy
   assert.equal(execution.result.solidCount, 1);
   assert.equal(execution.result.valid, true);
 });
+
+test('executor consumes a full simple intent plan through the canonical resolved plan', async () => {
+  const simplePlan = {
+    shape: 'plate', size: [100, 60, 10], unit: 'mm',
+    holes: { diameter: 6, grid: [3, 2], start: [20, 15], spacing: [30, 20] },
+    fillet: { radius: 5, edges: 'all_vertical' },
+    chamfer: { size: 0.5, edges: 'all_top_inner' },
+  };
+  const { bridge, validation } = await validateAndCapture(simplePlan, 'SimpleIntentFeatures');
+  assert.deepEqual(validation.resolved_plan.features.map((feature) => feature.type), [
+    'rectangular_pad', 'hole_pattern', 'fillet', 'chamfer',
+  ]);
+  assert.doesNotMatch(bridge.commands[0], /rectangular_grid|spacing_x|spacing_y|edge_offset|"placement"/);
+  const execution = executeFreeCad(bridge.commands[0]);
+  assert.equal(execution.ok, true, execution.traceback);
+  assert.equal(execution.result.success, true);
+  assert.equal(execution.result.valid, true);
+  assert.equal(execution.result.solidCount, 1);
+  assert.deepEqual(execution.result.executed_steps, ['base', 'holes', 'fillet', 'chamfer']);
+  assert.equal(execution.result.features[1].verified_holes, 6);
+  assert.deepEqual(execution.result.verification.recomputeErrors, []);
+});

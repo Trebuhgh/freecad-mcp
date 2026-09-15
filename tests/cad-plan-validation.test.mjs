@@ -297,3 +297,88 @@ test('explicit IDs are preserved and an invented incomplete feature is never dis
   assert.ok(invented.result.issues.some((issue) => issue.path.endsWith('.size')));
   assert.ok(invented.result.issues.some((issue) => issue.path.endsWith('.edges')));
 });
+
+test('simple plate intent resolves to one canonical rectangular pad', async () => {
+  const { result, bridge } = await validate({ shape: 'plate', size: [100, 60, 10], unit: 'mm' });
+  assert.equal(result.status, 'valid');
+  assert.equal(result.can_execute, true);
+  assert.equal(bridge.calls, 0);
+  assert.deepEqual(result.resolved_plan, {
+    unit: 'mm',
+    features: [{ id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 }],
+  });
+});
+
+test('simple explicit holes resolve three centers', async () => {
+  const centers = [[10, 10], [50, 30], [85, 45]];
+  const { result } = await validate({ shape: 'plate', size: [100, 60, 10], unit: 'mm', holes: { diameter: 6, centers } });
+  assert.equal(result.status, 'valid');
+  assert.deepEqual(result.resolved_plan.features[1], {
+    id: 'holes', type: 'hole_pattern', diameter: 6,
+    centers: centers.map(([x, y]) => ({ x, y })), operation: 'through_all', after: 'base',
+  });
+});
+
+test('simple rectangular grid resolves six row-major centers', async () => {
+  const simple = { shape: 'plate', size: [100, 60, 10], unit: 'mm', holes: { diameter: 6, grid: [3, 2], start: [20, 15], spacing: [30, 20] } };
+  const feature = {
+    unit: 'mm',
+    features: [
+      { type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { type: 'hole_pattern', diameter: 6, placement: { type: 'rectangular_grid', columns: 3, rows: 2, origin: { x: 20, y: 15 }, spacing_x: 30, spacing_y: 20 } },
+    ],
+  };
+  const simpleResult = (await validate(simple)).result;
+  const featureResult = (await validate(feature)).result;
+  assert.equal(simpleResult.status, 'valid');
+  assert.deepEqual(simpleResult.resolved_plan.features[1].centers, [
+    { x: 20, y: 15 }, { x: 50, y: 15 }, { x: 80, y: 15 },
+    { x: 20, y: 35 }, { x: 50, y: 35 }, { x: 80, y: 35 },
+  ]);
+  assert.deepEqual(simpleResult.resolved_plan, featureResult.resolved_plan);
+});
+
+test('simple edge offset preserves resolved and ambiguous reference semantics', async () => {
+  const center = (await validate({ shape: 'plate', size: [100, 60, 10], unit: 'mm', holes: { diameter: 8, edge_offset: 10, reference: 'center' } })).result;
+  assert.equal(center.status, 'valid');
+  assert.deepEqual(center.resolved_plan.features[1].centers, [
+    { x: 10, y: 10 }, { x: 90, y: 10 }, { x: 10, y: 50 }, { x: 90, y: 50 },
+  ]);
+
+  const ambiguous = (await validate({ shape: 'plate', size: [100, 60, 10], unit: 'mm', holes: { diameter: 8, edge_offset: 10, reference: null } })).result;
+  assert.equal(ambiguous.status, 'ambiguous');
+  assert.equal(ambiguous.can_execute, false);
+  assert.ok(ambiguous.issues.some((issue) => issue.code === 'AMBIGUOUS_DISTANCE_REFERENCE' && issue.path === 'holes.placement.reference'));
+  assert.equal(ambiguous.clarification_visual.type, 'svg');
+  assert.deepEqual(ambiguous.issues.find((issue) => issue.code === 'AMBIGUOUS_DISTANCE_REFERENCE').options.map((option) => option.id), ['A', 'B']);
+});
+
+test('simple hole placement forms are mutually exclusive', async () => {
+  const combinations = [
+    { grid: [2, 2], start: [10, 10], spacing: [30, 20], centers: [[10, 10]] },
+    { grid: [2, 2], start: [10, 10], spacing: [30, 20], edge_offset: 10, reference: 'center' },
+    { centers: [[10, 10]], edge_offset: 10, reference: 'center' },
+  ];
+  for (const placement of combinations) {
+    const { result, bridge } = await validate({ shape: 'plate', size: [100, 60, 10], unit: 'mm', holes: { diameter: 6, ...placement } });
+    assert.equal(result.status, 'invalid');
+    assert.equal(result.can_execute, false);
+    assert.ok(result.issues.some((issue) => issue.code === 'CONFLICTING_HOLE_PLACEMENT'));
+    assert.equal(bridge.calls, 0);
+  }
+});
+
+test('simple intent rejects malformed arrays and unknown fields', async () => {
+  const candidates = [
+    { shape: 'plate', size: [100, 60], unit: 'mm' },
+    { shape: 'plate', size: [100, -60, 10], unit: 'mm' },
+    { shape: 'plate', size: [100, 60, 10], unit: 'mm', holes: { diameter: 6, grid: [3, 0], start: [20, 15], spacing: [30, 20] } },
+    { shape: 'plate', size: [100, 60, 10], unit: 'mm', holes: { diameter: 6, grid: [3, 2], start: [20], spacing: [30, 20] } },
+    { shape: 'plate', size: [100, 60, 10], unit: 'mm', invented: true },
+  ];
+  for (const candidate of candidates) {
+    const { result } = await validate(candidate);
+    assert.equal(result.status, 'invalid');
+    assert.equal(result.can_execute, false);
+  }
+});
