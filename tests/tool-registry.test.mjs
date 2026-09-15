@@ -23,6 +23,7 @@ const expectedHighLevelNames = [
   'cad_execute_plan',
   'cad_validate_edit_plan',
   'cad_execute_edit_plan',
+  'cad_list_managed_models',
 ];
 
 test('high-level is the default tool mode', () => {
@@ -30,10 +31,10 @@ test('high-level is the default tool mode', () => {
   assert.equal(resolveToolMode(''), 'high-level');
 });
 
-test('high-level mode exposes only the fourteen High-Level CAD tools', () => {
+test('high-level mode exposes only the fifteen High-Level CAD tools', () => {
   const tools = getRegisteredTools(resolveToolMode('high-level'));
   assert.deepEqual(tools.map((tool) => tool.name), expectedHighLevelNames);
-  assert.equal(tools.length, 14);
+  assert.equal(tools.length, 15);
 
   const lowLevelNames = new Set(LOW_LEVEL_TOOLS.map((tool) => tool.name));
   assert.equal(tools.some((tool) => lowLevelNames.has(tool.name)), false);
@@ -43,7 +44,7 @@ test('high-level mode exposes only the fourteen High-Level CAD tools', () => {
 test('full mode exposes High-Level and all existing Low-Level tools', () => {
   const tools = getRegisteredTools(resolveToolMode('full'));
   assert.equal(tools, FULL_TOOLS);
-  assert.equal(tools.length, 179);
+  assert.equal(tools.length, 180);
   assert.equal(LOW_LEVEL_TOOLS.length, 165);
   assert.ok(tools.some((tool) => tool.name === 'cad_create_part'));
   assert.ok(tools.some((tool) => tool.name === 'freecad_new_document'));

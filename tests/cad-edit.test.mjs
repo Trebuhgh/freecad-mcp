@@ -157,7 +157,10 @@ test('edit tool schemas expose only semantic fields and allow invalid intents to
   assert.equal(validateTool.inputSchema.properties.parameter.enum, undefined);
   assert.equal(validateTool.inputSchema.properties.new_value.exclusiveMinimum, undefined);
   assert.deepEqual(executeTool.inputSchema.properties, {});
-  assert.doesNotMatch(JSON.stringify(validateTool.inputSchema), /constraint|sketch|feature_object|document/i);
+  assert.doesNotMatch(
+    Object.keys(validateTool.inputSchema.properties).join(','),
+    /constraint|sketch|feature_object|document/i,
+  );
 });
 
 test('a fresh edit gate blocks execution without calling FreeCAD', async () => {
@@ -185,6 +188,113 @@ _mcp_result["result"] = {
     "model_revision": int(metadata.ModelRevision), "plan_digest": str(metadata.PlanDigest), "resolved_plan": json.loads(metadata.ResolvedPlanJson),
 }`));
 }
+
+async function listManagedModels(bridge) {
+  return payload(await handleHighLevelCadTool(
+    'cad_list_managed_models', {}, bridge, new CadPlanValidationGate(), new CadEditValidationGate(),
+  ));
+}
+
+test('managed-model discovery returns an empty deterministic result without open models', async (t) => {
+  const bridge = new PersistentFreeCadBridge();
+  t.after(() => bridge.destroy());
+  const listed = await listManagedModels(bridge);
+  assert.deepEqual(listed, { models: [], issues: [] });
+});
+
+test('managed-model discovery returns actual rectangular parameters without mutating FreeCAD', async (t) => {
+  const { bridge, created } = await createManagedPlate(t, 'DiscoverOne');
+  const before = await inspectManagedModel(bridge);
+  const objectsBefore = payload(await bridge.run(`
+doc = FreeCAD.getDocument("DiscoverOne")
+_mcp_result["result"] = [obj.Name for obj in doc.Objects]`));
+  const listed = await listManagedModels(bridge);
+  assert.deepEqual(listed.issues, []);
+  assert.deepEqual(listed.models, [{
+    model_id: created.managed_model.model_id,
+    model_revision: 1,
+    document: 'DiscoverOne',
+    features: [{ id: 'base', type: 'rectangular_pad', parameters: { width: 100, height: 60, length: 10 } }],
+  }]);
+  const after = await inspectManagedModel(bridge);
+  const objectsAfter = payload(await bridge.run(`
+doc = FreeCAD.getDocument("DiscoverOne")
+_mcp_result["result"] = [obj.Name for obj in doc.Objects]`));
+  assert.deepEqual(after, before);
+  assert.deepEqual(objectsAfter, objectsBefore);
+});
+
+test('managed-model discovery returns every valid open model in deterministic document order', async (t) => {
+  const { bridge, planGate, editGate, created } = await createManagedPlate(t, 'DiscoverB');
+  const validation = await handleHighLevelCadTool('cad_validate_plan', { plan: platePlan }, bridge, planGate, editGate);
+  assert.equal(payload(validation).status, 'valid');
+  const secondResult = await handleHighLevelCadTool('cad_execute_plan', { documentName: 'DiscoverA' }, bridge, planGate, editGate);
+  const second = payload(secondResult);
+  assert.equal(second.success, true, JSON.stringify(second, null, 2));
+  const listed = await listManagedModels(bridge);
+  assert.deepEqual(listed.issues, []);
+  assert.deepEqual(listed.models.map((model) => model.document), ['DiscoverA', 'DiscoverB']);
+  assert.deepEqual(new Set(listed.models.map((model) => model.model_id)), new Set([
+    created.managed_model.model_id, second.managed_model.model_id,
+  ]));
+  assert.ok(listed.models.every((model) => model.features[0].parameters.width === 100));
+});
+
+test('managed-model discovery excludes invalid metadata and reports structured issues', async (t) => {
+  const { bridge } = await createManagedPlate(t, 'DiscoverCorrupt');
+  const originals = payload(await bridge.run(`
+doc = FreeCAD.getDocument("DiscoverCorrupt")
+metadata = doc.getObject("ManagedModelMetadata")
+_mcp_result["result"] = {"plan": str(metadata.ResolvedPlanJson), "digest": str(metadata.PlanDigest), "bindings": str(metadata.FeatureBindingsJson)}`));
+
+  const scenarios = [
+    {
+      code: 'MODEL_NOT_MANAGED',
+      corrupt: 'metadata.IsManagedModel = False',
+      restore: 'metadata.IsManagedModel = True',
+    },
+    {
+      code: 'PLAN_DIGEST_MISMATCH',
+      corrupt: 'metadata.PlanDigest = "sha256:" + "0" * 64',
+      restore: `metadata.PlanDigest = ${JSON.stringify(originals.digest)}`,
+    },
+    {
+      code: 'RESOLVED_PLAN_INVALID',
+      corrupt: 'metadata.ResolvedPlanJson = "{"',
+      restore: `metadata.ResolvedPlanJson = ${JSON.stringify(originals.plan)}`,
+    },
+    {
+      code: 'BOUND_OBJECT_NOT_FOUND',
+      corrupt: 'bindings = json.loads(metadata.FeatureBindingsJson)\nbindings["base"]["feature_object"] = "MissingFeature"\nmetadata.FeatureBindingsJson = json.dumps(bindings)',
+      restore: `metadata.FeatureBindingsJson = ${JSON.stringify(originals.bindings)}`,
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await bridge.run(`
+doc = FreeCAD.getDocument("DiscoverCorrupt")
+metadata = doc.getObject("ManagedModelMetadata")
+${scenario.corrupt}
+_mcp_result["result"] = {"changed": True}`);
+    const listed = await listManagedModels(bridge);
+    assert.deepEqual(listed.models, []);
+    assert.equal(listed.issues.length, 1);
+    assert.deepEqual(
+      { document: listed.issues[0].document, code: listed.issues[0].code },
+      { document: 'DiscoverCorrupt', code: scenario.code },
+    );
+    await bridge.run(`
+doc = FreeCAD.getDocument("DiscoverCorrupt")
+metadata = doc.getObject("ManagedModelMetadata")
+${scenario.restore}
+_mcp_result["result"] = {"restored": True}`);
+  }
+
+  const restored = await listManagedModels(bridge);
+  assert.equal(restored.models.length, 1);
+  assert.deepEqual(restored.issues, []);
+  assert.deepEqual(restored.models[0].features[0].parameters, { width: 100, height: 60, length: 10 });
+});
 
 test('V1 validates and executes base.width with independent verification and persistent save/reload', async (t) => {
   const { bridge, planGate, editGate, created } = await createManagedPlate(t, 'EditSuccess');

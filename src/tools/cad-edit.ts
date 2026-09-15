@@ -93,7 +93,7 @@ const editPlanProperties = {
   model_id: { type: 'string', description: 'Persistent managed-model UUID returned by cad_execute_plan.' },
   model_revision: { type: 'integer', description: 'Exact optimistic-concurrency revision currently stored by the managed model.' },
   target_feature_id: { type: 'string', description: 'Semantic feature ID from the resolved plan, for V1: base.' },
-  parameter: { type: 'string', description: 'Requested semantic parameter. Validation accepts rectangular_pad width, height, or length.' },
+  parameter: { type: 'string', description: 'rectangular_pad parameter: width is X extent of the base Sketch, height is Y extent of the base Sketch, and length is Pad.Length / plate thickness in Z.' },
   old_value: { type: 'number', description: 'Expected current parameter value in mm.' },
   new_value: { type: 'number', description: 'Requested new parameter value in mm; validation requires a positive finite value.' },
   unit: { type: 'string', description: 'Requested unit. Validation currently accepts only millimetres.' },
@@ -101,7 +101,7 @@ const editPlanProperties = {
 
 export const CAD_EDIT_TOOLS = [{
   name: 'cad_validate_edit_plan',
-  description: 'Non-mutating validation gate for one semantic edit of an existing managed model. Supports rectangular_pad width, height, or length. Never provide FreeCAD object names or constraint indices.',
+  description: 'Non-mutating validation gate for one semantic rectangular_pad edit. width means X extent, height means Y extent, and length means Pad.Length / plate thickness in Z. Never provide FreeCAD object names or constraint indices.',
   inputSchema: {
     type: 'object' as const,
     properties: editPlanProperties,
