@@ -61,18 +61,21 @@ def attach_xy(sketch, body):
         raise RuntimeError("SKETCH_ATTACHMENT_UNSUPPORTED")
     sketch.MapMode = "FlatFace"
 
-def semantic_face_frame(face, shape):
+def shape_bounds(shape):
     bounds = shape.BoundBox
+    return {"min_x": float(bounds.XMin), "max_x": float(bounds.XMax), "min_y": float(bounds.YMin), "max_y": float(bounds.YMax), "min_z": float(bounds.ZMin), "max_z": float(bounds.ZMax)}
+
+def semantic_face_frame(face, bounds):
     if face == "top":
-        origin, columns, reversed_direction = (bounds.XMin, bounds.YMin, bounds.ZMax), ((1, 0, 0), (0, 1, 0), (0, 0, 1)), False
+        origin, columns, reversed_direction = (bounds["min_x"], bounds["min_y"], bounds["max_z"]), ((1, 0, 0), (0, 1, 0), (0, 0, 1)), False
     elif face == "front":
-        origin, columns, reversed_direction = (bounds.XMin, bounds.YMin, bounds.ZMin), ((1, 0, 0), (0, 0, 1), (0, -1, 0)), False
+        origin, columns, reversed_direction = (bounds["min_x"], bounds["min_y"], bounds["min_z"]), ((1, 0, 0), (0, 0, 1), (0, -1, 0)), False
     elif face == "back":
-        origin, columns, reversed_direction = (bounds.XMin, bounds.YMax, bounds.ZMin), ((1, 0, 0), (0, 0, 1), (0, -1, 0)), True
+        origin, columns, reversed_direction = (bounds["min_x"], bounds["max_y"], bounds["min_z"]), ((1, 0, 0), (0, 0, 1), (0, -1, 0)), True
     elif face == "left":
-        origin, columns, reversed_direction = (bounds.XMin, bounds.YMin, bounds.ZMin), ((0, 1, 0), (0, 0, 1), (1, 0, 0)), True
+        origin, columns, reversed_direction = (bounds["min_x"], bounds["min_y"], bounds["min_z"]), ((0, 1, 0), (0, 0, 1), (1, 0, 0)), True
     elif face == "right":
-        origin, columns, reversed_direction = (bounds.XMax, bounds.YMin, bounds.ZMin), ((0, 1, 0), (0, 0, 1), (1, 0, 0)), False
+        origin, columns, reversed_direction = (bounds["max_x"], bounds["min_y"], bounds["min_z"]), ((0, 1, 0), (0, 0, 1), (1, 0, 0)), False
     else:
         raise RuntimeError("UNSUPPORTED_SEMANTIC_FACE: " + str(face))
     matrix = FreeCAD.Matrix()
@@ -140,6 +143,9 @@ def pocket_box_shape(box):
         float(box["max_z"]) - float(box["min_z"]),
         FreeCAD.Vector(float(box["min_x"]), float(box["min_y"]), float(box["min_z"])),
     )
+
+def boxes_match(first, second):
+    return all(abs(float(first[key]) - float(second[key])) <= LINEAR_TOLERANCE_MM for key in ("min_x", "max_x", "min_y", "max_y", "min_z", "max_z"))
 
 def union_box_volume(boxes):
     if not boxes:
@@ -288,6 +294,7 @@ try:
     executed_steps = []
     feature_results = []
     feature_bindings = {}
+    feature_frame_bounds = {}
     expected_holes = []
     failed_step = "create_part"
     doc = FreeCAD.newDocument(document_name)
@@ -330,6 +337,7 @@ try:
             check_object(pad, "PAD_RECOMPUTE_FAILED")
             if body.Tip != pad or pad.Shape.isNull() or not pad.Shape.isValid() or len(pad.Shape.Solids) != 1:
                 raise RuntimeError("PAD_POSTCONDITION_FAILED")
+            feature_frame_bounds[feature_id] = shape_bounds(pad.Shape)
             feature_bindings[feature_id] = {
                 "type": feature_type,
                 "feature_object": pad.Name,
@@ -404,11 +412,15 @@ try:
             feature_bindings[feature_id] = {"type": feature_type, "feature_object": pad.Name, "feature_type_id": pad.TypeId, "sketch_object": sketch.Name, "parameters": {"length": {"kind": "feature_property", "object": pad.Name, "property": "Length", "unit": "mm"}}}
             feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pad.Name, "object_type": pad.TypeId, "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(sketch.DoF), "segment_count": len(sketch.Geometry), "line_segment_count": actual_line_count, "arc_segment_count": len(actual_arc_geometries), "arc_radii": [float(geometry.Radius) for geometry in actual_arc_geometries], "arc_geometry_types": [geometry.__class__.__name__ for geometry in actual_arc_geometries], "solid_valid": True})
         elif feature_type == "rectangular_pocket":
-            source_volume = float(body.Tip.Shape.Volume)
+            source_tip = body.Tip
+            if source_tip is None or source_tip.Label != feature_plan["target"] or feature_plan["target"] not in feature_frame_bounds:
+                raise RuntimeError("RECTANGULAR_POCKET_TARGET_NOT_CURRENT_TIP")
+            source_shape = source_tip.Shape.copy()
+            source_volume = float(source_tip.Shape.Volume)
             pocket_sketch = body.newObject("Sketcher::SketchObject", "PlanSketch_" + str(feature_index))
             pocket_sketch.MapMode = "Deactivated"
-            target_shape = body.Tip.Shape
-            pocket_sketch.Placement, reversed_direction = semantic_face_frame(feature_plan["face"], target_shape)
+            target_bounds = feature_frame_bounds[feature_plan["target"]]
+            pocket_sketch.Placement, reversed_direction = semantic_face_frame(feature_plan["face"], target_bounds)
             position = feature_plan["position"]
             named_constraints = add_constrained_rectangle(pocket_sketch, float(position["x"]), float(position["y"]), float(feature_plan["width"]), float(feature_plan["height"]))
             solve_result = pocket_sketch.solve()
@@ -426,19 +438,29 @@ try:
             check_object(pocket, "RECTANGULAR_POCKET_RECOMPUTE_FAILED")
             if body.Tip != pocket or pocket.Shape.isNull() or not pocket.Shape.isValid() or len(pocket.Shape.Solids) != 1 or float(pocket.Shape.Volume) >= source_volume - VOLUME_TOLERANCE_MM3:
                 raise RuntimeError("RECTANGULAR_POCKET_POSTCONDITION_FAILED")
+            removed_shape = source_shape.cut(pocket.Shape)
+            if removed_shape.isNull() or not removed_shape.isValid() or float(removed_shape.Volume) <= VOLUME_TOLERANCE_MM3:
+                raise RuntimeError("RECTANGULAR_POCKET_DELTA_GEOMETRY_INVALID")
+            actual_delta_box = shape_bounds(removed_shape)
+            if not boxes_match(actual_delta_box, feature_plan["box"]):
+                raise RuntimeError("RECTANGULAR_POCKET_TARGET_LOCAL_BOX_MISMATCH")
+            feature_frame_bounds[feature_id] = shape_bounds(pocket.Shape)
             parameter_bindings = {name: {"kind": "sketch_constraint", "object": pocket_sketch.Name, "constraint_name": name, "unit": "mm"} for name in ("width", "height", "position_x", "position_y")}
             parameter_bindings["depth"] = {"kind": "feature_property", "object": pocket.Name, "property": "Length", "unit": "mm"}
             feature_bindings[feature_id] = {"type": feature_type, "feature_object": pocket.Name, "feature_type_id": pocket.TypeId, "sketch_object": pocket_sketch.Name, "semantic_face": feature_plan["face"], "target_feature_id": feature_plan["target"], "parameters": parameter_bindings}
-            feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pocket.Name, "object_type": pocket.TypeId, "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(pocket_sketch.DoF), "face": feature_plan["face"], "width": float(feature_plan["width"]), "height": float(feature_plan["height"]), "position": {"x": float(position["x"]), "y": float(position["y"])}, "depth": float(pocket.Length.Value), "box": feature_plan["box"], "source_volume": source_volume, "result_volume": float(pocket.Shape.Volume)})
+            feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pocket.Name, "object_type": pocket.TypeId, "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(pocket_sketch.DoF), "face": feature_plan["face"], "frame_origin": [float(pocket_sketch.Placement.Base.x), float(pocket_sketch.Placement.Base.y), float(pocket_sketch.Placement.Base.z)], "width": float(feature_plan["width"]), "height": float(feature_plan["height"]), "position": {"x": float(position["x"]), "y": float(position["y"])}, "depth": float(pocket.Length.Value), "box": feature_plan["box"], "actual_delta_box": actual_delta_box, "source_volume": source_volume, "result_volume": float(pocket.Shape.Volume)})
         elif feature_type == "rectangular_addition":
             source_tip = body.Tip
             if source_tip is None or source_tip.Label != feature_plan["target"]:
                 raise RuntimeError("RECTANGULAR_ADDITION_TARGET_NOT_CURRENT_TIP")
+            if feature_plan["target"] not in feature_frame_bounds:
+                raise RuntimeError("RECTANGULAR_ADDITION_TARGET_FRAME_NOT_FOUND")
+            source_shape = source_tip.Shape.copy()
             source_volume = float(source_tip.Shape.Volume)
             source_body_count = len([item for item in doc.Objects if item.TypeId == "PartDesign::Body"])
             addition_sketch = body.newObject("Sketcher::SketchObject", "PlanSketch_" + str(feature_index))
             addition_sketch.MapMode = "Deactivated"
-            addition_sketch.Placement, reversed_direction = semantic_face_frame(feature_plan["face"], source_tip.Shape)
+            addition_sketch.Placement, reversed_direction = semantic_face_frame(feature_plan["face"], feature_frame_bounds[feature_plan["target"]])
             position = feature_plan["position"]
             add_constrained_rectangle(addition_sketch, float(position["x"]), float(position["y"]), float(feature_plan["width"]), float(feature_plan["height"]))
             solve_result = addition_sketch.solve()
@@ -464,10 +486,17 @@ try:
             actual_added_volume = float(addition.Shape.Volume) - source_volume
             if body.Tip != addition or addition.Shape.isNull() or not addition.Shape.isValid() or len(addition.Shape.Solids) != 1 or actual_added_volume <= VOLUME_TOLERANCE_MM3 or abs(actual_added_volume - expected_added_volume) > VOLUME_TOLERANCE_MM3 or len([item for item in doc.Objects if item.TypeId == "PartDesign::Body"]) != source_body_count:
                 raise RuntimeError("RECTANGULAR_ADDITION_POSTCONDITION_FAILED")
+            added_shape = addition.Shape.cut(source_shape)
+            if added_shape.isNull() or not added_shape.isValid() or abs(float(added_shape.Volume) - expected_added_volume) > VOLUME_TOLERANCE_MM3:
+                raise RuntimeError("RECTANGULAR_ADDITION_DELTA_GEOMETRY_INVALID")
+            feature_frame_bounds[feature_id] = shape_bounds(added_shape)
+            actual_delta_box = feature_frame_bounds[feature_id]
+            if not boxes_match(actual_delta_box, feature_plan["box"]):
+                raise RuntimeError("RECTANGULAR_ADDITION_TARGET_LOCAL_BOX_MISMATCH")
             parameter_bindings = {name: {"kind": "sketch_constraint", "object": addition_sketch.Name, "constraint_name": name, "unit": "mm"} for name in ("width", "height", "position_x", "position_y")}
             parameter_bindings["length"] = {"kind": "feature_property", "object": addition.Name, "property": "Length", "unit": "mm"}
             feature_bindings[feature_id] = {"type": feature_type, "feature_object": addition.Name, "feature_type_id": addition.TypeId, "sketch_object": addition_sketch.Name, "semantic_face": feature_plan["face"], "target_feature_id": feature_plan["target"], "parameters": parameter_bindings}
-            feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": addition.Name, "object_type": addition.TypeId, "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(addition_sketch.DoF), "face": feature_plan["face"], "width": float(feature_plan["width"]), "height": float(feature_plan["height"]), "position": {"x": float(position["x"]), "y": float(position["y"])}, "length": float(addition.Length.Value), "box": feature_plan["box"], "source_volume": source_volume, "result_volume": float(addition.Shape.Volume), "expected_added_volume": expected_added_volume, "side_mode": side_mode})
+            feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": addition.Name, "object_type": addition.TypeId, "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(addition_sketch.DoF), "face": feature_plan["face"], "frame_origin": [float(addition_sketch.Placement.Base.x), float(addition_sketch.Placement.Base.y), float(addition_sketch.Placement.Base.z)], "width": float(feature_plan["width"]), "height": float(feature_plan["height"]), "position": {"x": float(position["x"]), "y": float(position["y"])}, "length": float(addition.Length.Value), "box": feature_plan["box"], "actual_delta_box": actual_delta_box, "source_volume": source_volume, "result_volume": float(addition.Shape.Volume), "expected_added_volume": expected_added_volume, "side_mode": side_mode})
         elif feature_type == "hole_pattern":
             source_volume = float(body.Tip.Shape.Volume)
             diameter = float(feature_plan["diameter"])
@@ -703,9 +732,11 @@ try:
             entry["sketch_degrees_of_freedom"] = feature_result.get("sketch_dof")
             entry["material_removed"] = float(feature_result.get("result_volume", 0.0)) < float(feature_result.get("source_volume", 0.0)) - VOLUME_TOLERANCE_MM3
             entry["semantic_face"] = {"expected": feature_plan["face"], "actual": feature_result.get("face"), "passed": feature_result.get("face") == feature_plan["face"]}
+            delta_box_passed = isinstance(feature_result.get("actual_delta_box"), dict) and boxes_match(feature_result["actual_delta_box"], feature_plan["box"])
+            entry["resolved_box"] = {"expected": feature_plan["box"], "actual": feature_result.get("actual_delta_box"), "passed": delta_box_passed}
             entry["void_box"] = {"expected": feature_plan["box"], "actual": None if measured is None else measured["box"], "intersection_volume": None if measured is None else measured["void_intersection_volume"], "passed": void_passed}
             entry["axis_material_length"] = {"expected": None if measured is None else measured["expected_axis_material_length"], "actual": None if measured is None else measured["axis_material_length"], "passed": axis_passed}
-            entry["passed"] = entry["sketch_closed"] and entry["sketch_fully_constrained"] and entry["sketch_degrees_of_freedom"] == 0 and entry["material_removed"] and entry["semantic_face"]["passed"] and void_passed and axis_passed
+            entry["passed"] = entry["sketch_closed"] and entry["sketch_fully_constrained"] and entry["sketch_degrees_of_freedom"] == 0 and entry["material_removed"] and entry["semantic_face"]["passed"] and delta_box_passed and void_passed and axis_passed
             if not void_passed:
                 add_issue(feature_id, feature_type, "pocket_void", {"intersection_volume": 0.0, "box": feature_plan["box"]}, measured, "The final analytic BREP still contains material inside the resolved rectangular pocket volume.")
             if not axis_passed:
@@ -721,9 +752,11 @@ try:
             entry["material_added"] = actual_added_volume > VOLUME_TOLERANCE_MM3
             entry["added_volume"] = {"expected": expected_added_volume, "actual": actual_added_volume, "passed": abs(actual_added_volume - expected_added_volume) <= VOLUME_TOLERANCE_MM3}
             entry["semantic_face"] = {"expected": feature_plan["face"], "actual": feature_result.get("face"), "passed": feature_result.get("face") == feature_plan["face"]}
+            delta_box_passed = isinstance(feature_result.get("actual_delta_box"), dict) and boxes_match(feature_result["actual_delta_box"], feature_plan["box"])
+            entry["resolved_box"] = {"expected": feature_plan["box"], "actual": feature_result.get("actual_delta_box"), "passed": delta_box_passed}
             entry["one_sided"] = {"expected": True, "actual": feature_result.get("side_mode"), "passed": feature_result.get("side_mode") in ("oneside", "legacy_midplane_default")}
             entry["ordered_brep"] = rectangular_brep
-            entry["passed"] = entry["sketch_closed"] and entry["sketch_fully_constrained"] and entry["sketch_degrees_of_freedom"] == 0 and entry["material_added"] and entry["added_volume"]["passed"] and entry["semantic_face"]["passed"] and entry["one_sided"]["passed"] and rectangular_brep is not None and rectangular_brep["passed"]
+            entry["passed"] = entry["sketch_closed"] and entry["sketch_fully_constrained"] and entry["sketch_degrees_of_freedom"] == 0 and entry["material_added"] and entry["added_volume"]["passed"] and entry["semantic_face"]["passed"] and delta_box_passed and entry["one_sided"]["passed"] and rectangular_brep is not None and rectangular_brep["passed"]
             if not entry["passed"]:
                 add_issue(feature_id, feature_type, "rectangular_addition_feature", {"closed": True, "fully_constrained": True, "degrees_of_freedom": 0, "material_added": True, "added_volume": expected_added_volume, "semantic_face": feature_plan["face"], "one_sided": True, "ordered_brep": True}, entry, "The rectangular addition feature or its independent BREP postconditions were not preserved.")
         elif feature_type == "hole_pattern":

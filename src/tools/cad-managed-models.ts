@@ -32,8 +32,7 @@ def require(condition, code, message):
     if not condition:
         raise ManagedModelIssue(code, message)
 
-def semantic_face_frame(face, shape):
-    bounds = shape.BoundBox
+def semantic_face_frame(face, bounds):
     if face == "top":
         return FreeCAD.Vector(bounds.XMin, bounds.YMin, bounds.ZMax), FreeCAD.Vector(1, 0, 0), FreeCAD.Vector(0, 1, 0), False
     if face == "front":
@@ -45,6 +44,17 @@ def semantic_face_frame(face, shape):
     if face == "right":
         return FreeCAD.Vector(bounds.XMax, bounds.YMin, bounds.ZMin), FreeCAD.Vector(0, 1, 0), FreeCAD.Vector(0, 0, 1), False
     raise ManagedModelIssue("FEATURE_BINDING_INVALID", "The semantic face is unsupported.")
+
+def semantic_target_bounds(feature_plan, feature_object, bindings, doc):
+    if feature_plan.get("type") != "rectangular_addition":
+        return feature_object.Shape.BoundBox
+    predecessor_id = feature_plan.get("after")
+    predecessor_binding = bindings.get(predecessor_id, {}) if isinstance(predecessor_id, str) else {}
+    predecessor_object = doc.getObject(predecessor_binding.get("feature_object", "")) if isinstance(predecessor_binding, dict) else None
+    require(predecessor_object is not None, "FEATURE_CHAIN_MISMATCH", "The rectangular_addition predecessor needed for target-local placement is missing.")
+    added_shape = feature_object.Shape.cut(predecessor_object.Shape)
+    require(not added_shape.isNull() and added_shape.isValid() and float(added_shape.Volume) > 0.0, "FEATURE_BINDING_INVALID", "The rectangular_addition material delta needed for target-local placement is invalid.")
+    return added_shape.BoundBox
 
 for document_name in sorted(FreeCAD.listDocuments().keys()):
     doc = FreeCAD.getDocument(document_name)
@@ -80,6 +90,7 @@ for document_name in sorted(FreeCAD.listDocuments().keys()):
         require(isinstance(bindings, dict), "FEATURE_BINDINGS_INVALID", "FeatureBindingsJson must contain an object keyed by feature ID.")
 
         semantic_features = []
+        resolved_features_by_id = {feature.get("id"): feature for feature in resolved_plan["features"] if isinstance(feature, dict) and isinstance(feature.get("id"), str)}
         seen_ids = set()
         for feature_plan in resolved_plan["features"]:
             require(isinstance(feature_plan, dict), "RESOLVED_PLAN_INVALID", "A resolved feature is not an object.")
@@ -125,7 +136,8 @@ for document_name in sorted(FreeCAD.listDocuments().keys()):
                 target_object = doc.getObject(target_binding.get("feature_object", "")) if isinstance(target_binding, dict) else None
                 require(body is not None and body.TypeId == "PartDesign::Body" and feature_object in body.Group and sketch in body.Group and profile_object == sketch and target_object in body.Group, "FEATURE_CHAIN_MISMATCH", "The rectangular_pocket binding no longer matches its Body feature chain or semantic target.")
                 require(binding.get("semantic_face") == feature_plan.get("face") and binding.get("target_feature_id") == target_id, "FEATURE_BINDING_INVALID", "The rectangular_pocket semantic face or target binding differs from the resolved plan.")
-                expected_origin, expected_x, expected_y, expected_reversed = semantic_face_frame(feature_plan["face"], target_object.Shape)
+                target_plan = resolved_features_by_id.get(target_id, {})
+                expected_origin, expected_x, expected_y, expected_reversed = semantic_face_frame(feature_plan["face"], semantic_target_bounds(target_plan, target_object, bindings, doc))
                 actual_origin = sketch.Placement.multVec(FreeCAD.Vector(0, 0, 0))
                 actual_x = sketch.Placement.multVec(FreeCAD.Vector(1, 0, 0)).sub(actual_origin)
                 actual_y = sketch.Placement.multVec(FreeCAD.Vector(0, 1, 0)).sub(actual_origin)
@@ -156,7 +168,8 @@ for document_name in sorted(FreeCAD.listDocuments().keys()):
                 target_object = doc.getObject(target_binding.get("feature_object", "")) if isinstance(target_binding, dict) else None
                 require(body is not None and body.TypeId == "PartDesign::Body" and feature_object in body.Group and sketch in body.Group and profile_object == sketch and target_object in body.Group, "FEATURE_CHAIN_MISMATCH", "The rectangular_addition binding no longer matches its Body feature chain or semantic target.")
                 require(binding.get("semantic_face") == feature_plan.get("face") and binding.get("target_feature_id") == target_id, "FEATURE_BINDING_INVALID", "The rectangular_addition semantic face or target binding differs from the resolved plan.")
-                expected_origin, expected_x, expected_y, expected_reversed = semantic_face_frame(feature_plan["face"], target_object.Shape)
+                target_plan = resolved_features_by_id.get(target_id, {})
+                expected_origin, expected_x, expected_y, expected_reversed = semantic_face_frame(feature_plan["face"], semantic_target_bounds(target_plan, target_object, bindings, doc))
                 actual_origin = sketch.Placement.multVec(FreeCAD.Vector(0, 0, 0))
                 actual_x = sketch.Placement.multVec(FreeCAD.Vector(1, 0, 0)).sub(actual_origin)
                 actual_y = sketch.Placement.multVec(FreeCAD.Vector(0, 1, 0)).sub(actual_origin)

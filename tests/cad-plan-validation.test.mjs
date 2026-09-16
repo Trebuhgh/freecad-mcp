@@ -58,6 +58,15 @@ const esp32PocketPlan = {
   ],
 };
 
+const lidGuidePlan = {
+  unit: 'mm',
+  features: [
+    { id: 'lid', type: 'rectangular_pad', width: 59.95, height: 32.97, length: 2 },
+    { id: 'lid_guide_block', type: 'rectangular_addition', after: 'lid', target: 'lid', face: 'top', width: 55.35, height: 28.37, position: { x: 2.3, y: 2.3 }, length: 2 },
+    { id: 'lid_guide_cavity', type: 'rectangular_pocket', after: 'lid_guide_block', target: 'lid_guide_block', face: 'top', width: 52.35, height: 25.37, position: { x: 1.5, y: 1.5 }, depth: 2 },
+  ],
+};
+
 test('cad_validate_plan schema presents Simple Intent first and isolates compatibility formats', () => {
   const tool = CAD_PLAN_TOOLS.find((candidate) => candidate.name === 'cad_validate_plan');
   const planSchema = tool.inputSchema.properties.plan;
@@ -365,12 +374,61 @@ test('multiple rectangular additions preserve current-tip coordinates and a sing
     features: [
       { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
       { id: 'top_block', type: 'rectangular_addition', after: 'base', target: 'base', face: 'top', width: 40, height: 20, position: { x: 30, y: 20 }, length: 2 },
-      { id: 'right_block', type: 'rectangular_addition', after: 'top_block', target: 'top_block', face: 'right', width: 20, height: 5, position: { x: 20, y: 2 }, length: 3 },
+      { id: 'right_block', type: 'rectangular_addition', after: 'top_block', target: 'top_block', face: 'right', width: 20, height: 2, position: { x: 0, y: 0 }, length: 3 },
     ],
   });
   assert.equal(result.status, 'valid', JSON.stringify(result));
-  assert.deepEqual(result.resolved_plan.features[2].box, { min_x: 100, max_x: 103, min_y: 20, max_y: 40, min_z: 2, max_z: 7 });
+  assert.deepEqual(result.resolved_plan.features[2].box, { min_x: 70, max_x: 73, min_y: 20, max_y: 40, min_z: 10, max_z: 12 });
 });
+
+test('target-local lid guide coordinates resolve to a centered 1.50 mm frame', async () => {
+  const { result } = await validate(lidGuidePlan);
+  assert.equal(result.status, 'valid', JSON.stringify(result));
+  assert.deepEqual(result.resolved_plan.features[1].box, { min_x: 2.3, max_x: 57.65, min_y: 2.3, max_y: 30.67, min_z: 2, max_z: 4 });
+  assert.deepEqual(result.resolved_plan.features[2].box, { min_x: 3.8, max_x: 56.15, min_y: 3.8, max_y: 29.17, min_z: 2, max_z: 4 });
+});
+
+test('strong target-local offset maps child 3,4 to global 23,19', async () => {
+  const { result } = await validate({
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 80, length: 20 },
+      { id: 'target', type: 'rectangular_addition', after: 'base', target: 'base', face: 'top', width: 30, height: 25, position: { x: 20, y: 15 }, length: 10 },
+      { id: 'child', type: 'rectangular_addition', after: 'target', target: 'target', face: 'top', width: 10, height: 10, position: { x: 3, y: 4 }, length: 2 },
+    ],
+  });
+  assert.equal(result.status, 'valid', JSON.stringify(result));
+  assert.deepEqual(result.resolved_plan.features[2].box, { min_x: 23, max_x: 33, min_y: 19, max_y: 29, min_z: 30, max_z: 32 });
+});
+
+for (const [kind, face, expectedBox] of [
+  ['rectangular_pocket', 'top', { min_x: 23, max_x: 33, min_y: 19, max_y: 27, min_z: 28, max_z: 30 }],
+  ['rectangular_pocket', 'front', { min_x: 23, max_x: 33, min_y: 15, max_y: 17, min_z: 22, max_z: 27 }],
+  ['rectangular_pocket', 'back', { min_x: 23, max_x: 33, min_y: 43, max_y: 45, min_z: 22, max_z: 27 }],
+  ['rectangular_pocket', 'left', { min_x: 20, max_x: 22, min_y: 18, max_y: 28, min_z: 22, max_z: 27 }],
+  ['rectangular_pocket', 'right', { min_x: 58, max_x: 60, min_y: 18, max_y: 28, min_z: 22, max_z: 27 }],
+  ['rectangular_addition', 'top', { min_x: 23, max_x: 33, min_y: 19, max_y: 27, min_z: 30, max_z: 32 }],
+  ['rectangular_addition', 'front', { min_x: 23, max_x: 33, min_y: 13, max_y: 15, min_z: 22, max_z: 27 }],
+  ['rectangular_addition', 'back', { min_x: 23, max_x: 33, min_y: 45, max_y: 47, min_z: 22, max_z: 27 }],
+  ['rectangular_addition', 'left', { min_x: 18, max_x: 20, min_y: 18, max_y: 28, min_z: 22, max_z: 27 }],
+  ['rectangular_addition', 'right', { min_x: 60, max_x: 62, min_y: 18, max_y: 28, min_z: 22, max_z: 27 }],
+]) {
+  test(`${kind} uses the offset target-local ${face} frame`, async () => {
+    const distanceField = kind === 'rectangular_pocket' ? { depth: 2 } : { length: 2 };
+    const position = face === 'top' ? { x: 3, y: 4 } : { x: 3, y: 2 };
+    const dimensions = face === 'top' ? { width: 10, height: 8 } : { width: 10, height: 5 };
+    const { result } = await validate({
+      unit: 'mm',
+      features: [
+        { id: 'base', type: 'rectangular_pad', width: 100, height: 80, length: 20 },
+        { id: 'target', type: 'rectangular_addition', after: 'base', target: 'base', face: 'top', width: 40, height: 30, position: { x: 20, y: 15 }, length: 10 },
+        { id: 'child', type: kind, after: 'target', target: 'target', face, ...dimensions, position, ...distanceField },
+      ],
+    });
+    assert.equal(result.status, 'valid', JSON.stringify(result));
+    assert.deepEqual(result.resolved_plan.features[2].box, expectedBox);
+  });
+}
 
 test('rectangular_pocket rejects outside, excessive depth, missing target, and invalid ordering', async () => {
   const outside = await validate(rectangularPocketPlan('top', { position: { x: 90, y: 5 }, width: 20 }));

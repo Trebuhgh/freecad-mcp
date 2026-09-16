@@ -19,6 +19,14 @@ const esp32PocketPlan = {
     { id: 'usb_cutout', type: 'rectangular_pocket', after: 'inner_cavity', target: 'inner_cavity', face: 'front', width: 12, height: 7, position: { x: 23.975, y: 4 }, depth: 2 },
   ],
 };
+const lidGuidePlan = {
+  unit: 'mm',
+  features: [
+    { id: 'lid', type: 'rectangular_pad', width: 59.95, height: 32.97, length: 2 },
+    { id: 'lid_guide_block', type: 'rectangular_addition', after: 'lid', target: 'lid', face: 'top', width: 55.35, height: 28.37, position: { x: 2.3, y: 2.3 }, length: 2 },
+    { id: 'lid_guide_cavity', type: 'rectangular_pocket', after: 'lid_guide_block', target: 'lid_guide_block', face: 'top', width: 52.35, height: 25.37, position: { x: 1.5, y: 1.5 }, depth: 2 },
+  ],
+};
 
 function plan(reference, operations = {}) {
   return {
@@ -63,6 +71,12 @@ class CapturingBridge {
 
 function payload(result) {
   return JSON.parse(result.content[0].text);
+}
+
+function assertBoxClose(actual, expected, tolerance = 1e-6) {
+  for (const key of ['min_x', 'max_x', 'min_y', 'max_y', 'min_z', 'max_z']) {
+    assert.ok(Math.abs(actual[key] - expected[key]) <= tolerance, `${key}: expected ${expected[key]}, actual ${actual[key]}`);
+  }
 }
 
 function executeFreeCad(code, allowFailure = false) {
@@ -1036,6 +1050,107 @@ _mcp_result["result"] = _execution_result`);
   ]);
 });
 
+test('real lid guide frame uses target-local pocket coordinates and survives save/reload discovery', async () => {
+  const { bridge, validation } = await validateAndCapture(lidGuidePlan, 'LidGuideFrame');
+  const discoveryBridge = new CapturingBridge();
+  await handleHighLevelCadTool('cad_list_managed_models', {}, discoveryBridge, new CadPlanValidationGate());
+  const execution = executeFreeCad(`${bridge.commands[0]}
+import os
+import tempfile
+_execution_result = _mcp_result["result"]
+_fd, _path = tempfile.mkstemp(suffix=".FCStd")
+os.close(_fd)
+doc.saveAs(_path)
+FreeCAD.closeDocument(doc.Name)
+_reloaded = FreeCAD.openDocument(_path)
+_reloaded.recompute()
+${discoveryBridge.commands[0]}
+_execution_result["discovery"] = _mcp_result["result"]
+FreeCAD.closeDocument(_reloaded.Name)
+os.remove(_path)
+_mcp_result["result"] = _execution_result`);
+  assert.equal(execution.ok, true, execution.traceback);
+  const result = execution.result;
+  assert.equal(result.success, true, JSON.stringify(result, null, 2));
+  assert.equal(result.status, 'verified');
+  assert.equal(result.solidCount, 1);
+  assert.equal(result.geometry_signature.shape_valid, true);
+  assert.ok(Math.abs(result.geometry_signature.bounding_box.x - 59.95) <= 1e-6);
+  assert.ok(Math.abs(result.geometry_signature.bounding_box.y - 32.97) <= 1e-6);
+  assert.ok(Math.abs(result.geometry_signature.bounding_box.z - 4) <= 1e-6);
+  assert.ok(Math.abs(result.geometry_signature.volume - 4437.423) <= 1e-6);
+  assert.deepEqual(result.executed_steps, ['lid', 'lid_guide_block', 'lid_guide_cavity']);
+  assert.equal(result.verification.bodyTip, 'PlanFeature_2');
+  assert.deepEqual(result.verification.recomputeErrors, []);
+  assert.equal(result.verification.ordered_rectangular_brep.passed, true);
+  assert.ok(result.verification.ordered_rectangular_brep.missing_material_volume <= 1e-7);
+  assert.ok(result.verification.ordered_rectangular_brep.unexpected_material_volume <= 1e-7);
+  const outer = result.features[1].actual_delta_box;
+  const inner = result.features[2].actual_delta_box;
+  assertBoxClose(outer, { min_x: 2.3, max_x: 57.65, min_y: 2.3, max_y: 30.67, min_z: 2, max_z: 4 });
+  assertBoxClose(inner, { min_x: 3.8, max_x: 56.15, min_y: 3.8, max_y: 29.17, min_z: 2, max_z: 4 });
+  assert.deepEqual([
+    inner.min_x - outer.min_x,
+    outer.max_x - inner.max_x,
+    inner.min_y - outer.min_y,
+    outer.max_y - inner.max_y,
+  ].map((value) => Math.round(value * 1e6) / 1e6), [1.5, 1.5, 1.5, 1.5]);
+  assert.equal(result.features[2].frame_origin.every((value, index) => Math.abs(value - [2.3, 2.3, 4][index]) <= 1e-6), true);
+  assert.equal(result.verification.features[1].resolved_box.passed, true);
+  assert.equal(result.verification.features[2].resolved_box.passed, true);
+  assertBoxClose(inner, validation.resolved_plan.features[2].box);
+  assert.deepEqual(result.discovery.issues, []);
+  assert.deepEqual(result.discovery.models[0].features, [
+    { id: 'lid', type: 'rectangular_pad', parameters: { width: 59.95, height: 32.97, length: 2 } },
+    { id: 'lid_guide_block', type: 'rectangular_addition', parameters: { face: 'top', width: 55.35, height: 28.37, position: { x: 2.3, y: 2.3 }, length: 2, target: 'lid' } },
+    { id: 'lid_guide_cavity', type: 'rectangular_pocket', parameters: { face: 'top', width: 52.35, height: 25.37, position: { x: 1.5, y: 1.5 }, depth: 2, target: 'lid_guide_block' } },
+  ]);
+});
+
+for (const [face, expectedOrigin] of [
+  ['front', [20, 15, 20]],
+  ['back', [20, 45, 20]],
+  ['left', [20, 15, 20]],
+  ['right', [60, 15, 20]],
+]) {
+  test(`real ${face} child pocket uses its offset addition target frame`, async () => {
+    const planned = {
+      unit: 'mm',
+      features: [
+        { id: 'base', type: 'rectangular_pad', width: 100, height: 80, length: 20 },
+        { id: 'target', type: 'rectangular_addition', after: 'base', target: 'base', face: 'top', width: 40, height: 30, position: { x: 20, y: 15 }, length: 10 },
+        { id: 'child', type: 'rectangular_pocket', after: 'target', target: 'target', face, width: 10, height: 5, position: { x: 3, y: 2 }, depth: 2 },
+      ],
+    };
+    const { bridge } = await validateAndCapture(planned, `OffsetTargetPocket_${face}`);
+    const execution = executeFreeCad(bridge.commands[0]);
+    assert.equal(execution.ok, true, execution.traceback);
+    assert.equal(execution.result.success, true, JSON.stringify(execution.result, null, 2));
+    assert.deepEqual(execution.result.features[2].frame_origin, expectedOrigin);
+    assert.equal(execution.result.verification.features[2].resolved_box.passed, true);
+    assert.equal(execution.result.verification.ordered_rectangular_brep.passed, true);
+    assert.deepEqual(execution.result.verification.recomputeErrors, []);
+  });
+}
+
+test('real nested top addition maps local 3,4 on target origin 20,15 to global 23,19', async () => {
+  const planned = {
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 80, length: 20 },
+      { id: 'target', type: 'rectangular_addition', after: 'base', target: 'base', face: 'top', width: 30, height: 25, position: { x: 20, y: 15 }, length: 10 },
+      { id: 'child', type: 'rectangular_addition', after: 'target', target: 'target', face: 'top', width: 10, height: 10, position: { x: 3, y: 4 }, length: 2 },
+    ],
+  };
+  const { bridge } = await validateAndCapture(planned, 'StrongTargetLocalOffset');
+  const execution = executeFreeCad(bridge.commands[0]);
+  assert.equal(execution.ok, true, execution.traceback);
+  assert.equal(execution.result.success, true, JSON.stringify(execution.result, null, 2));
+  assert.deepEqual(execution.result.features[2].frame_origin, [20, 15, 30]);
+  assert.deepEqual(execution.result.features[2].actual_delta_box, { min_x: 23, max_x: 33, min_y: 19, max_y: 29, min_z: 30, max_z: 32 });
+  assert.equal(execution.result.verification.features[2].resolved_box.passed, true);
+});
+
 test('ordered rectangular pocket then supported addition executes in one verified feature chain', async () => {
   const planned = {
     unit: 'mm',
@@ -1067,7 +1182,7 @@ test('multiple rectangular additions execute sequentially from the current targe
     features: [
       { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
       { id: 'tower', type: 'rectangular_addition', after: 'base', target: 'base', face: 'top', width: 20, height: 20, position: { x: 20, y: 20 }, length: 2 },
-      { id: 'tower_cap', type: 'rectangular_addition', after: 'tower', target: 'tower', face: 'top', width: 10, height: 10, position: { x: 25, y: 25 }, length: 2 },
+      { id: 'tower_cap', type: 'rectangular_addition', after: 'tower', target: 'tower', face: 'top', width: 10, height: 10, position: { x: 5, y: 5 }, length: 2 },
     ],
   };
   const { bridge } = await validateAndCapture(planned, 'MultipleAdditions');
