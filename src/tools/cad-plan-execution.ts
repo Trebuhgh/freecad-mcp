@@ -343,6 +343,12 @@ try:
             if feature_plan.get("center_editable") is True and len(centers) == 1:
                 hole_parameters["center_x"] = {"kind": "sketch_constraint", "object": hole_sketch.Name, "constraint_name": center_x_constraint_names[0], "unit": "mm"}
                 hole_parameters["center_y"] = {"kind": "sketch_constraint", "object": hole_sketch.Name, "constraint_name": center_y_constraint_names[0], "unit": "mm"}
+            grid = feature_plan.get("grid")
+            if isinstance(grid, dict):
+                if int(grid.get("columns", 0)) > 1:
+                    hole_parameters["spacing_x"] = {"kind": "grid_position_constraints", "object": hole_sketch.Name, "constraint_names": center_x_constraint_names, "unit": "mm"}
+                if int(grid.get("rows", 0)) > 1:
+                    hole_parameters["spacing_y"] = {"kind": "grid_position_constraints", "object": hole_sketch.Name, "constraint_names": center_y_constraint_names, "unit": "mm"}
             feature_bindings[feature_id] = {"type": feature_type, "feature_object": pocket.Name, "feature_type_id": pocket.TypeId, "sketch_object": hole_sketch.Name, "parameters": hole_parameters}
             expected_holes.append({"id": feature_id, "diameter": diameter, "centers": centers})
             feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pocket.Name, "object_type": pocket.TypeId, "verified_holes": len(centers), "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(hole_sketch.DoF), "source_volume": source_volume, "result_volume": float(pocket.Shape.Volume), "through_all": True})

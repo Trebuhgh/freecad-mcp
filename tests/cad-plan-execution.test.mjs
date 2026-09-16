@@ -349,7 +349,8 @@ test('executor creates six grid holes followed by fillet and inner chamfer', asy
   ];
   const { bridge, validation } = await validateAndCapture(gridPlan, 'GridFeatures');
   assert.deepEqual(validation.resolved_plan.features[1].centers, expected);
-  assert.doesNotMatch(bridge.commands[0], /rectangular_grid|spacing_x|spacing_y|"origin"/);
+  assert.deepEqual(validation.resolved_plan.features[1].grid, { columns: 3, rows: 2, spacing_x: 30, spacing_y: 20, pattern_center_x: 50, pattern_center_y: 25 });
+  assert.doesNotMatch(bridge.commands[0], /rectangular_grid|"origin"|"placement"/);
   const execution = executeFreeCad(bridge.commands[0]);
   assert.equal(execution.ok, true, execution.traceback);
   assert.deepEqual(execution.result.executed_steps, ['base', 'holes', 'fillet', 'chamfer']);
@@ -376,7 +377,8 @@ test('executor consumes a full simple intent plan through the canonical resolved
   assert.deepEqual(validation.resolved_plan.features.map((feature) => feature.type), [
     'rectangular_pad', 'hole_pattern', 'fillet', 'chamfer',
   ]);
-  assert.doesNotMatch(bridge.commands[0], /rectangular_grid|spacing_x|spacing_y|edge_offset|"placement"/);
+  assert.deepEqual(validation.resolved_plan.features[1].grid, { columns: 3, rows: 2, spacing_x: 30, spacing_y: 20, pattern_center_x: 50, pattern_center_y: 25 });
+  assert.doesNotMatch(bridge.commands[0], /rectangular_grid|edge_offset|"origin"|"placement"/);
   const execution = executeFreeCad(bridge.commands[0]);
   assert.equal(execution.ok, true, execution.traceback);
   assert.equal(execution.result.success, true, JSON.stringify(execution.result, null, 2));

@@ -33,6 +33,14 @@ const positionEditPlan = {
     { id: 'sensor_holes', type: 'hole_pattern', diameter: 9, placement: { type: 'explicit', centers: [[50, 30]] }, operation: 'through_all', after: 'mounting_holes' },
   ],
 };
+const gridSpacingPlan = {
+  unit: 'mm',
+  features: [
+    { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+    { id: 'mounting_holes', type: 'hole_pattern', diameter: 9, placement: { type: 'rectangular_grid', origin: { x: 15, y: 15 }, columns: 2, rows: 2, spacing_x: 70, spacing_y: 30 }, operation: 'through_all', after: 'base' },
+    { id: 'sensor_holes', type: 'hole_pattern', diameter: 9, placement: { type: 'explicit', centers: [[60, 30]] }, operation: 'through_all', after: 'mounting_holes' },
+  ],
+};
 
 function payload(toolResult) {
   return JSON.parse(toolResult.content[0].text);
@@ -234,6 +242,19 @@ function holePositionEdit(created, modelRevision, parameter, oldValue, newValue,
     model_id: created.managed_model.model_id,
     model_revision: modelRevision,
     target_feature_id: 'sensor_holes',
+    parameter,
+    old_value: oldValue,
+    new_value: newValue,
+    unit: 'mm',
+    ...overrides,
+  };
+}
+
+function gridSpacingEdit(created, modelRevision, parameter, oldValue, newValue, overrides = {}) {
+  return {
+    model_id: created.managed_model.model_id,
+    model_revision: modelRevision,
+    target_feature_id: 'mounting_holes',
     parameter,
     old_value: oldValue,
     new_value: newValue,
@@ -1342,6 +1363,169 @@ _mcp_result["result"] = {"document": reloaded.Name, "path": path}`));
   assert.equal(execution.managed_model.model_revision, 2);
   const state = await inspectManagedHoleGroups(bridge, reload.document);
   assert.deepEqual(state.groups.sensor_holes.circles, [{ x: 60, y: 30, diameter: 9 }]);
+  await bridge.run(`
+import os
+doc = FreeCAD.getDocument(${JSON.stringify(reload.document)})
+path = ${JSON.stringify(reload.path)}
+FreeCAD.closeDocument(doc.Name)
+os.remove(path)
+  _mcp_result["result"] = True`);
+});
+
+test('rectangular grid spacing_x and spacing_y edit in-place around the invariant pattern center', async (t) => {
+  const { bridge, planGate, editGate, created } = await createManagedHoledPlate(t, 'GridSpacingEdit', gridSpacingPlan);
+  const before = await inspectManagedHoleGroups(bridge, 'GridSpacingEdit');
+  const discovery = await listManagedModels(bridge);
+  assert.deepEqual(discovery.models[0].features.filter((feature) => feature.type === 'hole_pattern'), [
+    { id: 'mounting_holes', type: 'hole_pattern', parameters: { diameter: 9, spacing_x: 70, spacing_y: 30 } },
+    { id: 'sensor_holes', type: 'hole_pattern', parameters: { diameter: 9, center_x: 60, center_y: 30 } },
+  ]);
+
+  let validation = payload(await handleHighLevelCadTool('cad_validate_edit_plan', gridSpacingEdit(created, 1, 'spacing_x', 70, 60), bridge, planGate, editGate));
+  assert.equal(validation.status, 'valid', JSON.stringify(validation, null, 2));
+  let execution = payload(await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate));
+  assert.equal(execution.status, 'verified', JSON.stringify(execution, null, 2));
+  assert.equal(execution.managed_model.model_revision, 2);
+  assert.equal(execution.rollback, undefined);
+  assert.equal(execution.verification.checks.parameter_spacing_x.passed, true);
+  assert.deepEqual(execution.geometry_signature.bounding_box, { x: 100, y: 60, z: 10 });
+  assert.deepEqual(execution.verification.checks.recompute_errors.actual, []);
+  let state = await inspectManagedHoleGroups(bridge, 'GridSpacingEdit');
+  assert.deepEqual(state.groups.mounting_holes.circles, [
+    { x: 20, y: 15, diameter: 9 }, { x: 20, y: 45, diameter: 9 },
+    { x: 80, y: 15, diameter: 9 }, { x: 80, y: 45, diameter: 9 },
+  ]);
+  assert.deepEqual(state.groups.sensor_holes.circles, before.groups.sensor_holes.circles);
+  assert.equal(state.object_count, before.object_count);
+  assert.equal(state.tip, before.tip);
+  let grid = state.resolved_plan.features.find((feature) => feature.id === 'mounting_holes').grid;
+  assert.deepEqual(grid, { columns: 2, rows: 2, spacing_x: 60, spacing_y: 30, pattern_center_x: 50, pattern_center_y: 30 });
+
+  validation = payload(await handleHighLevelCadTool('cad_validate_edit_plan', gridSpacingEdit(created, 2, 'spacing_y', 30, 20), bridge, planGate, editGate));
+  assert.equal(validation.status, 'valid', JSON.stringify(validation, null, 2));
+  execution = payload(await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate));
+  assert.equal(execution.status, 'verified', JSON.stringify(execution, null, 2));
+  assert.equal(execution.managed_model.model_revision, 3);
+  assert.equal(execution.verification.checks.parameter_spacing_y.passed, true);
+  state = await inspectManagedHoleGroups(bridge, 'GridSpacingEdit');
+  assert.deepEqual(state.groups.mounting_holes.circles, [
+    { x: 20, y: 20, diameter: 9 }, { x: 20, y: 40, diameter: 9 },
+    { x: 80, y: 20, diameter: 9 }, { x: 80, y: 40, diameter: 9 },
+  ]);
+  assert.deepEqual(state.groups.sensor_holes.circles, before.groups.sensor_holes.circles);
+  grid = state.resolved_plan.features.find((feature) => feature.id === 'mounting_holes').grid;
+  assert.equal(grid.pattern_center_x, 50);
+  assert.equal(grid.pattern_center_y, 30);
+});
+
+test('grid spacing validation blocks invalid values, boundary, overlap, collision, old mismatch, and stale revision without mutation', async (t) => {
+  const invalidCase = await createManagedHoledPlate(t, 'GridSpacingInvalid', gridSpacingPlan);
+  const invalidBefore = await inspectManagedHoleGroups(invalidCase.bridge, 'GridSpacingInvalid');
+  const nonPositive = payload(await handleHighLevelCadTool('cad_validate_edit_plan', gridSpacingEdit(invalidCase.created, 1, 'spacing_x', 70, 0), invalidCase.bridge, invalidCase.planGate, invalidCase.editGate));
+  assert.equal(nonPositive.can_execute, false);
+  assert.equal(nonPositive.issues[0].code, 'INVALID_NEW_VALUE');
+  const mismatch = payload(await handleHighLevelCadTool('cad_validate_edit_plan', gridSpacingEdit(invalidCase.created, 1, 'spacing_x', 60, 50), invalidCase.bridge, invalidCase.planGate, invalidCase.editGate));
+  assert.equal(mismatch.can_execute, false);
+  assert.equal(mismatch.issues[0].code, 'OLD_VALUE_MISMATCH');
+  const stale = payload(await handleHighLevelCadTool('cad_validate_edit_plan', gridSpacingEdit(invalidCase.created, 2, 'spacing_x', 70, 60), invalidCase.bridge, invalidCase.planGate, invalidCase.editGate));
+  assert.equal(stale.can_execute, false);
+  assert.equal(stale.issues[0].code, 'STALE_MODEL_REVISION');
+  assert.deepEqual(await inspectManagedHoleGroups(invalidCase.bridge, 'GridSpacingInvalid'), invalidBefore);
+
+  const boundaryCase = await createManagedHoledPlate(t, 'GridSpacingBoundary', gridSpacingPlan);
+  const boundaryBefore = await inspectManagedHoleGroups(boundaryCase.bridge, 'GridSpacingBoundary');
+  const boundary = payload(await handleHighLevelCadTool('cad_validate_edit_plan', gridSpacingEdit(boundaryCase.created, 1, 'spacing_x', 70, 92), boundaryCase.bridge, boundaryCase.planGate, boundaryCase.editGate));
+  assert.equal(boundary.can_execute, false);
+  assert.ok(boundary.issues.some((issue) => issue.code === 'HOLE_OUTSIDE_BASE'));
+  assert.deepEqual(await inspectManagedHoleGroups(boundaryCase.bridge, 'GridSpacingBoundary'), boundaryBefore);
+
+  const overlapCase = await createManagedHoledPlate(t, 'GridSpacingOverlap', gridSpacingPlan);
+  const overlapBefore = await inspectManagedHoleGroups(overlapCase.bridge, 'GridSpacingOverlap');
+  const overlap = payload(await handleHighLevelCadTool('cad_validate_edit_plan', gridSpacingEdit(overlapCase.created, 1, 'spacing_x', 70, 9), overlapCase.bridge, overlapCase.planGate, overlapCase.editGate));
+  assert.equal(overlap.can_execute, false);
+  assert.ok(overlap.issues.some((issue) => issue.code === 'HOLES_OVERLAP'));
+  assert.deepEqual(await inspectManagedHoleGroups(overlapCase.bridge, 'GridSpacingOverlap'), overlapBefore);
+
+  const collisionPlan = structuredClone(gridSpacingPlan);
+  collisionPlan.features[1].placement.spacing_y = 10;
+  collisionPlan.features[1].placement.origin.y = 25;
+  const collisionCase = await createManagedHoledPlate(t, 'GridSpacingCollision', collisionPlan);
+  const collisionBefore = await inspectManagedHoleGroups(collisionCase.bridge, 'GridSpacingCollision');
+  const collision = payload(await handleHighLevelCadTool('cad_validate_edit_plan', gridSpacingEdit(collisionCase.created, 1, 'spacing_x', 70, 20), collisionCase.bridge, collisionCase.planGate, collisionCase.editGate));
+  assert.equal(collision.can_execute, false);
+  assert.ok(collision.issues.some((issue) => issue.code === 'HOLES_OVERLAP'));
+  assert.deepEqual(await inspectManagedHoleGroups(collisionCase.bridge, 'GridSpacingCollision'), collisionBefore);
+});
+
+test('legacy grids omit spacing discovery and reject spacing edits while retaining diameter validation', async (t) => {
+  const { bridge, planGate, editGate, created } = await createManagedHoledPlate(t, 'LegacyGridSpacing', gridSpacingPlan);
+  await bridge.run(`
+import hashlib
+doc = FreeCAD.getDocument("LegacyGridSpacing")
+metadata = doc.getObject("ManagedModelMetadata")
+plan = json.loads(metadata.ResolvedPlanJson)
+bindings = json.loads(metadata.FeatureBindingsJson)
+mounting = next(item for item in plan["features"] if item["id"] == "mounting_holes")
+mounting.pop("grid", None)
+bindings["mounting_holes"]["parameters"].pop("spacing_x", None)
+bindings["mounting_holes"]["parameters"].pop("spacing_y", None)
+canonical = json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+metadata.ResolvedPlanJson = canonical
+metadata.PlanDigest = "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+metadata.FeatureBindingsJson = json.dumps(bindings, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+doc.recompute()
+_mcp_result["result"] = True`);
+  const discovery = await listManagedModels(bridge);
+  assert.deepEqual(discovery.models[0].features.find((feature) => feature.id === 'mounting_holes').parameters, { diameter: 9 });
+  const diameter = payload(await handleHighLevelCadTool('cad_validate_edit_plan', groupDiameterEdit(created, 1, 'mounting_holes', 9, 8), bridge, planGate, editGate));
+  assert.equal(diameter.status, 'valid', JSON.stringify(diameter, null, 2));
+  const spacing = payload(await handleHighLevelCadTool('cad_validate_edit_plan', gridSpacingEdit(created, 1, 'spacing_x', 70, 60), bridge, planGate, editGate));
+  assert.equal(spacing.can_execute, false);
+  assert.equal(spacing.issues[0].code, 'RECTANGULAR_GRID_REQUIRED');
+});
+
+test('grid spacing verification failure explicitly restores every center, BREP, digest, and revision', async (t) => {
+  const { bridge, planGate, editGate, created } = await createManagedHoledPlate(t, 'GridSpacingRollback', gridSpacingPlan);
+  const before = await inspectManagedHoleGroups(bridge, 'GridSpacingRollback');
+  const validation = payload(await handleHighLevelCadTool('cad_validate_edit_plan', gridSpacingEdit(created, 1, 'spacing_x', 70, 60), bridge, planGate, editGate));
+  assert.equal(validation.status, 'valid', JSON.stringify(validation, null, 2));
+  bridge.mutateNextCode((code) => {
+    const marker = '    # edit_verification_snapshot_complete';
+    assert.ok(code.includes(marker));
+    return code.replace(marker, '    actual_snapshot["volume"] = 1.0\n' + marker);
+  });
+  const failedResult = await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate);
+  const failed = payload(failedResult);
+  assert.equal(failedResult.isError, true);
+  assert.equal(failed.code, 'CAD_EDIT_VERIFICATION_FAILED');
+  assert.equal(failed.rollback.passed, true, JSON.stringify(failed, null, 2));
+  assert.equal(failed.rollback.spacing_x, 70);
+  assert.deepEqual(await inspectManagedHoleGroups(bridge, 'GridSpacingRollback'), before);
+});
+
+test('grid spacing bindings survive FCStd save/reload and authorize a verified edit', async (t) => {
+  const { bridge, planGate, editGate, created } = await createManagedHoledPlate(t, 'GridSpacingReload', gridSpacingPlan);
+  const reload = payload(await bridge.run(`
+import os
+import tempfile
+doc = FreeCAD.getDocument("GridSpacingReload")
+descriptor, path = tempfile.mkstemp(suffix=".FCStd")
+os.close(descriptor)
+doc.saveAs(path)
+FreeCAD.closeDocument(doc.Name)
+reloaded = FreeCAD.openDocument(path)
+_mcp_result["result"] = {"document": reloaded.Name, "path": path}`));
+  const discovery = await listManagedModels(bridge);
+  assert.deepEqual(discovery.models[0].features.find((feature) => feature.id === 'mounting_holes').parameters, { diameter: 9, spacing_x: 70, spacing_y: 30 });
+  const validation = payload(await handleHighLevelCadTool('cad_validate_edit_plan', gridSpacingEdit(created, 1, 'spacing_x', 70, 60), bridge, planGate, editGate));
+  assert.equal(validation.status, 'valid', JSON.stringify(validation, null, 2));
+  const execution = payload(await handleHighLevelCadTool('cad_execute_edit_plan', {}, bridge, planGate, editGate));
+  assert.equal(execution.status, 'verified', JSON.stringify(execution, null, 2));
+  assert.equal(execution.managed_model.model_revision, 2);
+  const state = await inspectManagedHoleGroups(bridge, reload.document);
+  assert.deepEqual(state.groups.mounting_holes.circles.map(({ x, y }) => ({ x, y })), [
+    { x: 20, y: 15 }, { x: 20, y: 45 }, { x: 80, y: 15 }, { x: 80, y: 45 },
+  ]);
   await bridge.run(`
 import os
 doc = FreeCAD.getDocument(${JSON.stringify(reload.document)})

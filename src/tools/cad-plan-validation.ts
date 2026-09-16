@@ -786,6 +786,7 @@ interface HoleResolution {
   diameter?: number;
   centers?: Point2D[];
   placementSource?: 'explicit' | 'rectangular_grid';
+  grid?: { columns: number; rows: number; spacing_x: number; spacing_y: number; pattern_center_x: number; pattern_center_y: number };
   issues: InternalIssue[];
   ambiguityDistance?: number;
 }
@@ -849,6 +850,7 @@ function resolveHolePattern(feature: Record<string, unknown>, path: string, widt
   const placement = feature.placement;
   let centers: Point2D[] | undefined;
   let placementSource: 'explicit' | 'rectangular_grid' | undefined;
+  let grid: HoleResolution['grid'];
   let ambiguityDistance: number | undefined;
   if (placement === undefined || placement === null) addMissing(issues, `${path}.placement`, 'Hole placement');
   else if (!isRecord(placement)) issues.push({ kind: 'invalid', code: 'INVALID_PLACEMENT', path: `${path}.placement`, message: 'Hole placement must be an object.' });
@@ -900,6 +902,14 @@ function resolveHolePattern(feature: Record<string, unknown>, path: string, widt
       else {
         centers = [];
         for (let row = 0; row < rows; row += 1) for (let column = 0; column < columns; column += 1) centers.push({ x: origin.x + column * spacingX, y: origin.y + row * spacingY });
+        grid = {
+          columns,
+          rows,
+          spacing_x: spacingX,
+          spacing_y: spacingY,
+          pattern_center_x: origin.x + ((columns - 1) * spacingX) / 2,
+          pattern_center_y: origin.y + ((rows - 1) * spacingY) / 2,
+        };
       }
     }
   } else if (placement.type === undefined || placement.type === null) addMissing(issues, `${path}.placement.type`, 'Placement type');
@@ -922,7 +932,7 @@ function resolveHolePattern(feature: Record<string, unknown>, path: string, widt
       }
     }
   }
-  return { diameter, centers, placementSource, issues, ambiguityDistance };
+  return { diameter, centers, placementSource, grid, issues, ambiguityDistance };
 }
 
 interface ResolvedHoleGroup {
@@ -1081,6 +1091,7 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
         diameter: holeResolution.diameter,
         centers: holeResolution.centers,
         ...(holeResolution.placementSource === 'explicit' && holeResolution.centers?.length === 1 ? { center_editable: true } : {}),
+        ...(holeResolution.grid !== undefined ? { grid: holeResolution.grid } : {}),
         operation: 'through_all',
         ...(typeof holeFeature.after === 'string' ? { after: holeFeature.after } : {}),
         ...(typeof holeFeature.target === 'string' ? { target: holeFeature.target } : {}),
@@ -1141,7 +1152,7 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
     }
     if (feature.type === 'hole_pattern') {
       const resolution = resolutionByFeature.get(feature)!;
-      return { id: feature.id, type: 'hole_pattern', diameter: resolution.diameter, centers: resolution.centers, ...(resolution.placementSource === 'explicit' && resolution.centers?.length === 1 ? { center_editable: true } : {}), operation: 'through_all', ...dependencies };
+      return { id: feature.id, type: 'hole_pattern', diameter: resolution.diameter, centers: resolution.centers, ...(resolution.placementSource === 'explicit' && resolution.centers?.length === 1 ? { center_editable: true } : {}), ...(resolution.grid !== undefined ? { grid: resolution.grid } : {}), operation: 'through_all', ...dependencies };
     }
     const dimension = feature.type === 'fillet' ? 'radius' : 'size';
     const resolvedOperation = legacyResolved[String(feature.type)] as Record<string, unknown>;

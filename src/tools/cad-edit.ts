@@ -23,7 +23,7 @@ interface EditPlan {
   model_id: string;
   model_revision: number;
   target_feature_id: string;
-  parameter: 'width' | 'height' | 'length' | 'diameter' | 'center_x' | 'center_y';
+  parameter: 'width' | 'height' | 'length' | 'diameter' | 'center_x' | 'center_y' | 'spacing_x' | 'spacing_y';
   old_value: number;
   new_value: number;
   unit: 'mm';
@@ -95,7 +95,7 @@ const editPlanProperties = {
   model_id: { type: 'string', description: 'Persistent managed-model UUID returned by cad_execute_plan.' },
   model_revision: { type: 'integer', description: 'Exact optimistic-concurrency revision currently stored by the managed model.' },
   target_feature_id: { type: 'string', description: 'Semantic feature ID from the persistent resolved plan.' },
-  parameter: { type: 'string', description: 'rectangular_pad: width, height, or length. hole_pattern: diameter, or center_x/center_y only for one explicitly positioned hole with persistent position bindings.' },
+  parameter: { type: 'string', description: 'rectangular_pad: width, height, or length. hole_pattern: diameter; center_x/center_y for one explicitly positioned hole; or spacing_x/spacing_y for a persisted rectangular grid axis with more than one position.' },
   old_value: { type: 'number', description: 'Expected current parameter value in mm; center coordinates may be any finite value.' },
   new_value: { type: 'number', description: 'Requested new parameter value in mm; dimensions require a positive finite value and center coordinates require a finite value.' },
   unit: { type: 'string', description: 'Requested unit. Validation currently accepts only millimetres.' },
@@ -103,7 +103,7 @@ const editPlanProperties = {
 
 export const CAD_EDIT_TOOLS = [{
   name: 'cad_validate_edit_plan',
-  description: 'Non-mutating validation gate for one semantic edit: rectangular_pad width/height/length; hole_pattern diameter; or center_x/center_y for one explicitly positioned hole. Never provide FreeCAD object names or constraint indices.',
+  description: 'Non-mutating validation gate for one semantic edit: rectangular_pad width/height/length; hole_pattern diameter; center_x/center_y for one explicitly positioned hole; or spacing_x/spacing_y for a rectangular grid. Never provide FreeCAD object names or constraint indices.',
   inputSchema: {
     type: 'object' as const,
     properties: editPlanProperties,
@@ -142,7 +142,7 @@ function validateInput(args: ToolArgs): EditValidationResult | EditPlan {
   if (typeof args.model_id !== 'string' || args.model_id.length === 0) return issue('invalid', 'INVALID_MODEL_ID', 'model_id', 'model_id must be a non-empty string.');
   if (!Number.isInteger(args.model_revision) || (args.model_revision as number) < 1) return issue('invalid', 'INVALID_MODEL_REVISION', 'model_revision', 'model_revision must be a positive integer.');
   if (typeof args.target_feature_id !== 'string' || args.target_feature_id.length === 0) return issue('invalid', 'INVALID_FEATURE_ID', 'target_feature_id', 'target_feature_id must be a non-empty semantic feature ID.');
-  if (args.parameter !== 'width' && args.parameter !== 'height' && args.parameter !== 'length' && args.parameter !== 'diameter' && args.parameter !== 'center_x' && args.parameter !== 'center_y') return issue('unsupported', 'UNSUPPORTED_EDIT_PARAMETER', 'parameter', 'Supported parameters are rectangular_pad width/height/length and hole_pattern diameter/center_x/center_y.');
+  if (args.parameter !== 'width' && args.parameter !== 'height' && args.parameter !== 'length' && args.parameter !== 'diameter' && args.parameter !== 'center_x' && args.parameter !== 'center_y' && args.parameter !== 'spacing_x' && args.parameter !== 'spacing_y') return issue('unsupported', 'UNSUPPORTED_EDIT_PARAMETER', 'parameter', 'Supported parameters are rectangular_pad width/height/length and hole_pattern diameter/center_x/center_y/spacing_x/spacing_y.');
   if (args.unit !== 'mm') return issue('unsupported', 'UNSUPPORTED_EDIT_UNIT', 'unit', 'V1 supports only millimetres.');
   const positionParameter = args.parameter === 'center_x' || args.parameter === 'center_y';
   if (typeof args.old_value !== 'number' || !Number.isFinite(args.old_value) || (!positionParameter && args.old_value <= 0)) return issue('invalid', 'INVALID_OLD_VALUE', 'old_value', positionParameter ? 'old_value must be finite.' : 'old_value must be finite and greater than zero.');
@@ -208,24 +208,30 @@ else:
                 features = [feature for feature in source_plan.get("features", []) if feature.get("id") == edit["target_feature_id"]]
                 target_feature = features[0] if len(features) == 1 else None
                 position_edit = edit["parameter"] in ("center_x", "center_y")
+                spacing_edit = edit["parameter"] in ("spacing_x", "spacing_y")
                 expected_parameter_value = None
                 if target_feature is not None:
                     if position_edit and len(target_feature.get("centers", [])) == 1:
                         expected_parameter_value = target_feature["centers"][0]["x" if edit["parameter"] == "center_x" else "y"]
+                    elif spacing_edit and isinstance(target_feature.get("grid"), dict):
+                        expected_parameter_value = target_feature["grid"].get(edit["parameter"])
                     elif not position_edit:
                         expected_parameter_value = target_feature.get(edit["parameter"])
                 if len(features) != 1:
                     fail("invalid", "TARGET_FEATURE_NOT_FOUND", "target_feature_id", "The target feature ID does not exist exactly once in the persistent resolved plan.")
-                elif not ((target_feature.get("type") == "rectangular_pad" and edit["parameter"] in ("width", "height", "length")) or (target_feature.get("type") == "hole_pattern" and edit["parameter"] in ("diameter", "center_x", "center_y"))):
+                elif not ((target_feature.get("type") == "rectangular_pad" and edit["parameter"] in ("width", "height", "length")) or (target_feature.get("type") == "hole_pattern" and edit["parameter"] in ("diameter", "center_x", "center_y", "spacing_x", "spacing_y"))):
                     fail("unsupported", "UNSUPPORTED_EDIT_PARAMETER", "parameter", "The requested parameter is not supported for the target feature type.")
                 elif target_feature.get("type") == "hole_pattern" and (not source_plan.get("features") or source_plan["features"][0].get("type") != "rectangular_pad"):
                     fail("unsupported", "UNSUPPORTED_EDIT_BASE", "target_feature_id", "hole_pattern editing currently requires a rectangular_pad base.")
                 elif position_edit and (target_feature.get("center_editable") is not True or len(target_feature.get("centers", [])) != 1):
                     fail("unsupported", "SINGLE_EXPLICIT_HOLE_REQUIRED", "target_feature_id", "center_x/center_y editing requires exactly one explicitly positioned hole.")
+                elif spacing_edit and (not isinstance(target_feature.get("grid"), dict) or int(target_feature["grid"].get("columns" if edit["parameter"] == "spacing_x" else "rows", 0)) <= 1):
+                    fail("unsupported", "RECTANGULAR_GRID_REQUIRED", "target_feature_id", "spacing_x/spacing_y editing requires a persisted rectangular grid with more than one column or row on the edited axis.")
                 elif expected_parameter_value is None or abs(float(expected_parameter_value) - float(edit["old_value"])) > LINEAR_TOLERANCE_MM:
                     fail("invalid", "OLD_VALUE_MISMATCH", "old_value", "old_value does not match the persistent resolved plan.", {"expected": expected_parameter_value, "actual": edit["old_value"]})
                 elif edit["target_feature_id"] not in bindings or edit["parameter"] not in bindings[edit["target_feature_id"]].get("parameters", {}):
-                    fail("unsupported" if position_edit else "invalid", "POSITION_BINDING_UNAVAILABLE" if position_edit else "FEATURE_BINDING_MISSING", "target_feature_id", "The persistent parameter binding is missing.")
+                    semantic_position_edit = position_edit or spacing_edit
+                    fail("unsupported" if semantic_position_edit else "invalid", "POSITION_BINDING_UNAVAILABLE" if semantic_position_edit else "FEATURE_BINDING_MISSING", "target_feature_id", "The persistent parameter binding is missing.")
                 else:
                     binding = bindings[edit["target_feature_id"]]
                     parameter_binding = binding["parameters"][edit["parameter"]]
@@ -284,7 +290,7 @@ else:
                                     actual_value = actual_diameters[0]
                                     if any(abs(value - actual_value) > LINEAR_TOLERANCE_MM for value in actual_diameters):
                                         actual_state_valid = False
-                            else:
+                            elif position_edit:
                                 centers = target_feature.get("centers", [])
                                 constraint_name = parameter_binding.get("constraint_name") if isinstance(parameter_binding, dict) else None
                                 indices = [index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == constraint_name]
@@ -304,6 +310,38 @@ else:
                                         actual_value = coordinate
                                         if abs(float(sketch.getDatum(indices[0]).Value) - coordinate) > LINEAR_TOLERANCE_MM or abs(other_coordinate - expected_other) > LINEAR_TOLERANCE_MM:
                                             actual_state_valid = False
+                            else:
+                                centers = target_feature.get("centers", [])
+                                grid = target_feature.get("grid", {})
+                                names = parameter_binding.get("constraint_names") if isinstance(parameter_binding, dict) else None
+                                constraint_type = "DistanceX" if edit["parameter"] == "spacing_x" else "DistanceY"
+                                coordinate_key = "x" if edit["parameter"] == "spacing_x" else "y"
+                                axis_count = int(grid.get("columns" if edit["parameter"] == "spacing_x" else "rows", 0))
+                                pattern_center = float(grid.get("pattern_center_x" if edit["parameter"] == "spacing_x" else "pattern_center_y"))
+                                binding_valid = parameter_binding.get("kind") == "grid_position_constraints" and parameter_binding.get("unit") == "mm" and parameter_binding.get("object") == binding.get("sketch_object") and isinstance(names, list) and len(names) == len(centers) and len(set(names)) == len(names) and axis_count > 1
+                                axis_values = []
+                                if binding_valid:
+                                    for center_index, (center, name) in enumerate(zip(centers, names)):
+                                        indices = [index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == name]
+                                        if len(indices) != 1:
+                                            binding_valid = False
+                                            break
+                                        constraint = sketch.Constraints[indices[0]]
+                                        geometry_index = int(constraint.Second)
+                                        if constraint.Type != constraint_type or geometry_index < 0 or geometry_index >= len(sketch.Geometry):
+                                            binding_valid = False
+                                            break
+                                        geometry = sketch.Geometry[geometry_index]
+                                        coordinate = float(geometry.Center.x if coordinate_key == "x" else geometry.Center.y)
+                                        if geometry.__class__.__name__ != "Circle" or abs(coordinate - float(center[coordinate_key])) > LINEAR_TOLERANCE_MM or abs(float(sketch.getDatum(indices[0]).Value) - coordinate) > LINEAR_TOLERANCE_MM:
+                                            actual_state_valid = False
+                                        axis_values.append(coordinate)
+                                if binding_valid:
+                                    unique_axis_values = sorted(set(round(value, 12) for value in axis_values))
+                                    actual_state_valid = actual_state_valid and len(unique_axis_values) == axis_count and abs(unique_axis_values[0] + unique_axis_values[-1] - 2.0 * pattern_center) <= LINEAR_TOLERANCE_MM
+                                    actual_value = float(grid[edit["parameter"]])
+                                    if any(abs((unique_axis_values[index + 1] - unique_axis_values[index]) - actual_value) > LINEAR_TOLERANCE_MM for index in range(len(unique_axis_values) - 1)):
+                                        actual_state_valid = False
                             if not binding_valid:
                                 fail("invalid", "FEATURE_BINDING_INVALID", "parameter", "The persistent parameter binding does not match the requested semantic.")
                             elif not actual_state_valid or abs(actual_value - float(expected_parameter_value)) > LINEAR_TOLERANCE_MM or abs(actual_value - float(edit["old_value"])) > LINEAR_TOLERANCE_MM:
@@ -313,6 +351,12 @@ else:
                                 expected_feature = next(feature for feature in expected_plan["features"] if feature["id"] == edit["target_feature_id"])
                                 if position_edit:
                                     expected_feature["centers"][0]["x" if edit["parameter"] == "center_x" else "y"] = edit["new_value"]
+                                elif spacing_edit:
+                                    grid = expected_feature["grid"]
+                                    grid[edit["parameter"]] = edit["new_value"]
+                                    columns = int(grid["columns"])
+                                    rows = int(grid["rows"])
+                                    expected_feature["centers"] = [{"x": float(grid["pattern_center_x"]) + (column - (columns - 1) / 2.0) * float(grid["spacing_x"]), "y": float(grid["pattern_center_y"]) + (row - (rows - 1) / 2.0) * float(grid["spacing_y"])} for row in range(rows) for column in range(columns)]
                                 else:
                                     expected_feature[edit["parameter"]] = edit["new_value"]
                                 expected_json = json.dumps(expected_plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -335,7 +379,7 @@ edit = json.loads(${JSON.stringify(JSON.stringify(validated.editPlan))})
 source_plan = json.loads(${JSON.stringify(JSON.stringify(validated.sourceResolvedPlan))})
 source_plan_digest = ${JSON.stringify(validated.sourcePlanDigest)}
 expected_plan = json.loads(${JSON.stringify(JSON.stringify(validated.expectedResolvedPlan))})
-expected_plan_digest = ${JSON.stringify(validated.expectedPlanDigest)}
+expected_plan_digest = "sha256:" + hashlib.sha256(json.dumps(expected_plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
 LINEAR_TOLERANCE_MM = ${LINEAR_TOLERANCE_MM}
 AREA_TOLERANCE_MM2 = ${AREA_TOLERANCE_MM2}
 VOLUME_TOLERANCE_MM3 = ${VOLUME_TOLERANCE_MM3}
@@ -350,6 +394,8 @@ parameter_indices = {}
 diameter_constraint_names = []
 position_constraint_name = None
 target_circle_index = None
+spacing_constraint_names = []
+spacing_axis = None
 source_geometry_signature = None
 source_holes = []
 source_target_holes = []
@@ -396,7 +442,7 @@ try:
     source_feature = next(item for item in source_plan["features"] if item["id"] == edit["target_feature_id"])
     expected_feature = next(item for item in expected_plan["features"] if item["id"] == edit["target_feature_id"])
     feature_type = source_feature["type"]
-    require((feature_type == "rectangular_pad" and edit["parameter"] in ("width", "height", "length")) or (feature_type == "hole_pattern" and edit["parameter"] in ("diameter", "center_x", "center_y")), "UNSUPPORTED_EDIT_PARAMETER")
+    require((feature_type == "rectangular_pad" and edit["parameter"] in ("width", "height", "length")) or (feature_type == "hole_pattern" and edit["parameter"] in ("diameter", "center_x", "center_y", "spacing_x", "spacing_y")), "UNSUPPORTED_EDIT_PARAMETER")
     expected_type_id = "PartDesign::Pad" if feature_type == "rectangular_pad" else "PartDesign::Pocket"
     require(binding.get("type") == feature_type and binding.get("feature_type_id") == expected_type_id, "FEATURE_BINDING_INVALID")
     sketch = doc.getObject(binding.get("sketch_object", ""))
@@ -462,7 +508,7 @@ try:
         if edit["parameter"] == "diameter":
             source_values = {"diameter": float(source_feature["diameter"])}
             actual_before = {"diameter": actual_diameters[0]}
-        else:
+        elif edit["parameter"] in ("center_x", "center_y"):
             require(source_feature.get("center_editable") is True and len(centers) == 1, "SINGLE_EXPLICIT_HOLE_REQUIRED")
             position_binding = parameter_bindings.get(edit["parameter"], {})
             position_constraint_name = position_binding.get("constraint_name")
@@ -478,6 +524,31 @@ try:
             require(abs(float(sketch.getDatum(position_indices[0]).Value) - actual_coordinate) <= LINEAR_TOLERANCE_MM, "MODEL_STATE_CHANGED_AFTER_VALIDATION")
             source_values = {edit["parameter"]: float(centers[0][axis_name])}
             actual_before = {edit["parameter"]: actual_coordinate}
+        else:
+            grid = source_feature.get("grid")
+            require(isinstance(grid, dict), "RECTANGULAR_GRID_REQUIRED")
+            spacing_axis = "x" if edit["parameter"] == "spacing_x" else "y"
+            axis_count = int(grid.get("columns" if spacing_axis == "x" else "rows", 0))
+            require(axis_count > 1, "RECTANGULAR_GRID_REQUIRED")
+            spacing_binding = parameter_bindings.get(edit["parameter"], {})
+            spacing_constraint_names = spacing_binding.get("constraint_names", [])
+            require(spacing_binding.get("kind") == "grid_position_constraints" and spacing_binding.get("object") == binding.get("sketch_object") and spacing_binding.get("unit") == "mm" and isinstance(spacing_constraint_names, list) and len(spacing_constraint_names) == len(centers) and len(set(spacing_constraint_names)) == len(spacing_constraint_names), "FEATURE_BINDING_INVALID")
+            expected_constraint_type = "DistanceX" if spacing_axis == "x" else "DistanceY"
+            axis_values = []
+            for center_index, name in enumerate(spacing_constraint_names):
+                indices = [index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == name]
+                require(len(indices) == 1, "FEATURE_BINDING_INVALID")
+                constraint = sketch.Constraints[indices[0]]
+                require(constraint.Type == expected_constraint_type and int(constraint.Second) == circle_indices[center_index], "FEATURE_BINDING_INVALID")
+                parameter_indices[name] = indices[0]
+                coordinate = float(sketch.Geometry[circle_indices[center_index]].Center.x if spacing_axis == "x" else sketch.Geometry[circle_indices[center_index]].Center.y)
+                require(abs(float(sketch.getDatum(indices[0]).Value) - coordinate) <= LINEAR_TOLERANCE_MM, "MODEL_STATE_CHANGED_AFTER_VALIDATION")
+                axis_values.append(coordinate)
+            unique_axis_values = sorted(set(round(value, 12) for value in axis_values))
+            current_spacing = float(grid[edit["parameter"]])
+            require(len(unique_axis_values) == axis_count and all(abs((unique_axis_values[index + 1] - unique_axis_values[index]) - current_spacing) <= LINEAR_TOLERANCE_MM for index in range(len(unique_axis_values) - 1)), "MODEL_STATE_CHANGED_AFTER_VALIDATION")
+            source_values = {edit["parameter"]: current_spacing}
+            actual_before = {edit["parameter"]: current_spacing}
     require(abs(actual_before[edit["parameter"]] - float(edit["old_value"])) <= LINEAR_TOLERANCE_MM, "MODEL_STATE_CHANGED_AFTER_VALIDATION")
     source_geometry_signature = inspect_geometry(body.Tip.Shape)
     source_holes = inspect_holes(source_geometry_signature)
@@ -499,8 +570,12 @@ try:
     elif edit["parameter"] == "diameter":
         for name in diameter_constraint_names:
             sketch.setDatum(parameter_indices[name], FreeCAD.Units.Quantity(str(edit["new_value"]) + " mm"))
-    else:
+    elif edit["parameter"] in ("center_x", "center_y"):
         sketch.setDatum(parameter_indices[edit["parameter"]], FreeCAD.Units.Quantity(str(edit["new_value"]) + " mm"))
+    else:
+        coordinate_key = "x" if edit["parameter"] == "spacing_x" else "y"
+        for center, name in zip(expected_feature["centers"], spacing_constraint_names):
+            sketch.setDatum(parameter_indices[name], FreeCAD.Units.Quantity(str(center[coordinate_key]) + " mm"))
     doc.recompute()
     # edit_verification_snapshot_start
     shape = body.Tip.Shape
@@ -511,6 +586,10 @@ try:
         actual_diameters = [float(sketch.Geometry[int(sketch.Constraints[parameter_indices[name]].First)].Radius) * 2.0 for name in diameter_constraint_names]
         actual_circle = sketch.Geometry[target_circle_index if target_circle_index is not None else int(sketch.Constraints[parameter_indices[diameter_constraint_names[0]]].First)]
         actual_values = {"diameter": actual_diameters[0] if actual_diameters else None, "center_x": float(actual_circle.Center.x), "center_y": float(actual_circle.Center.y)}
+        if edit["parameter"] in ("spacing_x", "spacing_y"):
+            coordinate_key = "x" if edit["parameter"] == "spacing_x" else "y"
+            axis_values = sorted(set(round(float(sketch.Geometry[index].Center.x if coordinate_key == "x" else sketch.Geometry[index].Center.y), 12) for index in circle_indices))
+            actual_values[edit["parameter"]] = axis_values[1] - axis_values[0] if len(axis_values) > 1 else None
     recompute_errors = [{"object": obj.Name, "states": cad_object_error_states(obj)} for obj in doc.Objects]
     recompute_errors = [entry for entry in recompute_errors if entry["states"]]
     actual_snapshot = {
@@ -575,8 +654,11 @@ try:
             "base_dimensions": {"expected": base_values_before, "actual": actual_snapshot["base_dimensions"], "passed": all(abs(actual_snapshot["base_dimensions"][name] - base_values_before[name]) <= LINEAR_TOLERANCE_MM for name in base_values_before)},
         }
         if edit["parameter"] in ("center_x", "center_y"):
-            expected_coordinate = float(expected_feature["centers"][0]["x" if edit["parameter"] == "center_x" else "y"])
-            checks["parameter_" + edit["parameter"]] = {"expected": expected_coordinate, "actual": actual_snapshot[edit["parameter"]], "passed": abs(actual_snapshot[edit["parameter"]] - expected_coordinate) <= LINEAR_TOLERANCE_MM}
+            expected_parameter = float(expected_feature["centers"][0]["x" if edit["parameter"] == "center_x" else "y"])
+            checks["parameter_" + edit["parameter"]] = {"expected": expected_parameter, "actual": actual_snapshot[edit["parameter"]], "passed": abs(actual_snapshot[edit["parameter"]] - expected_parameter) <= LINEAR_TOLERANCE_MM}
+        elif edit["parameter"] in ("spacing_x", "spacing_y"):
+            expected_parameter = float(expected_feature["grid"][edit["parameter"]])
+            checks["parameter_" + edit["parameter"]] = {"expected": expected_parameter, "actual": actual_snapshot[edit["parameter"]], "passed": actual_snapshot[edit["parameter"]] is not None and abs(actual_snapshot[edit["parameter"]] - expected_parameter) <= LINEAR_TOLERANCE_MM}
     checks.update({
         "body_tip": {"expected": bindings[source_plan["features"][-1]["id"]]["feature_object"], "actual": actual_snapshot["body_tip"], "passed": actual_snapshot["body_tip"] == bindings[source_plan["features"][-1]["id"]]["feature_object"]},
         "feature_chain_complete": {"expected": True, "actual": actual_snapshot["feature_chain_complete"], "passed": actual_snapshot["feature_chain_complete"] is True},
@@ -595,8 +677,12 @@ try:
         elif edit["parameter"] == "diameter":
             for name in diameter_constraint_names:
                 sketch.setDatum(parameter_indices[name], FreeCAD.Units.Quantity(str(edit["old_value"]) + " mm"))
-        else:
+        elif edit["parameter"] in ("center_x", "center_y"):
             sketch.setDatum(parameter_indices[edit["parameter"]], FreeCAD.Units.Quantity(str(edit["old_value"]) + " mm"))
+        else:
+            coordinate_key = "x" if edit["parameter"] == "spacing_x" else "y"
+            for center, name in zip(source_feature["centers"], spacing_constraint_names):
+                sketch.setDatum(parameter_indices[name], FreeCAD.Units.Quantity(str(center[coordinate_key]) + " mm"))
         metadata.IsManagedModel = True
         metadata.ResolvedPlanJson = json.dumps(source_plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
         metadata.PlanDigest = source_plan_digest
@@ -609,11 +695,15 @@ try:
             rollback_diameters = [float(sketch.Geometry[int(sketch.Constraints[parameter_indices[name]].First)].Radius) * 2.0 for name in diameter_constraint_names]
             rollback_circle = sketch.Geometry[target_circle_index if target_circle_index is not None else int(sketch.Constraints[parameter_indices[diameter_constraint_names[0]]].First)]
             rollback_values = {"diameter": rollback_diameters[0] if rollback_diameters else None, "center_x": float(rollback_circle.Center.x), "center_y": float(rollback_circle.Center.y), "width": float(base_sketch.getDatum(base_parameter_indices["width"]).Value), "height": float(base_sketch.getDatum(base_parameter_indices["height"]).Value), "length": float(base_feature.Length.Value)}
+            if edit["parameter"] in ("spacing_x", "spacing_y"):
+                coordinate_key = "x" if edit["parameter"] == "spacing_x" else "y"
+                axis_values = sorted(set(round(float(sketch.Geometry[index].Center.x if coordinate_key == "x" else sketch.Geometry[index].Center.y), 12) for index in circle_indices))
+                rollback_values[edit["parameter"]] = axis_values[1] - axis_values[0] if len(axis_values) > 1 else None
             rollback_signature = inspect_geometry(body.Tip.Shape)
             rollback_holes = inspect_holes(rollback_signature)
             rollback_geometry_ok = len(rollback_holes) == len(source_holes) and abs(float(rollback_signature["volume"]) - float(source_geometry_signature["volume"])) <= VOLUME_TOLERANCE_MM3 and all(abs(float(rollback_signature["bounding_box"][axis]) - float(source_geometry_signature["bounding_box"][axis])) <= LINEAR_TOLERANCE_MM for axis in ("x", "y", "z")) and all(abs(rollback_holes[index]["x"] - source_holes[index]["x"]) <= LINEAR_TOLERANCE_MM and abs(rollback_holes[index]["y"] - source_holes[index]["y"]) <= LINEAR_TOLERANCE_MM and abs(rollback_holes[index]["radius"] - source_holes[index]["radius"]) <= LINEAR_TOLERANCE_MM for index in range(len(source_holes)))
         rollback_ok = all(abs(rollback_values[name] - source_values[name]) <= LINEAR_TOLERANCE_MM for name in source_values) and rollback_geometry_ok and int(metadata.ModelRevision) == int(edit["model_revision"]) and str(metadata.PlanDigest) == source_plan_digest and json.loads(metadata.ResolvedPlanJson) == source_plan
-        _mcp_result["result"] = {"success": False, "status": "verification_failed", "code": "CAD_EDIT_VERIFICATION_FAILED", "issues": issues, "geometry_signature": geometry_signature, "verification": verification, "rollback": {"passed": rollback_ok, "parameter": edit["parameter"], "value": rollback_values[edit["parameter"]], "width": rollback_values.get("width"), "height": rollback_values.get("height"), "length": rollback_values.get("length"), "diameter": rollback_values.get("diameter"), "center_x": rollback_values.get("center_x"), "center_y": rollback_values.get("center_y"), "model_revision": int(metadata.ModelRevision), "plan_digest": str(metadata.PlanDigest)}}
+        _mcp_result["result"] = {"success": False, "status": "verification_failed", "code": "CAD_EDIT_VERIFICATION_FAILED", "issues": issues, "geometry_signature": geometry_signature, "verification": verification, "rollback": {"passed": rollback_ok, "parameter": edit["parameter"], "value": rollback_values[edit["parameter"]], "width": rollback_values.get("width"), "height": rollback_values.get("height"), "length": rollback_values.get("length"), "diameter": rollback_values.get("diameter"), "center_x": rollback_values.get("center_x"), "center_y": rollback_values.get("center_y"), "spacing_x": rollback_values.get("spacing_x"), "spacing_y": rollback_values.get("spacing_y"), "model_revision": int(metadata.ModelRevision), "plan_digest": str(metadata.PlanDigest)}}
     else:
         metadata.IsManagedModel = False
         metadata.ResolvedPlanJson = json.dumps(expected_plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -642,6 +732,11 @@ except Exception as error:
                 for name in diameter_constraint_names:
                     if name in parameter_indices:
                         sketch.setDatum(parameter_indices[name], FreeCAD.Units.Quantity(str(edit["old_value"]) + " mm"))
+            elif sketch is not None and edit["parameter"] in ("spacing_x", "spacing_y"):
+                coordinate_key = "x" if edit["parameter"] == "spacing_x" else "y"
+                for center, name in zip(source_feature["centers"], spacing_constraint_names):
+                    if name in parameter_indices:
+                        sketch.setDatum(parameter_indices[name], FreeCAD.Units.Quantity(str(center[coordinate_key]) + " mm"))
             if metadata is not None:
                 metadata.IsManagedModel = True
                 metadata.ResolvedPlanJson = json.dumps(source_plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -654,6 +749,10 @@ except Exception as error:
                 restored_signature = inspect_geometry(body.Tip.Shape)
                 restored_holes = inspect_holes(restored_signature)
                 restored_values = {"diameter": restored_diameters[0] if restored_diameters else None, "center_x": float(restored_circle.Center.x), "center_y": float(restored_circle.Center.y)}
+                if edit["parameter"] in ("spacing_x", "spacing_y"):
+                    coordinate_key = "x" if edit["parameter"] == "spacing_x" else "y"
+                    axis_values = sorted(set(round(float(sketch.Geometry[index].Center.x if coordinate_key == "x" else sketch.Geometry[index].Center.y), 12) for index in circle_indices))
+                    restored_values[edit["parameter"]] = axis_values[1] - axis_values[0] if len(axis_values) > 1 else None
                 rollback_ok = all(abs(restored_values[name] - source_values[name]) <= LINEAR_TOLERANCE_MM for name in source_values) and len(restored_diameters) == len(diameter_constraint_names) and len(restored_holes) == len(source_holes) and abs(float(restored_signature["volume"]) - float(source_geometry_signature["volume"])) <= VOLUME_TOLERANCE_MM3 and all(abs(restored_holes[index]["x"] - source_holes[index]["x"]) <= LINEAR_TOLERANCE_MM and abs(restored_holes[index]["y"] - source_holes[index]["y"]) <= LINEAR_TOLERANCE_MM and abs(restored_holes[index]["radius"] - source_holes[index]["radius"]) <= LINEAR_TOLERANCE_MM for index in range(len(source_holes)))
                 rollback = {"passed": rollback_ok, **restored_values}
             else:
@@ -690,7 +789,23 @@ function resolvedPlanAsValidationInput(plan: Record<string, unknown>): Record<st
   if (!Array.isArray(copy.features)) return copy;
   copy.features = copy.features.map((feature) => {
     if (!isRecord(feature) || feature.type !== 'hole_pattern' || !Array.isArray(feature.centers)) return feature;
-    const { centers, center_editable: _centerEditable, ...rest } = feature;
+    const { centers, center_editable: _centerEditable, grid, ...rest } = feature;
+    if (isRecord(grid)
+      && typeof grid.columns === 'number' && typeof grid.rows === 'number'
+      && typeof grid.spacing_x === 'number' && typeof grid.spacing_y === 'number'
+      && typeof grid.pattern_center_x === 'number' && typeof grid.pattern_center_y === 'number') {
+      return {
+        ...rest,
+        placement: {
+          type: 'rectangular_grid', columns: grid.columns, rows: grid.rows,
+          origin: {
+            x: grid.pattern_center_x - ((grid.columns - 1) * grid.spacing_x) / 2,
+            y: grid.pattern_center_y - ((grid.rows - 1) * grid.spacing_y) / 2,
+          },
+          spacing_x: grid.spacing_x, spacing_y: grid.spacing_y,
+        },
+      };
+    }
     return { ...rest, placement: { type: 'explicit', centers } };
   });
   return copy;

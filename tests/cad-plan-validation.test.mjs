@@ -594,11 +594,13 @@ test('profile_pad rectangular_grid normalizes row-major and Simple Intent matche
   assert.equal(simple.result.can_execute, true);
   assert.equal(simple.bridge.calls, 0);
   assert.deepEqual(simple.result.resolved_plan.features[1], {
-    id: 'holes', type: 'hole_pattern', diameter: 6, centers: expectedCenters, operation: 'through_all', after: 'base',
+    id: 'holes', type: 'hole_pattern', diameter: 6, centers: expectedCenters,
+    grid: { columns: 2, rows: 2, spacing_x: 30, spacing_y: 30, pattern_center_x: 35, pattern_center_y: 35 },
+    operation: 'through_all', after: 'base',
   });
   assert.deepEqual(feature.result.resolved_plan, simple.result.resolved_plan);
-  assert.equal(JSON.stringify(simple.result.resolved_plan).includes('grid'), false);
-  assert.equal(JSON.stringify(simple.result.resolved_plan).includes('spacing'), false);
+  assert.equal(JSON.stringify(simple.result.resolved_plan).includes('rectangular_grid'), false);
+  assert.equal(JSON.stringify(simple.result.resolved_plan).includes('"placement"'), false);
 });
 
 for (const [name, grid, start, spacing, code, expectedSource] of [

@@ -4,7 +4,7 @@ import { LINEAR_TOLERANCE_MM } from './cad-geometry-tolerances.js';
 
 export const CAD_MANAGED_MODEL_TOOLS = [{
   name: 'cad_list_managed_models',
-  description: 'Read-only discovery of every valid managed model currently open in FreeCAD. Returns rectangular_pad width/height/length, hole_pattern diameter, and center_x/center_y for a positions-editable singleton explicit hole through persistent semantic bindings. Never selects a model automatically.',
+  description: 'Read-only discovery of every valid managed model currently open in FreeCAD. Returns rectangular_pad dimensions; hole_pattern diameter; center_x/center_y for a positions-editable singleton explicit hole; and spacing_x/spacing_y for supported rectangular-grid axes through persistent semantic bindings. Never selects a model automatically.',
   inputSchema: {
     type: 'object' as const,
     properties: {},
@@ -137,6 +137,29 @@ for document_name in sorted(FreeCAD.listDocuments().keys()):
                         require(constraint.Type == constraint_type and int(constraint.Second) == geometry_indices[0] and abs(float(sketch.getDatum(indices[0]).Value) - coordinate) <= LINEAR_TOLERANCE_MM, "FEATURE_BINDING_INVALID", "A singleton hole position constraint does not match its circle center.")
                         require(abs(coordinate - float(centers[0]["x" if name == "center_x" else "y"])) <= LINEAR_TOLERANCE_MM, "MODEL_STATE_MISMATCH", "Actual hole position differs from the persistent resolved plan.")
                         parameters[name] = coordinate
+                grid = feature_plan.get("grid")
+                if isinstance(grid, dict):
+                    columns = int(grid.get("columns", 0))
+                    rows = int(grid.get("rows", 0))
+                    require(columns > 0 and rows > 0 and columns * rows == len(centers), "RESOLVED_PLAN_INVALID", "Grid metadata does not match the resolved hole centers.")
+                    for name, count, constraint_type, coordinate_key in (("spacing_x", columns, "DistanceX", "x"), ("spacing_y", rows, "DistanceY", "y")):
+                        if count <= 1:
+                            continue
+                        spacing = float(grid.get(name))
+                        pattern_center = float(grid.get("pattern_center_x" if name == "spacing_x" else "pattern_center_y"))
+                        position_binding = binding.get("parameters", {}).get(name)
+                        constraint_names = position_binding.get("constraint_names") if isinstance(position_binding, dict) else None
+                        require(isinstance(position_binding, dict) and position_binding.get("kind") == "grid_position_constraints" and position_binding.get("object") == binding.get("sketch_object") and position_binding.get("unit") == "mm" and isinstance(constraint_names, list) and len(constraint_names) == len(centers) and len(set(constraint_names)) == len(constraint_names), "FEATURE_BINDING_INVALID", "A grid spacing binding is invalid.")
+                        for center_index, constraint_name in enumerate(constraint_names):
+                            indices = [index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == constraint_name]
+                            require(len(indices) == 1, "FEATURE_BINDING_INVALID", "A grid position constraint is missing or duplicated.")
+                            constraint = sketch.Constraints[indices[0]]
+                            require(constraint.Type == constraint_type and int(constraint.Second) == geometry_indices[center_index], "FEATURE_BINDING_INVALID", "A grid position constraint does not match its circle.")
+                            actual_coordinate = float(sketch.Geometry[geometry_indices[center_index]].Center.x if coordinate_key == "x" else sketch.Geometry[geometry_indices[center_index]].Center.y)
+                            require(abs(float(sketch.getDatum(indices[0]).Value) - actual_coordinate) <= LINEAR_TOLERANCE_MM, "FEATURE_BINDING_INVALID", "A grid position constraint datum differs from its circle center.")
+                        axis_values = sorted(set(round(float(center[coordinate_key]), 12) for center in centers))
+                        require(len(axis_values) == count and abs(axis_values[0] + axis_values[-1] - 2.0 * pattern_center) <= LINEAR_TOLERANCE_MM and all(abs((axis_values[index + 1] - axis_values[index]) - spacing) <= LINEAR_TOLERANCE_MM for index in range(len(axis_values) - 1)), "MODEL_STATE_MISMATCH", "Actual grid spacing or pattern center differs from the persistent resolved plan.")
+                        parameters[name] = spacing
             semantic_features.append({"id": feature_id, "type": feature_type, "parameters": parameters})
         models.append({"model_id": model_id, "model_revision": model_revision, "document": doc.Name, "features": semantic_features})
     except ManagedModelIssue as error:
