@@ -61,6 +61,42 @@ def attach_xy(sketch, body):
         raise RuntimeError("SKETCH_ATTACHMENT_UNSUPPORTED")
     sketch.MapMode = "FlatFace"
 
+def semantic_pocket_placement(face, width, height, length):
+    if face == "top":
+        origin, columns, reversed_direction = (0.0, 0.0, length), ((1, 0, 0), (0, 1, 0), (0, 0, 1)), False
+    elif face == "front":
+        origin, columns, reversed_direction = (0.0, 0.0, 0.0), ((1, 0, 0), (0, 0, 1), (0, -1, 0)), False
+    elif face == "back":
+        origin, columns, reversed_direction = (0.0, height, 0.0), ((1, 0, 0), (0, 0, 1), (0, -1, 0)), True
+    elif face == "left":
+        origin, columns, reversed_direction = (0.0, 0.0, 0.0), ((0, 1, 0), (0, 0, 1), (1, 0, 0)), True
+    elif face == "right":
+        origin, columns, reversed_direction = (width, 0.0, 0.0), ((0, 1, 0), (0, 0, 1), (1, 0, 0)), False
+    else:
+        raise RuntimeError("UNSUPPORTED_POCKET_FACE: " + str(face))
+    matrix = FreeCAD.Matrix()
+    matrix.A11, matrix.A21, matrix.A31 = columns[0]
+    matrix.A12, matrix.A22, matrix.A32 = columns[1]
+    matrix.A13, matrix.A23, matrix.A33 = columns[2]
+    return FreeCAD.Placement(FreeCAD.Vector(*origin), FreeCAD.Rotation(matrix)), reversed_direction
+
+def add_constrained_rectangle(sketch, x, y, rectangle_width, rectangle_height):
+    points = ((x, y), (x + rectangle_width, y), (x + rectangle_width, y + rectangle_height), (x, y + rectangle_height))
+    lines = [sketch.addGeometry(Part.LineSegment(FreeCAD.Vector(points[index][0], points[index][1], 0), FreeCAD.Vector(points[(index + 1) % 4][0], points[(index + 1) % 4][1], 0)), False) for index in range(4)]
+    for first, first_point, second, second_point in ((lines[0], 2, lines[1], 1), (lines[1], 2, lines[2], 1), (lines[2], 2, lines[3], 1), (lines[3], 2, lines[0], 1)):
+        sketch.addConstraint(Sketcher.Constraint("Coincident", first, first_point, second, second_point))
+    for constraint in (Sketcher.Constraint("Horizontal", lines[0]), Sketcher.Constraint("Vertical", lines[1]), Sketcher.Constraint("Horizontal", lines[2]), Sketcher.Constraint("Vertical", lines[3])):
+        sketch.addConstraint(constraint)
+    named = {
+        "width": sketch.addConstraint(Sketcher.Constraint("Distance", lines[0], rectangle_width)),
+        "height": sketch.addConstraint(Sketcher.Constraint("Distance", lines[1], rectangle_height)),
+        "position_x": sketch.addConstraint(Sketcher.Constraint("DistanceX", -1, 1, lines[0], 1, x)),
+        "position_y": sketch.addConstraint(Sketcher.Constraint("DistanceY", -1, 1, lines[0], 1, y)),
+    }
+    for name, index in named.items():
+        sketch.renameConstraint(index, name)
+    return named
+
 def arc_sweep(segment):
     start_angle = math.atan2(segment["start"]["y"] - segment["center"]["y"], segment["start"]["x"] - segment["center"]["x"])
     end_angle = math.atan2(segment["end"]["y"] - segment["center"]["y"], segment["end"]["x"] - segment["center"]["x"])
@@ -95,6 +131,62 @@ def profile_metrics(segments):
         "area": abs(area),
         "bounds": {"min_x": min(float(point["x"]) for point in points), "max_x": max(float(point["x"]) for point in points), "min_y": min(float(point["y"]) for point in points), "max_y": max(float(point["y"]) for point in points)},
     }
+
+def pocket_box_shape(box):
+    return Part.makeBox(
+        float(box["max_x"]) - float(box["min_x"]),
+        float(box["max_y"]) - float(box["min_y"]),
+        float(box["max_z"]) - float(box["min_z"]),
+        FreeCAD.Vector(float(box["min_x"]), float(box["min_y"]), float(box["min_z"])),
+    )
+
+def union_box_volume(boxes):
+    if not boxes:
+        return 0.0
+    xs = sorted(set(float(value) for box in boxes for value in (box["min_x"], box["max_x"])))
+    ys = sorted(set(float(value) for box in boxes for value in (box["min_y"], box["max_y"])))
+    zs = sorted(set(float(value) for box in boxes for value in (box["min_z"], box["max_z"])))
+    volume = 0.0
+    for xi in range(len(xs) - 1):
+        for yi in range(len(ys) - 1):
+            for zi in range(len(zs) - 1):
+                center = ((xs[xi] + xs[xi + 1]) / 2.0, (ys[yi] + ys[yi + 1]) / 2.0, (zs[zi] + zs[zi + 1]) / 2.0)
+                if any(box["min_x"] - LINEAR_TOLERANCE_MM <= center[0] <= box["max_x"] + LINEAR_TOLERANCE_MM and box["min_y"] - LINEAR_TOLERANCE_MM <= center[1] <= box["max_y"] + LINEAR_TOLERANCE_MM and box["min_z"] - LINEAR_TOLERANCE_MM <= center[2] <= box["max_z"] + LINEAR_TOLERANCE_MM for box in boxes):
+                    volume += (xs[xi + 1] - xs[xi]) * (ys[yi + 1] - ys[yi]) * (zs[zi + 1] - zs[zi])
+    return volume
+
+def pocket_axis_line(feature):
+    box = feature["box"]
+    center_x = (float(box["min_x"]) + float(box["max_x"])) / 2.0
+    center_y = (float(box["min_y"]) + float(box["max_y"])) / 2.0
+    center_z = (float(box["min_z"]) + float(box["max_z"])) / 2.0
+    if feature["face"] == "top":
+        return Part.makeLine(FreeCAD.Vector(center_x, center_y, 0), FreeCAD.Vector(center_x, center_y, length))
+    if feature["face"] in ("front", "back"):
+        return Part.makeLine(FreeCAD.Vector(center_x, 0, center_z), FreeCAD.Vector(center_x, height, center_z))
+    return Part.makeLine(FreeCAD.Vector(0, center_y, center_z), FreeCAD.Vector(width, center_y, center_z))
+
+def expected_axis_material_length(feature, boxes):
+    box = feature["box"]
+    center_x = (float(box["min_x"]) + float(box["max_x"])) / 2.0
+    center_y = (float(box["min_y"]) + float(box["max_y"])) / 2.0
+    center_z = (float(box["min_z"]) + float(box["max_z"])) / 2.0
+    if feature["face"] == "top":
+        intervals = [(float(item["min_z"]), float(item["max_z"])) for item in boxes if item["min_x"] - LINEAR_TOLERANCE_MM <= center_x <= item["max_x"] + LINEAR_TOLERANCE_MM and item["min_y"] - LINEAR_TOLERANCE_MM <= center_y <= item["max_y"] + LINEAR_TOLERANCE_MM]
+        total = length
+    elif feature["face"] in ("front", "back"):
+        intervals = [(float(item["min_y"]), float(item["max_y"])) for item in boxes if item["min_x"] - LINEAR_TOLERANCE_MM <= center_x <= item["max_x"] + LINEAR_TOLERANCE_MM and item["min_z"] - LINEAR_TOLERANCE_MM <= center_z <= item["max_z"] + LINEAR_TOLERANCE_MM]
+        total = height
+    else:
+        intervals = [(float(item["min_x"]), float(item["max_x"])) for item in boxes if item["min_y"] - LINEAR_TOLERANCE_MM <= center_y <= item["max_y"] + LINEAR_TOLERANCE_MM and item["min_z"] - LINEAR_TOLERANCE_MM <= center_z <= item["max_z"] + LINEAR_TOLERANCE_MM]
+        total = width
+    merged = []
+    for start, end in sorted(intervals):
+        if not merged or start > merged[-1][1] + LINEAR_TOLERANCE_MM:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return total - sum(end - start for start, end in merged)
 
 def select_edges(source, selection):
     shape = source.Shape
@@ -297,6 +389,32 @@ try:
                 raise RuntimeError("PROFILE_PAD_POSTCONDITION_FAILED")
             feature_bindings[feature_id] = {"type": feature_type, "feature_object": pad.Name, "feature_type_id": pad.TypeId, "sketch_object": sketch.Name, "parameters": {"length": {"kind": "feature_property", "object": pad.Name, "property": "Length", "unit": "mm"}}}
             feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pad.Name, "object_type": pad.TypeId, "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(sketch.DoF), "segment_count": len(sketch.Geometry), "line_segment_count": actual_line_count, "arc_segment_count": len(actual_arc_geometries), "arc_radii": [float(geometry.Radius) for geometry in actual_arc_geometries], "arc_geometry_types": [geometry.__class__.__name__ for geometry in actual_arc_geometries], "solid_valid": True})
+        elif feature_type == "rectangular_pocket":
+            source_volume = float(body.Tip.Shape.Volume)
+            pocket_sketch = body.newObject("Sketcher::SketchObject", "PlanSketch_" + str(feature_index))
+            pocket_sketch.MapMode = "Deactivated"
+            pocket_sketch.Placement, reversed_direction = semantic_pocket_placement(feature_plan["face"], width, height, length)
+            position = feature_plan["position"]
+            named_constraints = add_constrained_rectangle(pocket_sketch, float(position["x"]), float(position["y"]), float(feature_plan["width"]), float(feature_plan["height"]))
+            solve_result = pocket_sketch.solve()
+            doc.recompute()
+            check_object(pocket_sketch, "RECTANGULAR_POCKET_SKETCH_RECOMPUTE_FAILED")
+            if solve_result not in (None, 0) or not pocket_sketch.FullyConstrained or int(pocket_sketch.DoF) != 0 or len(pocket_sketch.Shape.Wires) != 1 or not pocket_sketch.Shape.Wires[0].isClosed():
+                raise RuntimeError("RECTANGULAR_POCKET_SKETCH_VALIDATION_FAILED")
+            pocket = body.newObject("PartDesign::Pocket", "PlanFeature_" + str(feature_index))
+            pocket.Label = feature_id
+            pocket.Profile = pocket_sketch
+            pocket.Length = float(feature_plan["depth"])
+            pocket.Reversed = reversed_direction
+            pocket.Midplane = False
+            doc.recompute()
+            check_object(pocket, "RECTANGULAR_POCKET_RECOMPUTE_FAILED")
+            if body.Tip != pocket or pocket.Shape.isNull() or not pocket.Shape.isValid() or len(pocket.Shape.Solids) != 1 or float(pocket.Shape.Volume) >= source_volume - VOLUME_TOLERANCE_MM3:
+                raise RuntimeError("RECTANGULAR_POCKET_POSTCONDITION_FAILED")
+            parameter_bindings = {name: {"kind": "sketch_constraint", "object": pocket_sketch.Name, "constraint_name": name, "unit": "mm"} for name in ("width", "height", "position_x", "position_y")}
+            parameter_bindings["depth"] = {"kind": "feature_property", "object": pocket.Name, "property": "Length", "unit": "mm"}
+            feature_bindings[feature_id] = {"type": feature_type, "feature_object": pocket.Name, "feature_type_id": pocket.TypeId, "sketch_object": pocket_sketch.Name, "semantic_face": feature_plan["face"], "target_feature_id": feature_plan["target"], "parameters": parameter_bindings}
+            feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pocket.Name, "object_type": pocket.TypeId, "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(pocket_sketch.DoF), "face": feature_plan["face"], "width": float(feature_plan["width"]), "height": float(feature_plan["height"]), "position": {"x": float(position["x"]), "y": float(position["y"])}, "depth": float(pocket.Length.Value), "box": feature_plan["box"], "source_volume": source_volume, "result_volume": float(pocket.Shape.Volume)})
         elif feature_type == "hole_pattern":
             source_volume = float(body.Tip.Shape.Volume)
             diameter = float(feature_plan["diameter"])
@@ -389,6 +507,25 @@ try:
 
     # geometry_inspection_start
     geometry_signature = inspect_geometry(shape)
+    pocket_features = [feature for feature in features if feature["type"] == "rectangular_pocket"]
+    pocket_boxes = [feature["box"] for feature in pocket_features]
+    pocket_brep = []
+    for pocket_feature in pocket_features:
+        void_intersection = shape.common(pocket_box_shape(pocket_feature["box"]))
+        axis_intersection = shape.common(pocket_axis_line(pocket_feature))
+        pocket_brep.append({
+            "id": pocket_feature["id"],
+            "face": pocket_feature["face"],
+            "box": pocket_feature["box"],
+            "dimensions": {
+                "x": float(pocket_feature["box"]["max_x"]) - float(pocket_feature["box"]["min_x"]),
+                "y": float(pocket_feature["box"]["max_y"]) - float(pocket_feature["box"]["min_y"]),
+                "z": float(pocket_feature["box"]["max_z"]) - float(pocket_feature["box"]["min_z"]),
+            },
+            "void_intersection_volume": float(void_intersection.Volume),
+            "axis_material_length": float(axis_intersection.Length),
+            "expected_axis_material_length": float(expected_axis_material_length(pocket_feature, pocket_boxes)),
+        })
     actual_holes = []
     actual_outer_cylinders = []
     for cylinder in geometry_signature["surfaces"]["cylindrical"]:
@@ -411,6 +548,7 @@ try:
         "recompute_errors": recompute_errors,
         "holes": actual_holes,
         "outer_cylinders": actual_outer_cylinders,
+        "rectangular_pockets": pocket_brep,
     }
     # verification_snapshot_complete
 
@@ -485,6 +623,24 @@ try:
                     add_issue(feature_id, feature_type, "arc_surfaces", [{"center": segment["center"], "radius": segment["radius"]} for segment in expected_arc_segments], entry["arc_surfaces"], "The actual solid does not contain the expected cylindrical outer profile surfaces.")
             if not entry["passed"]:
                 add_issue(feature_id, feature_type, "base_feature", {"closed": True, "fully_constrained": True, "degrees_of_freedom": 0, "solid_created": True}, entry, "The base sketch or Pad postconditions were not preserved.")
+        elif feature_type == "rectangular_pocket":
+            measured = next((item for item in actual_snapshot["rectangular_pockets"] if item["id"] == feature_id), None)
+            void_passed = measured is not None and float(measured["void_intersection_volume"]) <= VOLUME_TOLERANCE_MM3
+            axis_passed = measured is not None and abs(float(measured["axis_material_length"]) - float(measured["expected_axis_material_length"])) <= LINEAR_TOLERANCE_MM
+            entry["sketch_closed"] = bool(feature_result.get("sketch_closed"))
+            entry["sketch_fully_constrained"] = bool(feature_result.get("sketch_fully_constrained"))
+            entry["sketch_degrees_of_freedom"] = feature_result.get("sketch_dof")
+            entry["material_removed"] = float(feature_result.get("result_volume", 0.0)) < float(feature_result.get("source_volume", 0.0)) - VOLUME_TOLERANCE_MM3
+            entry["semantic_face"] = {"expected": feature_plan["face"], "actual": feature_result.get("face"), "passed": feature_result.get("face") == feature_plan["face"]}
+            entry["void_box"] = {"expected": feature_plan["box"], "actual": None if measured is None else measured["box"], "intersection_volume": None if measured is None else measured["void_intersection_volume"], "passed": void_passed}
+            entry["axis_material_length"] = {"expected": None if measured is None else measured["expected_axis_material_length"], "actual": None if measured is None else measured["axis_material_length"], "passed": axis_passed}
+            entry["passed"] = entry["sketch_closed"] and entry["sketch_fully_constrained"] and entry["sketch_degrees_of_freedom"] == 0 and entry["material_removed"] and entry["semantic_face"]["passed"] and void_passed and axis_passed
+            if not void_passed:
+                add_issue(feature_id, feature_type, "pocket_void", {"intersection_volume": 0.0, "box": feature_plan["box"]}, measured, "The final analytic BREP still contains material inside the resolved rectangular pocket volume.")
+            if not axis_passed:
+                add_issue(feature_id, feature_type, "axis_material_length", None if measured is None else measured["expected_axis_material_length"], None if measured is None else measured["axis_material_length"], "Material remaining along the pocket cut axis does not match the resolved pocket union.")
+            if not entry["passed"] and void_passed and axis_passed:
+                add_issue(feature_id, feature_type, "rectangular_pocket_feature", {"closed": True, "fully_constrained": True, "degrees_of_freedom": 0, "material_removed": True, "semantic_face": feature_plan["face"]}, entry, "The rectangular pocket feature or semantic binding postconditions were not preserved.")
         elif feature_type == "hole_pattern":
             expected_centers = [{"x": float(center["x"]), "y": float(center["y"])} for center in feature_plan["centers"]]
             expected_radius = float(feature_plan["diameter"]) / 2.0
@@ -558,6 +714,14 @@ try:
         "body_tip_correct": body_tip_passed,
         "tolerances": {"linear_mm": LINEAR_TOLERANCE_MM, "volume_mm3": VOLUME_TOLERANCE_MM3},
     }
+    if pocket_boxes:
+        expected_pocket_volume = union_box_volume(pocket_boxes)
+        expected_final_volume = width * height * length - expected_pocket_volume
+        pocket_volume_passed = abs(float(geometry_signature["volume"]) - expected_final_volume) <= VOLUME_TOLERANCE_MM3
+        verification["rectangular_pocket_volume"] = {"expected_removed": expected_pocket_volume, "expected_final": expected_final_volume, "actual_final": geometry_signature["volume"], "passed": pocket_volume_passed}
+        verification["rectangular_pockets"] = pocket_brep
+        if not pocket_volume_passed:
+            add_issue(None, "rectangular_pocket", "volume", expected_final_volume, geometry_signature["volume"], "The final analytic BREP volume does not equal the base volume minus the union of resolved rectangular pocket volumes.")
     verification["featureChainComplete"] = feature_order_passed
     verification["recomputeErrors"] = actual_snapshot["recompute_errors"]
     verification["expectedHoleCount"] = sum(len(item["centers"]) for item in expected_holes)

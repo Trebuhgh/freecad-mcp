@@ -1,5 +1,5 @@
 import { ToolArgs, ToolResult } from '../types.js';
-import { AREA_TOLERANCE_MM2, LINEAR_TOLERANCE_MM } from './cad-geometry-tolerances.js';
+import { AREA_TOLERANCE_MM2, LINEAR_TOLERANCE_MM, VOLUME_TOLERANCE_MM3 } from './cad-geometry-tolerances.js';
 import { CanonicalProfileSegment, validateProfileSegments } from './cad-profile-geometry.js';
 
 type PlanStatus = 'valid' | 'incomplete' | 'ambiguous' | 'unsupported' | 'invalid';
@@ -186,10 +186,13 @@ const featurePlanSchema = {
         type: 'object',
         properties: {
           id: { type: ['string', 'null'] },
-          type: { type: ['string', 'null'], enum: ['rectangular_pad', 'profile_pad', 'hole_pattern', 'fillet', 'chamfer', null] },
+          type: { type: ['string', 'null'], enum: ['rectangular_pad', 'profile_pad', 'rectangular_pocket', 'hole_pattern', 'fillet', 'chamfer', null] },
           points: { type: ['array', 'null'], minItems: 3, items: coordinatePairSchema },
           segments: { type: ['array', 'null'], minItems: 1, items: profileSegmentSchema },
           width: { type: ['number', 'null'] }, height: { type: ['number', 'null'] }, length: { type: ['number', 'null'] },
+          depth: { type: ['number', 'null'] },
+          face: { type: ['string', 'null'], enum: ['top', 'front', 'back', 'left', 'right', null] },
+          position: { type: ['object', 'null'], properties: { x: { type: ['number', 'null'] }, y: { type: ['number', 'null'] } }, additionalProperties: false },
           diameter: { type: ['number', 'null'] }, count: { type: ['integer', 'null'] },
           placement: {
             type: ['object', 'null'],
@@ -456,7 +459,7 @@ function validateLegacyCadPlan(value: unknown): CadPlanValidationResult {
 
 const FEATURE_ID = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const BASE_FEATURE_TYPES = ['rectangular_pad', 'profile_pad'] as const;
-const SUPPORTED_FEATURE_TYPES = ['rectangular_pad', 'profile_pad', 'hole_pattern', 'fillet', 'chamfer'] as const;
+const SUPPORTED_FEATURE_TYPES = ['rectangular_pad', 'profile_pad', 'rectangular_pocket', 'hole_pattern', 'fillet', 'chamfer'] as const;
 
 interface NormalizedFeaturePlan {
   source: 'legacy' | 'feature' | 'simple';
@@ -941,6 +944,138 @@ interface ResolvedHoleGroup {
   resolution: HoleResolution;
 }
 
+interface RectangularPocketBox {
+  min_x: number; max_x: number;
+  min_y: number; max_y: number;
+  min_z: number; max_z: number;
+}
+
+interface RectangularPocketResolution {
+  resolved?: Record<string, unknown>;
+  box?: RectangularPocketBox;
+  issues: InternalIssue[];
+}
+
+const RECTANGULAR_POCKET_FACES = new Set(['top', 'front', 'back', 'left', 'right']);
+
+function rectangularBoxUnionVolume(boxes: RectangularPocketBox[]): number {
+  if (boxes.length === 0) return 0;
+  const coordinates = (minimum: keyof RectangularPocketBox, maximum: keyof RectangularPocketBox): number[] => [...new Set(boxes.flatMap((box) => [box[minimum], box[maximum]]))].sort((first, second) => first - second);
+  const xs = coordinates('min_x', 'max_x');
+  const ys = coordinates('min_y', 'max_y');
+  const zs = coordinates('min_z', 'max_z');
+  let volume = 0;
+  for (let xi = 0; xi < xs.length - 1; xi += 1) for (let yi = 0; yi < ys.length - 1; yi += 1) for (let zi = 0; zi < zs.length - 1; zi += 1) {
+    const center = { x: (xs[xi] + xs[xi + 1]) / 2, y: (ys[yi] + ys[yi + 1]) / 2, z: (zs[zi] + zs[zi + 1]) / 2 };
+    if (boxes.some((box) => box.min_x <= center.x && center.x <= box.max_x && box.min_y <= center.y && center.y <= box.max_y && box.min_z <= center.z && center.z <= box.max_z)) {
+      volume += (xs[xi + 1] - xs[xi]) * (ys[yi + 1] - ys[yi]) * (zs[zi + 1] - zs[zi]);
+    }
+  }
+  return volume;
+}
+
+function rectangularMaterialComponentCount(base: { width: number; height: number; length: number }, boxes: RectangularPocketBox[]): number {
+  const axis = (maximum: number, minimumKey: keyof RectangularPocketBox, maximumKey: keyof RectangularPocketBox): number[] => [...new Set([0, maximum, ...boxes.flatMap((box) => [box[minimumKey], box[maximumKey]])])].sort((first, second) => first - second);
+  const xs = axis(base.width, 'min_x', 'max_x');
+  const ys = axis(base.height, 'min_y', 'max_y');
+  const zs = axis(base.length, 'min_z', 'max_z');
+  const material = new Set<string>();
+  for (let xi = 0; xi < xs.length - 1; xi += 1) for (let yi = 0; yi < ys.length - 1; yi += 1) for (let zi = 0; zi < zs.length - 1; zi += 1) {
+    const center = { x: (xs[xi] + xs[xi + 1]) / 2, y: (ys[yi] + ys[yi + 1]) / 2, z: (zs[zi] + zs[zi + 1]) / 2 };
+    if (!boxes.some((box) => box.min_x <= center.x && center.x <= box.max_x && box.min_y <= center.y && center.y <= box.max_y && box.min_z <= center.z && center.z <= box.max_z)) material.add(`${xi},${yi},${zi}`);
+  }
+  let components = 0;
+  while (material.size > 0) {
+    components += 1;
+    const start = material.values().next().value as string;
+    const pending = [start];
+    material.delete(start);
+    while (pending.length > 0) {
+      const [xi, yi, zi] = pending.pop()!.split(',').map(Number);
+      for (const [dx, dy, dz] of [[-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1]]) {
+        const neighbor = `${xi + dx},${yi + dy},${zi + dz}`;
+        if (material.delete(neighbor)) pending.push(neighbor);
+      }
+    }
+  }
+  return components;
+}
+
+function resolveRectangularPocket(
+  feature: Record<string, unknown>, path: string,
+  base: { width: number; height: number; length: number },
+  previousFeature: Record<string, unknown> | undefined,
+  earlierById: Map<string, Record<string, unknown>>,
+  previousBoxes: RectangularPocketBox[],
+): RectangularPocketResolution {
+  const issues: InternalIssue[] = [];
+  const allowed = new Set(['id', 'type', 'after', 'target', 'face', 'width', 'height', 'position', 'depth']);
+  for (const key of Object.keys(feature)) {
+    if (!allowed.has(key)) issues.push({ kind: 'invalid', code: 'UNKNOWN_RECTANGULAR_POCKET_FIELD', path: `${path}.${key}`, message: `Unknown rectangular_pocket field "${key}".` });
+  }
+  const width = positiveNumber(feature, 'width', `${path}.width`, 'Pocket width', issues);
+  const height = positiveNumber(feature, 'height', `${path}.height`, 'Pocket height', issues);
+  const depth = positiveNumber(feature, 'depth', `${path}.depth`, 'Pocket depth', issues);
+  const face = feature.face;
+  if (face === undefined || face === null || face === '') addMissing(issues, `${path}.face`, 'Semantic face');
+  else if (typeof face !== 'string' || !RECTANGULAR_POCKET_FACES.has(face)) issues.push({ kind: 'unsupported', code: 'UNSUPPORTED_POCKET_FACE', path: `${path}.face`, message: 'rectangular_pocket supports only top, front, back, left, and right.' });
+  let position: Point2D | undefined;
+  if (feature.position === undefined || feature.position === null) addMissing(issues, `${path}.position`, 'Pocket position');
+  else if (!isRecord(feature.position)) issues.push({ kind: 'invalid', code: 'INVALID_POCKET_POSITION', path: `${path}.position`, message: 'position must contain finite local x and y coordinates.' });
+  else {
+    const x = feature.position.x;
+    const y = feature.position.y;
+    if (typeof x !== 'number' || !Number.isFinite(x)) issues.push({ kind: 'invalid', code: 'INVALID_POCKET_POSITION', path: `${path}.position.x`, message: 'position.x must be finite.' });
+    if (typeof y !== 'number' || !Number.isFinite(y)) issues.push({ kind: 'invalid', code: 'INVALID_POCKET_POSITION', path: `${path}.position.y`, message: 'position.y must be finite.' });
+    if (typeof x === 'number' && Number.isFinite(x) && typeof y === 'number' && Number.isFinite(y)) position = { x, y };
+  }
+  if (feature.target === undefined || feature.target === null || feature.target === '') addMissing(issues, `${path}.target`, 'Pocket target');
+  if (feature.after === undefined || feature.after === null || feature.after === '') addMissing(issues, `${path}.after`, 'Pocket predecessor');
+  const targetFeature = typeof feature.target === 'string' ? earlierById.get(feature.target) : undefined;
+  if (targetFeature !== undefined && targetFeature.type !== 'rectangular_pad' && targetFeature.type !== 'rectangular_pocket') {
+    issues.push({ kind: 'unsupported', code: 'UNSUPPORTED_POCKET_TARGET', path: `${path}.target`, message: 'V1 rectangular_pocket targets must reference a rectangular_pad or rectangular_pocket geometry state.' });
+  }
+  if (targetFeature !== undefined && previousFeature !== undefined && feature.target !== previousFeature.id) {
+    issues.push({ kind: 'invalid', code: 'POCKET_TARGET_NOT_CURRENT_TIP', path: `${path}.target`, message: 'rectangular_pocket must target the immediately preceding PartDesign geometry state.' });
+  }
+  if (typeof feature.after === 'string' && typeof feature.target === 'string' && feature.after !== feature.target) {
+    issues.push({ kind: 'invalid', code: 'POCKET_DEPENDENCY_MISMATCH', path: `${path}.after`, message: 'after and target must identify the same immediately preceding geometry state.' });
+  }
+  if (width === undefined || height === undefined || depth === undefined || position === undefined || typeof face !== 'string' || !RECTANGULAR_POCKET_FACES.has(face) || issues.length > 0) return { issues };
+  const faceWidth = face === 'left' || face === 'right' ? base.height : base.width;
+  const faceHeight = face === 'top' ? base.height : base.length;
+  const availableDepth = face === 'top' ? base.length : face === 'front' || face === 'back' ? base.height : base.width;
+  if (position.x < -LINEAR_TOLERANCE_MM || position.y < -LINEAR_TOLERANCE_MM
+    || position.x + width > faceWidth + LINEAR_TOLERANCE_MM || position.y + height > faceHeight + LINEAR_TOLERANCE_MM) {
+    issues.push({ kind: 'invalid', code: 'POCKET_OUTSIDE_FACE', path: `${path}.position`, message: 'The rectangular pocket must lie completely inside the selected semantic face.', details: { face, faceWidth, faceHeight, position, width, height } });
+  }
+  if (depth > availableDepth + LINEAR_TOLERANCE_MM) issues.push({ kind: 'invalid', code: 'POCKET_TOO_DEEP', path: `${path}.depth`, message: 'Pocket depth exceeds the available base dimension in the semantic cut direction.', details: { face, availableDepth, requestedDepth: depth } });
+  let box: RectangularPocketBox;
+  if (face === 'top') box = { min_x: position.x, max_x: position.x + width, min_y: position.y, max_y: position.y + height, min_z: base.length - depth, max_z: base.length };
+  else if (face === 'front') box = { min_x: position.x, max_x: position.x + width, min_y: 0, max_y: depth, min_z: position.y, max_z: position.y + height };
+  else if (face === 'back') box = { min_x: position.x, max_x: position.x + width, min_y: base.height - depth, max_y: base.height, min_z: position.y, max_z: position.y + height };
+  else if (face === 'left') box = { min_x: 0, max_x: depth, min_y: position.x, max_y: position.x + width, min_z: position.y, max_z: position.y + height };
+  else box = { min_x: base.width - depth, max_x: base.width, min_y: position.x, max_y: position.x + width, min_z: position.y, max_z: position.y + height };
+  const priorRemovedVolume = rectangularBoxUnionVolume(previousBoxes);
+  const resultingRemovedVolume = rectangularBoxUnionVolume([...previousBoxes, box]);
+  if (resultingRemovedVolume - priorRemovedVolume <= VOLUME_TOLERANCE_MM3) {
+    issues.push({ kind: 'invalid', code: 'POCKET_REMOVES_NO_MATERIAL', path, message: 'The requested pocket is completely contained in an earlier removed volume.' });
+  }
+  const baseVolume = base.width * base.height * base.length;
+  if (baseVolume - resultingRemovedVolume <= VOLUME_TOLERANCE_MM3) {
+    issues.push({ kind: 'invalid', code: 'POCKET_REMOVES_ALL_MATERIAL', path, message: 'The resolved rectangular pocket union would remove the complete base solid.' });
+  }
+  const materialComponents = rectangularMaterialComponentCount(base, [...previousBoxes, box]);
+  if (materialComponents > 1) {
+    issues.push({ kind: 'invalid', code: 'POCKET_DISCONNECTS_SOLID', path, message: 'The resolved rectangular pocket union would split the base into multiple solids.', details: { materialComponents } });
+  }
+  if (issues.length > 0) return { issues };
+  return {
+    issues: [], box,
+    resolved: { id: feature.id, type: 'rectangular_pocket', face, width, height, position, depth, box, after: feature.after, target: feature.target },
+  };
+}
+
 function validateCrossGroupHoleGeometry(groups: ResolvedHoleGroup[]): InternalIssue[] {
   const issues: InternalIssue[] = [];
   for (let firstGroup = 0; firstGroup < groups.length; firstGroup += 1) {
@@ -1024,7 +1159,7 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
     if (type === undefined || type === null) structuralIssues.push({ kind: 'incomplete', code: 'MISSING_REQUIRED_VALUE', path: `${path}.type`, message: 'Feature type is required.' });
     else if (!(SUPPORTED_FEATURE_TYPES as readonly string[]).includes(String(type))) structuralIssues.push({ kind: 'unsupported', code: 'UNSUPPORTED_FEATURE_TYPE', path: `${path}.type`, message: `Feature type "${String(type)}" is not supported.` });
     else {
-      if (type !== 'hole_pattern' && seenTypes.has(String(type))) structuralIssues.push({ kind: 'invalid', code: 'DUPLICATE_FEATURE_TYPE', path: `${path}.type`, message: `Only one ${String(type)} feature is currently supported.` });
+      if (type !== 'hole_pattern' && type !== 'rectangular_pocket' && seenTypes.has(String(type))) structuralIssues.push({ kind: 'invalid', code: 'DUPLICATE_FEATURE_TYPE', path: `${path}.type`, message: `Only one ${String(type)} feature is currently supported.` });
       seenTypes.add(String(type));
       if ((BASE_FEATURE_TYPES as readonly string[]).includes(String(type))) {
         if (index !== 0 || solidAvailable) structuralIssues.push({ kind: 'invalid', code: 'INVALID_FEATURE_ORDER', path, message: `${String(type)} must be the first and only base feature.` });
@@ -1105,12 +1240,45 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
     };
   }
 
+  const baseFeatureForPockets = normalized.features.find((feature) => feature.type === 'rectangular_pad');
+  const pocketFeatures = normalized.features
+    .map((feature, index) => ({ feature, path: normalized.paths[index], index }))
+    .filter((entry) => entry.feature.type === 'rectangular_pocket');
+  const pocketResolutionByFeature = new Map<Record<string, unknown>, RectangularPocketResolution>();
+  if (pocketFeatures.length > 0) {
+    const incompatible = normalized.features.find((feature) => feature.type === 'hole_pattern' || feature.type === 'fillet' || feature.type === 'chamfer');
+    if (incompatible !== undefined) {
+      const incompatibleIndex = normalized.features.indexOf(incompatible);
+      structuralIssues.push({ kind: 'unsupported', code: 'RECTANGULAR_POCKET_COMBINATION_UNSUPPORTED', path: normalized.paths[incompatibleIndex], message: 'V1 rectangular_pocket plans cannot be combined with hole_pattern, fillet, or chamfer features.' });
+    }
+    if (baseFeatureForPockets !== undefined
+      && typeof baseFeatureForPockets.width === 'number' && Number.isFinite(baseFeatureForPockets.width) && baseFeatureForPockets.width > 0
+      && typeof baseFeatureForPockets.height === 'number' && Number.isFinite(baseFeatureForPockets.height) && baseFeatureForPockets.height > 0
+      && typeof baseFeatureForPockets.length === 'number' && Number.isFinite(baseFeatureForPockets.length) && baseFeatureForPockets.length > 0) {
+      const earlierById = new Map<string, Record<string, unknown>>();
+      const previousBoxes: RectangularPocketBox[] = [];
+      normalized.features.forEach((feature, index) => {
+        if (feature.type === 'rectangular_pocket') {
+          const resolution = resolveRectangularPocket(feature, normalized.paths[index], {
+            width: baseFeatureForPockets.width as number,
+            height: baseFeatureForPockets.height as number,
+            length: baseFeatureForPockets.length as number,
+          }, normalized.features[index - 1], earlierById, previousBoxes);
+          pocketResolutionByFeature.set(feature, resolution);
+          structuralIssues.push(...resolution.issues);
+          if (resolution.box !== undefined) previousBoxes.push(resolution.box);
+        }
+        if (typeof feature.id === 'string') earlierById.set(feature.id, feature);
+      });
+    }
+  }
+
   if (structuralIssues.length > 0) {
     const status = statusFor(structuralIssues);
     return { status, can_execute: false, issues: structuralIssues.map(({ kind: _kind, ...issue }) => issue) };
   }
 
-  const baseFeature = normalized.features.find((feature) => feature.type === 'rectangular_pad');
+  const baseFeature = baseFeatureForPockets;
   const holeFeatures = normalized.features
     .map((feature, index) => ({ feature, path: normalized.paths[index] }))
     .filter((entry) => entry.feature.type === 'hole_pattern');
@@ -1154,6 +1322,7 @@ export function validateCadPlan(value: unknown): CadPlanValidationResult {
       const resolution = resolutionByFeature.get(feature)!;
       return { id: feature.id, type: 'hole_pattern', diameter: resolution.diameter, centers: resolution.centers, ...(resolution.placementSource === 'explicit' && resolution.centers?.length === 1 ? { center_editable: true } : {}), ...(resolution.grid !== undefined ? { grid: resolution.grid } : {}), operation: 'through_all', ...dependencies };
     }
+    if (feature.type === 'rectangular_pocket') return pocketResolutionByFeature.get(feature)!.resolved!;
     const dimension = feature.type === 'fillet' ? 'radius' : 'size';
     const resolvedOperation = legacyResolved[String(feature.type)] as Record<string, unknown>;
     return { id: feature.id, type: feature.type, [dimension]: resolvedOperation[dimension], edges: resolvedOperation.edges, ...dependencies };

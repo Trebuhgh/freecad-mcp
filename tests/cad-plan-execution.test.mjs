@@ -11,6 +11,14 @@ import { CadPlanValidationGate } from '../dist/tools/cad-plan-validation.js';
 const freecadPython = process.env.FREECAD_PYTHON || 'C:\\Program Files\\FreeCAD 1.1\\bin\\python.exe';
 const base = { type: 'rectangular_plate', width: 100, height: 60, thickness: 10, unit: 'mm' };
 const lProfile = [[0, 0], [100, 0], [100, 40], [60, 40], [60, 80], [0, 80]];
+const esp32PocketPlan = {
+  unit: 'mm',
+  features: [
+    { id: 'outer_body', type: 'rectangular_pad', width: 59.95, height: 32.97, length: 14 },
+    { id: 'inner_cavity', type: 'rectangular_pocket', after: 'outer_body', target: 'outer_body', face: 'top', width: 55.95, height: 28.97, position: { x: 2, y: 2 }, depth: 12 },
+    { id: 'usb_cutout', type: 'rectangular_pocket', after: 'inner_cavity', target: 'inner_cavity', face: 'front', width: 12, height: 7, position: { x: 23.975, y: 4 }, depth: 2 },
+  ],
+};
 
 function plan(reference, operations = {}) {
   return {
@@ -840,4 +848,110 @@ test('a structured verification failure is an MCP error and revokes execution au
   const retry = await handleHighLevelCadTool('cad_execute_plan', {}, bridge, gate);
   assert.equal(payload(retry).code, 'CAD_PLAN_NOT_VALIDATED');
   assert.equal(bridge.calls, 1);
+});
+
+for (const face of ['top', 'front', 'back', 'left', 'right']) {
+  test(`cad_execute_plan creates and independently verifies a real ${face} rectangular PartDesign pocket`, async () => {
+    const planned = {
+      unit: 'mm',
+      features: [
+        { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 20 },
+        { id: 'pocket', type: 'rectangular_pocket', after: 'base', target: 'base', face, width: 20, height: 10, position: { x: 5, y: 5 }, depth: 4 },
+      ],
+    };
+    const { bridge } = await validateAndCapture(planned, `RectangularPocket_${face}`);
+    assert.doesNotMatch(bridge.commands[0], /Face\d+|Edge\d+/);
+    const execution = executeFreeCad(bridge.commands[0]);
+    assert.equal(execution.ok, true, execution.traceback);
+    assert.equal(execution.result.success, true, JSON.stringify(execution.result, null, 2));
+    assert.equal(execution.result.status, 'verified');
+    assert.equal(execution.result.solidCount, 1);
+    assert.deepEqual(execution.result.geometry_signature.bounding_box, { x: 100, y: 60, z: 20 });
+    assert.equal(execution.result.features[1].object_type, 'PartDesign::Pocket');
+    assert.equal(execution.result.features[1].sketch_dof, 0);
+    const verification = execution.result.verification.features[1];
+    assert.equal(verification.passed, true, JSON.stringify(verification));
+    assert.equal(verification.semantic_face.passed, true);
+    assert.equal(verification.void_box.passed, true);
+    assert.equal(verification.axis_material_length.passed, true);
+    assert.equal(execution.result.verification.rectangular_pocket_volume.passed, true);
+  });
+}
+
+test('exact ESP32 enclosure executes as a verified linear PartDesign chain with analytic BREP measurements', async () => {
+  const { bridge } = await validateAndCapture(esp32PocketPlan, 'ESP32_Enclosure');
+  const execution = executeFreeCad(bridge.commands[0]);
+  assert.equal(execution.ok, true, execution.traceback);
+  const result = execution.result;
+  assert.equal(result.success, true, JSON.stringify(result, null, 2));
+  assert.equal(result.status, 'verified');
+  assert.equal(result.geometry_signature.solid_count, 1);
+  assert.equal(result.geometry_signature.shape_valid, true);
+  assert.ok(Math.abs(result.geometry_signature.bounding_box.x - 59.95) <= 1e-6);
+  assert.ok(Math.abs(result.geometry_signature.bounding_box.y - 32.97) <= 1e-6);
+  assert.ok(Math.abs(result.geometry_signature.bounding_box.z - 14) <= 1e-6);
+  assert.deepEqual(result.executed_steps, ['outer_body', 'inner_cavity', 'usb_cutout']);
+  assert.equal(result.verification.bodyTip, 'PlanFeature_2');
+  assert.equal(result.verification.featureChainComplete, true);
+  assert.deepEqual(result.verification.recomputeErrors, []);
+  const cavity = result.verification.rectangular_pockets.find((pocket) => pocket.id === 'inner_cavity');
+  const usb = result.verification.rectangular_pockets.find((pocket) => pocket.id === 'usb_cutout');
+  assert.ok(Math.abs(cavity.dimensions.x - 55.95) <= 1e-6);
+  assert.ok(Math.abs(cavity.dimensions.y - 28.97) <= 1e-6);
+  assert.ok(Math.abs(cavity.dimensions.z - 12) <= 1e-6);
+  assert.ok(Math.abs(cavity.axis_material_length - 2) <= 1e-6, JSON.stringify(cavity));
+  assert.deepEqual(usb.dimensions, { x: 12, y: 2, z: 7 });
+  assert.deepEqual(usb.box, { min_x: 23.975, max_x: 35.975, min_y: 0, max_y: 2, min_z: 4, max_z: 11 });
+  assert.ok(Math.abs(usb.axis_material_length - 2) <= 1e-6, JSON.stringify(usb));
+  assert.ok(cavity.void_intersection_volume <= 1e-7);
+  assert.ok(usb.void_intersection_volume <= 1e-7);
+  assert.equal(result.features[2].object, 'PlanFeature_2');
+  assert.equal(result.features[2].face, 'front');
+});
+
+test('rectangular pocket BREP verification rejects material left inside the planned void and removes the partial document', async () => {
+  const { bridge } = await validateAndCapture(esp32PocketPlan, 'ESP32_PocketFailure');
+  const mutation = 'shape = shape.fuse(Part.makeBox(1.0, 1.0, 1.0, FreeCAD.Vector(10.0, 10.0, 10.0)))';
+  const execution = executeFreeCad(mutateInspectedShape(bridge.commands[0], mutation), true);
+  assert.equal(execution.ok, true, execution.traceback);
+  assert.equal(execution.result.success, false);
+  assert.equal(execution.result.status, 'verification_failed');
+  assert.ok(execution.result.issues.some((issue) => issue.check === 'pocket_void' || issue.check === 'volume'), JSON.stringify(execution.result.issues));
+  assert.equal(execution.openDocuments.includes('ESP32_PocketFailure'), false);
+  assert.equal(execution.result.managed_model, undefined);
+});
+
+test('rectangular pocket metadata and semantic discovery survive an FCStd save/reload', async () => {
+  const { bridge, validation } = await validateAndCapture(esp32PocketPlan, 'ESP32_Reload');
+  const discoveryBridge = new CapturingBridge();
+  await handleHighLevelCadTool('cad_list_managed_models', {}, discoveryBridge, new CadPlanValidationGate());
+  assert.equal(discoveryBridge.calls, 1);
+  const execution = executeFreeCad(`${bridge.commands[0]}
+import os
+import tempfile
+_execution_result = _mcp_result["result"]
+_fd, _path = tempfile.mkstemp(suffix=".FCStd")
+os.close(_fd)
+doc.saveAs(_path)
+FreeCAD.closeDocument(doc.Name)
+_reloaded = FreeCAD.openDocument(_path)
+_reloaded.recompute()
+${discoveryBridge.commands[0]}
+_execution_result["discovery"] = _mcp_result["result"]
+FreeCAD.closeDocument(_reloaded.Name)
+os.remove(_path)
+_mcp_result["result"] = _execution_result`);
+  assert.equal(execution.ok, true, execution.traceback);
+  assert.equal(execution.result.success, true, JSON.stringify(execution.result, null, 2));
+  assert.deepEqual(execution.result.discovery.issues, []);
+  assert.equal(execution.result.discovery.models.length, 1);
+  const model = execution.result.discovery.models[0];
+  assert.equal(model.model_id, execution.result.managed_model.model_id);
+  assert.equal(model.model_revision, 1);
+  assert.deepEqual(model.features, [
+    { id: 'outer_body', type: 'rectangular_pad', parameters: { width: 59.95, height: 32.97, length: 14 } },
+    { id: 'inner_cavity', type: 'rectangular_pocket', parameters: { face: 'top', width: 55.95, height: 28.97, position: { x: 2, y: 2 }, depth: 12, target: 'outer_body' } },
+    { id: 'usb_cutout', type: 'rectangular_pocket', parameters: { face: 'front', width: 12, height: 7, position: { x: 23.975, y: 4 }, depth: 2, target: 'inner_cavity' } },
+  ]);
+  assert.deepEqual(validation.resolved_plan.features.map((feature) => feature.id), model.features.map((feature) => feature.id));
 });

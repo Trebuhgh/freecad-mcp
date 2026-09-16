@@ -4,7 +4,7 @@ import { LINEAR_TOLERANCE_MM } from './cad-geometry-tolerances.js';
 
 export const CAD_MANAGED_MODEL_TOOLS = [{
   name: 'cad_list_managed_models',
-  description: 'Read-only discovery of every valid managed model currently open in FreeCAD. Returns rectangular_pad dimensions; hole_pattern diameter; center_x/center_y for a positions-editable singleton explicit hole; and spacing_x/spacing_y for supported rectangular-grid axes through persistent semantic bindings. Never selects a model automatically.',
+  description: 'Read-only discovery of every valid managed model currently open in FreeCAD. Returns rectangular_pad dimensions; semantic rectangular_pocket face, size, position, depth, and target; hole_pattern diameter; center_x/center_y for a positions-editable singleton explicit hole; and spacing_x/spacing_y for supported rectangular-grid axes through persistent semantic bindings. Never selects a model automatically.',
   inputSchema: {
     type: 'object' as const,
     properties: {},
@@ -99,6 +99,48 @@ for document_name in sorted(FreeCAD.listDocuments().keys()):
                 require(isinstance(length_binding, dict) and length_binding.get("kind") == "feature_property" and length_binding.get("property") == "Length" and length_binding.get("object") == binding.get("feature_object") and length_binding.get("unit") == "mm", "FEATURE_BINDING_INVALID", "The rectangular_pad length binding is invalid.")
                 parameters["length"] = float(feature_object.Length.Value)
                 require(all(name in feature_plan and abs(parameters[name] - float(feature_plan[name])) <= LINEAR_TOLERANCE_MM for name in ("width", "height", "length")), "MODEL_STATE_MISMATCH", "Actual rectangular_pad parameters differ from the persistent resolved plan.")
+            elif feature_type == "rectangular_pocket":
+                require(feature_object.TypeId == "PartDesign::Pocket" and binding.get("feature_type_id") == "PartDesign::Pocket", "BOUND_OBJECT_TYPE_MISMATCH", "The rectangular_pocket binding does not reference a PartDesign Pocket.")
+                sketch = doc.getObject(binding.get("sketch_object", ""))
+                require(sketch is not None and sketch.TypeId == "Sketcher::SketchObject", "BOUND_OBJECT_NOT_FOUND", "The bound rectangular_pocket Sketch no longer exists.")
+                body = feature_object.getParentGeoFeatureGroup()
+                profile_value = feature_object.Profile
+                profile_object = profile_value[0] if isinstance(profile_value, tuple) else profile_value
+                target_id = feature_plan.get("target")
+                target_binding = bindings.get(target_id, {}) if isinstance(target_id, str) else {}
+                target_object = doc.getObject(target_binding.get("feature_object", "")) if isinstance(target_binding, dict) else None
+                require(body is not None and body.TypeId == "PartDesign::Body" and feature_object in body.Group and sketch in body.Group and profile_object == sketch and target_object in body.Group, "FEATURE_CHAIN_MISMATCH", "The rectangular_pocket binding no longer matches its Body feature chain or semantic target.")
+                require(binding.get("semantic_face") == feature_plan.get("face") and binding.get("target_feature_id") == target_id, "FEATURE_BINDING_INVALID", "The rectangular_pocket semantic face or target binding differs from the resolved plan.")
+                base_plan = resolved_plan["features"][0]
+                base_width, base_height, base_length = float(base_plan["width"]), float(base_plan["height"]), float(base_plan["length"])
+                if feature_plan["face"] == "top":
+                    expected_origin, expected_x, expected_y, expected_reversed = FreeCAD.Vector(0, 0, base_length), FreeCAD.Vector(1, 0, 0), FreeCAD.Vector(0, 1, 0), False
+                elif feature_plan["face"] == "front":
+                    expected_origin, expected_x, expected_y, expected_reversed = FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(1, 0, 0), FreeCAD.Vector(0, 0, 1), False
+                elif feature_plan["face"] == "back":
+                    expected_origin, expected_x, expected_y, expected_reversed = FreeCAD.Vector(0, base_height, 0), FreeCAD.Vector(1, 0, 0), FreeCAD.Vector(0, 0, 1), True
+                elif feature_plan["face"] == "left":
+                    expected_origin, expected_x, expected_y, expected_reversed = FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(0, 1, 0), FreeCAD.Vector(0, 0, 1), True
+                else:
+                    expected_origin, expected_x, expected_y, expected_reversed = FreeCAD.Vector(base_width, 0, 0), FreeCAD.Vector(0, 1, 0), FreeCAD.Vector(0, 0, 1), False
+                actual_origin = sketch.Placement.multVec(FreeCAD.Vector(0, 0, 0))
+                actual_x = sketch.Placement.multVec(FreeCAD.Vector(1, 0, 0)).sub(actual_origin)
+                actual_y = sketch.Placement.multVec(FreeCAD.Vector(0, 1, 0)).sub(actual_origin)
+                require(actual_origin.sub(expected_origin).Length <= LINEAR_TOLERANCE_MM and actual_x.sub(expected_x).Length <= LINEAR_TOLERANCE_MM and actual_y.sub(expected_y).Length <= LINEAR_TOLERANCE_MM and bool(feature_object.Reversed) == expected_reversed, "FEATURE_BINDING_INVALID", "The rectangular_pocket semantic placement or cut direction differs from its persistent face binding.")
+                parameter_bindings = binding.get("parameters", {})
+                require(all(name in parameter_bindings for name in ("width", "height", "position_x", "position_y", "depth")), "FEATURE_BINDING_MISSING", "rectangular_pocket parameter bindings are incomplete.")
+                for name in ("width", "height", "position_x", "position_y"):
+                    item = parameter_bindings[name]
+                    require(isinstance(item, dict) and item.get("kind") == "sketch_constraint" and item.get("constraint_name") == name and item.get("object") == binding.get("sketch_object") and item.get("unit") == "mm", "FEATURE_BINDING_INVALID", "A rectangular_pocket Sketch parameter binding is invalid.")
+                    indices = [index for index, constraint in enumerate(sketch.Constraints) if constraint.Name == name]
+                    require(len(indices) == 1, "FEATURE_BINDING_INVALID", "A named rectangular_pocket constraint does not exist exactly once.")
+                    parameters[name] = float(sketch.getDatum(indices[0]).Value)
+                depth_binding = parameter_bindings["depth"]
+                require(isinstance(depth_binding, dict) and depth_binding.get("kind") == "feature_property" and depth_binding.get("property") == "Length" and depth_binding.get("object") == binding.get("feature_object") and depth_binding.get("unit") == "mm", "FEATURE_BINDING_INVALID", "The rectangular_pocket depth binding is invalid.")
+                parameters["depth"] = float(feature_object.Length.Value)
+                expected_position = feature_plan.get("position", {})
+                require(abs(parameters["width"] - float(feature_plan.get("width"))) <= LINEAR_TOLERANCE_MM and abs(parameters["height"] - float(feature_plan.get("height"))) <= LINEAR_TOLERANCE_MM and abs(parameters["position_x"] - float(expected_position.get("x"))) <= LINEAR_TOLERANCE_MM and abs(parameters["position_y"] - float(expected_position.get("y"))) <= LINEAR_TOLERANCE_MM and abs(parameters["depth"] - float(feature_plan.get("depth"))) <= LINEAR_TOLERANCE_MM, "MODEL_STATE_MISMATCH", "Actual rectangular_pocket parameters differ from the persistent resolved plan.")
+                parameters = {"face": feature_plan["face"], "width": parameters["width"], "height": parameters["height"], "position": {"x": parameters["position_x"], "y": parameters["position_y"]}, "depth": parameters["depth"], "target": target_id}
             elif feature_type == "hole_pattern":
                 require(feature_object.TypeId == "PartDesign::Pocket" and binding.get("feature_type_id") == "PartDesign::Pocket", "BOUND_OBJECT_TYPE_MISMATCH", "The hole_pattern binding does not reference a PartDesign Pocket.")
                 sketch = doc.getObject(binding.get("sketch_object", ""))

@@ -29,6 +29,25 @@ async function validate(plan) {
   return { result: JSON.parse(response.content[0].text), bridge, gate };
 }
 
+function rectangularPocketPlan(face = 'top', overrides = {}) {
+  return {
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 20 },
+      { id: 'pocket', type: 'rectangular_pocket', after: 'base', target: 'base', face, width: 20, height: 10, position: { x: 5, y: 5 }, depth: 4, ...overrides },
+    ],
+  };
+}
+
+const esp32PocketPlan = {
+  unit: 'mm',
+  features: [
+    { id: 'outer_body', type: 'rectangular_pad', width: 59.95, height: 32.97, length: 14 },
+    { id: 'inner_cavity', type: 'rectangular_pocket', after: 'outer_body', target: 'outer_body', face: 'top', width: 55.95, height: 28.97, position: { x: 2, y: 2 }, depth: 12 },
+    { id: 'usb_cutout', type: 'rectangular_pocket', after: 'inner_cavity', target: 'inner_cavity', face: 'front', width: 12, height: 7, position: { x: 23.975, y: 4 }, depth: 2 },
+  ],
+};
+
 test('cad_validate_plan schema presents Simple Intent first and isolates compatibility formats', () => {
   const tool = CAD_PLAN_TOOLS.find((candidate) => candidate.name === 'cad_validate_plan');
   const planSchema = tool.inputSchema.properties.plan;
@@ -215,6 +234,73 @@ test('unknown plan elements and unsupported features are reported as unsupported
   assert.equal(result.status, 'unsupported');
   assert.equal(result.can_execute, false);
   assert.ok(result.issues.some((issue) => issue.code === 'UNSUPPORTED_PLAN_ELEMENT' && issue.path === 'shell'));
+});
+
+for (const [face, expectedBox] of [
+  ['top', { min_x: 5, max_x: 25, min_y: 5, max_y: 15, min_z: 16, max_z: 20 }],
+  ['front', { min_x: 5, max_x: 25, min_y: 0, max_y: 4, min_z: 5, max_z: 15 }],
+  ['back', { min_x: 5, max_x: 25, min_y: 56, max_y: 60, min_z: 5, max_z: 15 }],
+  ['left', { min_x: 0, max_x: 4, min_y: 5, max_y: 25, min_z: 5, max_z: 15 }],
+  ['right', { min_x: 96, max_x: 100, min_y: 5, max_y: 25, min_z: 5, max_z: 15 }],
+]) {
+  test(`rectangular_pocket resolves deterministic ${face} semantic coordinates`, async () => {
+    const { result, bridge } = await validate(rectangularPocketPlan(face));
+    assert.equal(result.status, 'valid', JSON.stringify(result));
+    assert.equal(result.can_execute, true);
+    assert.equal(bridge.calls, 0);
+    assert.deepEqual(result.resolved_plan.features[1].box, expectedBox);
+  });
+}
+
+for (const [field, value] of [['width', 0], ['height', 0], ['depth', 0]]) {
+  test(`rectangular_pocket rejects non-positive ${field}`, async () => {
+    const { result } = await validate(rectangularPocketPlan('top', { [field]: value }));
+    assert.notEqual(result.status, 'valid');
+    assert.equal(result.can_execute, false);
+    assert.ok(result.issues.some((issue) => issue.path === `features.1.${field}`), JSON.stringify(result));
+  });
+}
+
+test('rectangular_pocket rejects outside, excessive depth, missing target, and invalid ordering', async () => {
+  const outside = await validate(rectangularPocketPlan('top', { position: { x: 90, y: 5 }, width: 20 }));
+  assert.ok(outside.result.issues.some((issue) => issue.code === 'POCKET_OUTSIDE_FACE'));
+  const deep = await validate(rectangularPocketPlan('top', { depth: 21 }));
+  assert.ok(deep.result.issues.some((issue) => issue.code === 'POCKET_TOO_DEEP'));
+  const missing = await validate(rectangularPocketPlan('top', { target: null }));
+  assert.ok(missing.result.issues.some((issue) => issue.path === 'features.1.target'));
+  const ordered = await validate(rectangularPocketPlan('top', { after: 'not_base' }));
+  assert.ok(ordered.result.issues.some((issue) => ['INVALID_FEATURE_ORDER', 'POCKET_DEPENDENCY_MISMATCH'].includes(issue.code)), JSON.stringify(ordered.result));
+  const removesAll = await validate(rectangularPocketPlan('top', { position: { x: 0, y: 0 }, width: 100, height: 60, depth: 20 }));
+  assert.ok(removesAll.result.issues.some((issue) => issue.code === 'POCKET_REMOVES_ALL_MATERIAL'));
+  const disconnects = await validate(rectangularPocketPlan('top', { position: { x: 0, y: 25 }, width: 100, height: 10, depth: 20 }));
+  assert.ok(disconnects.result.issues.some((issue) => issue.code === 'POCKET_DISCONNECTS_SOLID'));
+  for (const candidate of [outside, deep, missing, ordered, removesAll, disconnects]) assert.equal(candidate.result.can_execute, false);
+});
+
+test('rectangular_pocket rejects unsupported target geometry deterministically', async () => {
+  const plan = {
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 20 },
+      { id: 'holes', type: 'hole_pattern', diameter: 6, placement: { type: 'explicit', centers: [[20, 20]] }, operation: 'through_all', after: 'base' },
+      { id: 'pocket', type: 'rectangular_pocket', after: 'holes', target: 'holes', face: 'top', width: 20, height: 10, position: { x: 5, y: 5 }, depth: 4 },
+    ],
+  };
+  const { result } = await validate(plan);
+  assert.equal(result.status, 'unsupported');
+  assert.equal(result.can_execute, false);
+  assert.ok(result.issues.some((issue) => issue.code === 'UNSUPPORTED_POCKET_TARGET'), JSON.stringify(result));
+});
+
+test('exact ESP32 enclosure rectangular pocket plan validates without topology references', async () => {
+  const { result, bridge } = await validate(esp32PocketPlan);
+  assert.equal(result.status, 'valid', JSON.stringify(result));
+  assert.equal(result.can_execute, true);
+  assert.equal(bridge.calls, 0);
+  assert.deepEqual(result.resolved_plan.features.map((feature) => feature.id), ['outer_body', 'inner_cavity', 'usb_cutout']);
+  assert.deepEqual(result.resolved_plan.features[1].box, { min_x: 2, max_x: 57.95, min_y: 2, max_y: 30.97, min_z: 2, max_z: 14 });
+  assert.deepEqual(result.resolved_plan.features[2].box, { min_x: 23.975, max_x: 35.975, min_y: 0, max_y: 2, min_z: 4, max_z: 11 });
+  assert.doesNotMatch(JSON.stringify(result.resolved_plan), /Face\d+|Edge\d+/);
 });
 
 test('fillet and chamfer plan dimensions are validated deterministically', async () => {
