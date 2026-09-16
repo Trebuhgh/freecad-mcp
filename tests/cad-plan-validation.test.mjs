@@ -64,7 +64,12 @@ test('cad_validate_plan schema presents Simple Intent first and isolates compati
   assert.equal(simple.properties.segments.minItems, 1);
   assert.equal(feature.title, 'Advanced Feature Plan (compatibility)');
   assert.deepEqual(feature.required, ['features']);
-  assert.equal(feature.properties.features.items.properties.segments.minItems, 1);
+  assert.equal(feature.properties.features.items.oneOf.length, 7);
+  const segmentedProfile = feature.properties.features.items.oneOf.find((candidate) => candidate.title === 'Mixed line/arc profile pad feature');
+  assert.equal(segmentedProfile.properties.segments.minItems, 1);
+  const rectangularPocket = feature.properties.features.items.oneOf.find((candidate) => candidate.properties.type.const === 'rectangular_pocket');
+  assert.deepEqual(rectangularPocket.required, ['type', 'face', 'width', 'height', 'depth', 'position', 'after', 'target']);
+  assert.equal(Object.hasOwn(rectangularPocket.properties, 'operation'), false);
   assert.equal(legacy.title, 'Legacy Plan (compatibility)');
   assert.deepEqual(legacy.required, ['base']);
   assert.match(tool.description, /Only include features explicitly requested by the user/);

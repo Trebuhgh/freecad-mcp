@@ -174,6 +174,71 @@ const simplePlanSchema = {
   ],
 };
 
+const featureIdSchema = { type: ['string', 'null'] };
+const featureDependencySchema = {
+  after: { type: ['string', 'null'] },
+  target: { type: ['string', 'null'] },
+};
+const rectangularPadFeatureSchema = {
+  title: 'Rectangular pad feature', type: 'object',
+  properties: {
+    id: featureIdSchema, type: { const: 'rectangular_pad' },
+    width: { type: 'number' }, height: { type: 'number' }, length: { type: 'number' },
+  },
+  required: ['type', 'width', 'height', 'length'], additionalProperties: false,
+};
+const polygonProfilePadFeatureSchema = {
+  title: 'Polygon profile pad feature', type: 'object',
+  properties: { id: featureIdSchema, type: { const: 'profile_pad' }, points: { type: 'array', minItems: 3, items: coordinatePairSchema }, length: { type: 'number' } },
+  required: ['type', 'points', 'length'], additionalProperties: false,
+};
+const segmentedProfilePadFeatureSchema = {
+  title: 'Mixed line/arc profile pad feature', type: 'object',
+  properties: { id: featureIdSchema, type: { const: 'profile_pad' }, segments: { type: 'array', minItems: 1, items: profileSegmentSchema }, length: { type: 'number' } },
+  required: ['type', 'segments', 'length'], additionalProperties: false,
+};
+const rectangularPocketFeatureSchema = {
+  title: 'Semantic rectangular pocket feature', type: 'object',
+  properties: {
+    id: featureIdSchema, type: { const: 'rectangular_pocket' },
+    face: { type: 'string', enum: ['top', 'front', 'back', 'left', 'right'] },
+    width: { type: 'number' }, height: { type: 'number' }, depth: { type: 'number' },
+    position: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'], additionalProperties: false },
+    after: { type: 'string' }, target: { type: 'string' },
+  },
+  required: ['type', 'face', 'width', 'height', 'depth', 'position', 'after', 'target'], additionalProperties: false,
+};
+const holePatternFeatureSchema = {
+  title: 'Hole pattern feature', type: 'object',
+  properties: {
+    id: featureIdSchema, type: { const: 'hole_pattern' }, diameter: { type: 'number' }, count: { type: ['integer', 'null'] },
+    placement: {
+      type: 'object',
+      properties: {
+        type: { type: ['string', 'null'], enum: ['edge_offset', 'explicit', 'rectangular_grid', null] },
+        distance: { type: ['number', 'null'] }, reference: { type: ['string', 'null'], enum: ['center', 'boundary', null] },
+        centers: { type: ['array', 'null'], items: { oneOf: [coordinatePairSchema, { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'], additionalProperties: false }] } },
+        origin: { type: ['object', 'null'], properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'], additionalProperties: false },
+        columns: { type: ['integer', 'null'] }, rows: { type: ['integer', 'null'] }, spacing_x: { type: ['number', 'null'] }, spacing_y: { type: ['number', 'null'] },
+      },
+      additionalProperties: false,
+    },
+    ...featureDependencySchema,
+    operation: { type: ['string', 'null'], enum: ['through_all', null] },
+  },
+  required: ['type', 'diameter', 'placement'], additionalProperties: false,
+};
+const filletFeatureSchema = {
+  title: 'Fillet feature', type: 'object',
+  properties: { id: featureIdSchema, type: { const: 'fillet' }, radius: { type: 'number' }, edges: { type: 'string', enum: ['all_vertical', 'all_top', 'all_bottom', 'all_top_outer', 'all_top_inner', 'all_bottom_outer', 'all_bottom_inner'] }, ...featureDependencySchema },
+  required: ['type', 'radius', 'edges'], additionalProperties: false,
+};
+const chamferFeatureSchema = {
+  title: 'Chamfer feature', type: 'object',
+  properties: { id: featureIdSchema, type: { const: 'chamfer' }, size: { type: 'number' }, edges: { type: 'string', enum: ['all_vertical', 'all_top', 'all_bottom', 'all_top_outer', 'all_top_inner', 'all_bottom_outer', 'all_bottom_inner'] }, ...featureDependencySchema },
+  required: ['type', 'size', 'edges'], additionalProperties: false,
+};
+
 const featurePlanSchema = {
   title: 'Advanced Feature Plan (compatibility)',
   type: 'object',
@@ -183,35 +248,15 @@ const featurePlanSchema = {
     features: {
       type: 'array', minItems: 1,
       items: {
-        type: 'object',
-        properties: {
-          id: { type: ['string', 'null'] },
-          type: { type: ['string', 'null'], enum: ['rectangular_pad', 'profile_pad', 'rectangular_pocket', 'hole_pattern', 'fillet', 'chamfer', null] },
-          points: { type: ['array', 'null'], minItems: 3, items: coordinatePairSchema },
-          segments: { type: ['array', 'null'], minItems: 1, items: profileSegmentSchema },
-          width: { type: ['number', 'null'] }, height: { type: ['number', 'null'] }, length: { type: ['number', 'null'] },
-          depth: { type: ['number', 'null'] },
-          face: { type: ['string', 'null'], enum: ['top', 'front', 'back', 'left', 'right', null] },
-          position: { type: ['object', 'null'], properties: { x: { type: ['number', 'null'] }, y: { type: ['number', 'null'] } }, additionalProperties: false },
-          diameter: { type: ['number', 'null'] }, count: { type: ['integer', 'null'] },
-          placement: {
-            type: ['object', 'null'],
-            properties: {
-              type: { type: ['string', 'null'], enum: ['edge_offset', 'explicit', 'rectangular_grid', null] },
-              distance: { type: ['number', 'null'] },
-              reference: { type: ['string', 'null'], enum: ['center', 'boundary', null] },
-              centers: { type: ['array', 'null'], items: { oneOf: [coordinatePairSchema, { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'], additionalProperties: false }] } },
-              origin: { type: ['object', 'null'], properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'], additionalProperties: false },
-              columns: { type: ['integer', 'null'] }, rows: { type: ['integer', 'null'] }, spacing_x: { type: ['number', 'null'] }, spacing_y: { type: ['number', 'null'] },
-            },
-            additionalProperties: false,
-          },
-          radius: { type: ['number', 'null'] }, size: { type: ['number', 'null'] },
-          edges: { type: ['string', 'null'], enum: ['all_vertical', 'all_top', 'all_bottom', 'all_top_outer', 'all_top_inner', 'all_bottom_outer', 'all_bottom_inner', null] },
-          after: { type: ['string', 'null'] }, target: { type: ['string', 'null'] },
-          operation: { type: ['string', 'null'], enum: ['through_all', null] },
-        },
-        additionalProperties: false,
+        oneOf: [
+          rectangularPadFeatureSchema,
+          polygonProfilePadFeatureSchema,
+          segmentedProfilePadFeatureSchema,
+          rectangularPocketFeatureSchema,
+          holePatternFeatureSchema,
+          filletFeatureSchema,
+          chamferFeatureSchema,
+        ],
       },
     },
   },
