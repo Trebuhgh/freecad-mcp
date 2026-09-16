@@ -239,6 +239,16 @@ const chamferFeatureSchema = {
   required: ['type', 'size', 'edges'], additionalProperties: false,
 };
 
+export const CAD_CONSTRUCTION_FEATURE_SCHEMAS = [
+  rectangularPadFeatureSchema,
+  polygonProfilePadFeatureSchema,
+  segmentedProfilePadFeatureSchema,
+  rectangularPocketFeatureSchema,
+  holePatternFeatureSchema,
+  filletFeatureSchema,
+  chamferFeatureSchema,
+] as const;
+
 const featurePlanSchema = {
   title: 'Advanced Feature Plan (compatibility)',
   type: 'object',
@@ -248,15 +258,7 @@ const featurePlanSchema = {
     features: {
       type: 'array', minItems: 1,
       items: {
-        oneOf: [
-          rectangularPadFeatureSchema,
-          polygonProfilePadFeatureSchema,
-          segmentedProfilePadFeatureSchema,
-          rectangularPocketFeatureSchema,
-          holePatternFeatureSchema,
-          filletFeatureSchema,
-          chamferFeatureSchema,
-        ],
+        oneOf: CAD_CONSTRUCTION_FEATURE_SCHEMAS,
       },
     },
   },

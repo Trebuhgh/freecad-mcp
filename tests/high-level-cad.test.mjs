@@ -92,6 +92,7 @@ test('public schemas expose neither GeometryIndex nor PointPos', () => {
       'cad_validate_edit_plan',
       'cad_execute_edit_plan',
       'cad_list_managed_models',
+      'cad_get_capabilities',
     ],
   );
 });

@@ -29,6 +29,27 @@ interface EditPlan {
   unit: 'mm';
 }
 
+export const CAD_EDIT_CAPABILITY_DEFINITIONS = {
+  rectangular_pad: {
+    parameters: ['width', 'height', 'length'],
+    constraints: ['Requires persistent semantic bindings to the rectangular sketch and Pad length.'],
+  },
+  hole_pattern: {
+    parameters: ['diameter', 'center_x', 'center_y', 'spacing_x', 'spacing_y'],
+    parameter_cases: {
+      diameter: 'Supported for a bound hole_pattern on a rectangular_pad base.',
+      center_x: 'Supported only for one explicitly positioned hole with persistent position bindings.',
+      center_y: 'Supported only for one explicitly positioned hole with persistent position bindings.',
+      spacing_x: 'Supported only for a persisted rectangular grid with more than one column and spacing bindings.',
+      spacing_y: 'Supported only for a persisted rectangular grid with more than one row and spacing bindings.',
+    },
+  },
+} as const;
+
+const SUPPORTED_EDIT_PARAMETERS = new Set<string>(
+  Object.values(CAD_EDIT_CAPABILITY_DEFINITIONS).flatMap((definition) => [...definition.parameters]),
+);
+
 interface EditValidationResult {
   status: EditStatus;
   can_execute: boolean;
@@ -142,7 +163,7 @@ function validateInput(args: ToolArgs): EditValidationResult | EditPlan {
   if (typeof args.model_id !== 'string' || args.model_id.length === 0) return issue('invalid', 'INVALID_MODEL_ID', 'model_id', 'model_id must be a non-empty string.');
   if (!Number.isInteger(args.model_revision) || (args.model_revision as number) < 1) return issue('invalid', 'INVALID_MODEL_REVISION', 'model_revision', 'model_revision must be a positive integer.');
   if (typeof args.target_feature_id !== 'string' || args.target_feature_id.length === 0) return issue('invalid', 'INVALID_FEATURE_ID', 'target_feature_id', 'target_feature_id must be a non-empty semantic feature ID.');
-  if (args.parameter !== 'width' && args.parameter !== 'height' && args.parameter !== 'length' && args.parameter !== 'diameter' && args.parameter !== 'center_x' && args.parameter !== 'center_y' && args.parameter !== 'spacing_x' && args.parameter !== 'spacing_y') return issue('unsupported', 'UNSUPPORTED_EDIT_PARAMETER', 'parameter', 'Supported parameters are rectangular_pad width/height/length and hole_pattern diameter/center_x/center_y/spacing_x/spacing_y.');
+  if (typeof args.parameter !== 'string' || !SUPPORTED_EDIT_PARAMETERS.has(args.parameter)) return issue('unsupported', 'UNSUPPORTED_EDIT_PARAMETER', 'parameter', 'Supported parameters are rectangular_pad width/height/length and hole_pattern diameter/center_x/center_y/spacing_x/spacing_y.');
   if (args.unit !== 'mm') return issue('unsupported', 'UNSUPPORTED_EDIT_UNIT', 'unit', 'V1 supports only millimetres.');
   const positionParameter = args.parameter === 'center_x' || args.parameter === 'center_y';
   if (typeof args.old_value !== 'number' || !Number.isFinite(args.old_value) || (!positionParameter && args.old_value <= 0)) return issue('invalid', 'INVALID_OLD_VALUE', 'old_value', positionParameter ? 'old_value must be finite.' : 'old_value must be finite and greater than zero.');
@@ -151,7 +172,7 @@ function validateInput(args: ToolArgs): EditValidationResult | EditPlan {
     model_id: args.model_id,
     model_revision: args.model_revision as number,
     target_feature_id: args.target_feature_id,
-    parameter: args.parameter,
+    parameter: args.parameter as EditPlan['parameter'],
     old_value: args.old_value,
     new_value: args.new_value,
     unit: 'mm',

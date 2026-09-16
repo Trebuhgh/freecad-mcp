@@ -15,6 +15,7 @@ import {
   handleCadValidateEditPlan,
 } from './cad-edit.js';
 import { CAD_MANAGED_MODEL_TOOLS, handleCadListManagedModels } from './cad-managed-models.js';
+import { CAD_CAPABILITY_TOOLS, handleCadGetCapabilities } from './cad-capabilities.js';
 import { cadObjectStateInspectionPython } from './cad-object-state-python.js';
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -229,6 +230,7 @@ export const HIGH_LEVEL_CAD_TOOLS = [
   ...CAD_PLAN_TOOLS,
   ...CAD_EDIT_TOOLS,
   ...CAD_MANAGED_MODEL_TOOLS,
+  ...CAD_CAPABILITY_TOOLS,
 ];
 
 const fallbackEditGates = new WeakMap<CadPlanValidationGate, CadEditValidationGate>();
@@ -658,6 +660,7 @@ export async function handleHighLevelCadTool(
   suppliedEditGate?: CadEditValidationGate,
 ): Promise<ToolResult> {
   const editValidationGate = editGateFor(validationGate, suppliedEditGate);
+  if (name === 'cad_get_capabilities') return handleCadGetCapabilities(args);
   if (name === 'cad_list_managed_models') return handleCadListManagedModels(args, bridge);
   if (name === 'cad_validate_edit_plan') return handleCadValidateEditPlan(args, bridge, editValidationGate);
   if (name === 'cad_execute_edit_plan') return handleCadExecuteEditPlan(args, bridge, editValidationGate);
