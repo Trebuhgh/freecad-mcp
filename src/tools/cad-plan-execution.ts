@@ -61,19 +61,20 @@ def attach_xy(sketch, body):
         raise RuntimeError("SKETCH_ATTACHMENT_UNSUPPORTED")
     sketch.MapMode = "FlatFace"
 
-def semantic_pocket_placement(face, width, height, length):
+def semantic_face_frame(face, shape):
+    bounds = shape.BoundBox
     if face == "top":
-        origin, columns, reversed_direction = (0.0, 0.0, length), ((1, 0, 0), (0, 1, 0), (0, 0, 1)), False
+        origin, columns, reversed_direction = (bounds.XMin, bounds.YMin, bounds.ZMax), ((1, 0, 0), (0, 1, 0), (0, 0, 1)), False
     elif face == "front":
-        origin, columns, reversed_direction = (0.0, 0.0, 0.0), ((1, 0, 0), (0, 0, 1), (0, -1, 0)), False
+        origin, columns, reversed_direction = (bounds.XMin, bounds.YMin, bounds.ZMin), ((1, 0, 0), (0, 0, 1), (0, -1, 0)), False
     elif face == "back":
-        origin, columns, reversed_direction = (0.0, height, 0.0), ((1, 0, 0), (0, 0, 1), (0, -1, 0)), True
+        origin, columns, reversed_direction = (bounds.XMin, bounds.YMax, bounds.ZMin), ((1, 0, 0), (0, 0, 1), (0, -1, 0)), True
     elif face == "left":
-        origin, columns, reversed_direction = (0.0, 0.0, 0.0), ((0, 1, 0), (0, 0, 1), (1, 0, 0)), True
+        origin, columns, reversed_direction = (bounds.XMin, bounds.YMin, bounds.ZMin), ((0, 1, 0), (0, 0, 1), (1, 0, 0)), True
     elif face == "right":
-        origin, columns, reversed_direction = (width, 0.0, 0.0), ((0, 1, 0), (0, 0, 1), (1, 0, 0)), False
+        origin, columns, reversed_direction = (bounds.XMax, bounds.YMin, bounds.ZMin), ((0, 1, 0), (0, 0, 1), (1, 0, 0)), False
     else:
-        raise RuntimeError("UNSUPPORTED_POCKET_FACE: " + str(face))
+        raise RuntimeError("UNSUPPORTED_SEMANTIC_FACE: " + str(face))
     matrix = FreeCAD.Matrix()
     matrix.A11, matrix.A21, matrix.A31 = columns[0]
     matrix.A12, matrix.A22, matrix.A32 = columns[1]
@@ -155,16 +156,17 @@ def union_box_volume(boxes):
                     volume += (xs[xi + 1] - xs[xi]) * (ys[yi + 1] - ys[yi]) * (zs[zi + 1] - zs[zi])
     return volume
 
-def pocket_axis_line(feature):
+def pocket_axis_line(feature, reference_shape):
     box = feature["box"]
+    bounds = reference_shape.BoundBox
     center_x = (float(box["min_x"]) + float(box["max_x"])) / 2.0
     center_y = (float(box["min_y"]) + float(box["max_y"])) / 2.0
     center_z = (float(box["min_z"]) + float(box["max_z"])) / 2.0
     if feature["face"] == "top":
-        return Part.makeLine(FreeCAD.Vector(center_x, center_y, 0), FreeCAD.Vector(center_x, center_y, length))
+        return Part.makeLine(FreeCAD.Vector(center_x, center_y, bounds.ZMin), FreeCAD.Vector(center_x, center_y, bounds.ZMax))
     if feature["face"] in ("front", "back"):
-        return Part.makeLine(FreeCAD.Vector(center_x, 0, center_z), FreeCAD.Vector(center_x, height, center_z))
-    return Part.makeLine(FreeCAD.Vector(0, center_y, center_z), FreeCAD.Vector(width, center_y, center_z))
+        return Part.makeLine(FreeCAD.Vector(center_x, bounds.YMin, center_z), FreeCAD.Vector(center_x, bounds.YMax, center_z))
+    return Part.makeLine(FreeCAD.Vector(bounds.XMin, center_y, center_z), FreeCAD.Vector(bounds.XMax, center_y, center_z))
 
 def expected_axis_material_length(feature, boxes):
     box = feature["box"]
@@ -253,6 +255,16 @@ try:
         width = float(base_plan["width"])
         height = float(base_plan["height"])
         expected_bounds = {"x": width, "y": height, "z": length}
+        rectangular_feature_types = ("rectangular_pad", "rectangular_pocket", "rectangular_addition")
+        ordered_rectangular_plan = all(item["type"] in rectangular_feature_types for item in features)
+        expected_rectangular_shape = Part.makeBox(width, height, length) if ordered_rectangular_plan else None
+        if expected_rectangular_shape is not None:
+            for expected_feature in features[1:]:
+                expected_box = pocket_box_shape(expected_feature["box"])
+                expected_rectangular_shape = expected_rectangular_shape.cut(expected_box) if expected_feature["type"] == "rectangular_pocket" else expected_rectangular_shape.fuse(expected_box)
+            expected_rectangular_shape = expected_rectangular_shape.removeSplitter()
+            expected_box_bounds = expected_rectangular_shape.BoundBox
+            expected_bounds = {"x": float(expected_box_bounds.XLength), "y": float(expected_box_bounds.YLength), "z": float(expected_box_bounds.ZLength)}
     elif base_type == "profile_pad":
         if "segments" in base_plan:
             profile_segments = []
@@ -269,6 +281,8 @@ try:
         metrics = profile_metrics(profile_segments)
         expected_profile_area = metrics["area"]
         expected_bounds = {"x": metrics["bounds"]["max_x"] - metrics["bounds"]["min_x"], "y": metrics["bounds"]["max_y"] - metrics["bounds"]["min_y"], "z": length}
+        ordered_rectangular_plan = False
+        expected_rectangular_shape = None
     else:
         raise RuntimeError("UNSUPPORTED_RESOLVED_BASE_FEATURE: " + str(base_type))
     executed_steps = []
@@ -393,7 +407,8 @@ try:
             source_volume = float(body.Tip.Shape.Volume)
             pocket_sketch = body.newObject("Sketcher::SketchObject", "PlanSketch_" + str(feature_index))
             pocket_sketch.MapMode = "Deactivated"
-            pocket_sketch.Placement, reversed_direction = semantic_pocket_placement(feature_plan["face"], width, height, length)
+            target_shape = body.Tip.Shape
+            pocket_sketch.Placement, reversed_direction = semantic_face_frame(feature_plan["face"], target_shape)
             position = feature_plan["position"]
             named_constraints = add_constrained_rectangle(pocket_sketch, float(position["x"]), float(position["y"]), float(feature_plan["width"]), float(feature_plan["height"]))
             solve_result = pocket_sketch.solve()
@@ -415,6 +430,44 @@ try:
             parameter_bindings["depth"] = {"kind": "feature_property", "object": pocket.Name, "property": "Length", "unit": "mm"}
             feature_bindings[feature_id] = {"type": feature_type, "feature_object": pocket.Name, "feature_type_id": pocket.TypeId, "sketch_object": pocket_sketch.Name, "semantic_face": feature_plan["face"], "target_feature_id": feature_plan["target"], "parameters": parameter_bindings}
             feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": pocket.Name, "object_type": pocket.TypeId, "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(pocket_sketch.DoF), "face": feature_plan["face"], "width": float(feature_plan["width"]), "height": float(feature_plan["height"]), "position": {"x": float(position["x"]), "y": float(position["y"])}, "depth": float(pocket.Length.Value), "box": feature_plan["box"], "source_volume": source_volume, "result_volume": float(pocket.Shape.Volume)})
+        elif feature_type == "rectangular_addition":
+            source_tip = body.Tip
+            if source_tip is None or source_tip.Label != feature_plan["target"]:
+                raise RuntimeError("RECTANGULAR_ADDITION_TARGET_NOT_CURRENT_TIP")
+            source_volume = float(source_tip.Shape.Volume)
+            source_body_count = len([item for item in doc.Objects if item.TypeId == "PartDesign::Body"])
+            addition_sketch = body.newObject("Sketcher::SketchObject", "PlanSketch_" + str(feature_index))
+            addition_sketch.MapMode = "Deactivated"
+            addition_sketch.Placement, reversed_direction = semantic_face_frame(feature_plan["face"], source_tip.Shape)
+            position = feature_plan["position"]
+            add_constrained_rectangle(addition_sketch, float(position["x"]), float(position["y"]), float(feature_plan["width"]), float(feature_plan["height"]))
+            solve_result = addition_sketch.solve()
+            doc.recompute()
+            check_object(addition_sketch, "RECTANGULAR_ADDITION_SKETCH_RECOMPUTE_FAILED")
+            if solve_result not in (None, 0) or not addition_sketch.FullyConstrained or int(addition_sketch.DoF) != 0 or len(addition_sketch.Shape.Wires) != 1 or not addition_sketch.Shape.Wires[0].isClosed():
+                raise RuntimeError("RECTANGULAR_ADDITION_SKETCH_VALIDATION_FAILED")
+            addition = body.newObject("PartDesign::Pad", "PlanFeature_" + str(feature_index))
+            addition.Label = feature_id
+            addition.Profile = addition_sketch
+            addition.Length = float(feature_plan["length"])
+            addition.Reversed = reversed_direction
+            side_mode = "legacy_midplane_default"
+            if "SideType" in addition.PropertiesList:
+                one_side = next((candidate for candidate in addition.getEnumerationsOfProperty("SideType") if candidate.replace(" ", "").replace("_", "").lower() == "oneside"), None)
+                if one_side is None:
+                    raise RuntimeError("PAD_SIDE_TYPE_UNSUPPORTED: One side")
+                addition.SideType = one_side
+                side_mode = "oneside"
+            doc.recompute()
+            check_object(addition, "RECTANGULAR_ADDITION_RECOMPUTE_FAILED")
+            expected_added_volume = float(feature_plan["width"]) * float(feature_plan["height"]) * float(feature_plan["length"])
+            actual_added_volume = float(addition.Shape.Volume) - source_volume
+            if body.Tip != addition or addition.Shape.isNull() or not addition.Shape.isValid() or len(addition.Shape.Solids) != 1 or actual_added_volume <= VOLUME_TOLERANCE_MM3 or abs(actual_added_volume - expected_added_volume) > VOLUME_TOLERANCE_MM3 or len([item for item in doc.Objects if item.TypeId == "PartDesign::Body"]) != source_body_count:
+                raise RuntimeError("RECTANGULAR_ADDITION_POSTCONDITION_FAILED")
+            parameter_bindings = {name: {"kind": "sketch_constraint", "object": addition_sketch.Name, "constraint_name": name, "unit": "mm"} for name in ("width", "height", "position_x", "position_y")}
+            parameter_bindings["length"] = {"kind": "feature_property", "object": addition.Name, "property": "Length", "unit": "mm"}
+            feature_bindings[feature_id] = {"type": feature_type, "feature_object": addition.Name, "feature_type_id": addition.TypeId, "sketch_object": addition_sketch.Name, "semantic_face": feature_plan["face"], "target_feature_id": feature_plan["target"], "parameters": parameter_bindings}
+            feature_results.append({"id": feature_id, "type": feature_type, "success": True, "object": addition.Name, "object_type": addition.TypeId, "sketch_closed": True, "sketch_fully_constrained": True, "sketch_dof": int(addition_sketch.DoF), "face": feature_plan["face"], "width": float(feature_plan["width"]), "height": float(feature_plan["height"]), "position": {"x": float(position["x"]), "y": float(position["y"])}, "length": float(addition.Length.Value), "box": feature_plan["box"], "source_volume": source_volume, "result_volume": float(addition.Shape.Volume), "expected_added_volume": expected_added_volume, "side_mode": side_mode})
         elif feature_type == "hole_pattern":
             source_volume = float(body.Tip.Shape.Volume)
             diameter = float(feature_plan["diameter"])
@@ -508,11 +561,14 @@ try:
     # geometry_inspection_start
     geometry_signature = inspect_geometry(shape)
     pocket_features = [feature for feature in features if feature["type"] == "rectangular_pocket"]
+    addition_features = [feature for feature in features if feature["type"] == "rectangular_addition"]
     pocket_boxes = [feature["box"] for feature in pocket_features]
     pocket_brep = []
     for pocket_feature in pocket_features:
         void_intersection = shape.common(pocket_box_shape(pocket_feature["box"]))
-        axis_intersection = shape.common(pocket_axis_line(pocket_feature))
+        axis_line = pocket_axis_line(pocket_feature, expected_rectangular_shape if expected_rectangular_shape is not None else shape)
+        axis_intersection = shape.common(axis_line)
+        expected_axis_intersection = (expected_rectangular_shape if expected_rectangular_shape is not None else shape).common(axis_line)
         pocket_brep.append({
             "id": pocket_feature["id"],
             "face": pocket_feature["face"],
@@ -524,8 +580,19 @@ try:
             },
             "void_intersection_volume": float(void_intersection.Volume),
             "axis_material_length": float(axis_intersection.Length),
-            "expected_axis_material_length": float(expected_axis_material_length(pocket_feature, pocket_boxes)),
+            "expected_axis_material_length": float(expected_axis_intersection.Length),
         })
+    rectangular_brep = None
+    if ordered_rectangular_plan and expected_rectangular_shape is not None:
+        unexpected_material_volume = float(shape.cut(expected_rectangular_shape).Volume)
+        missing_material_volume = float(expected_rectangular_shape.cut(shape).Volume)
+        rectangular_brep = {
+            "expected_volume": float(expected_rectangular_shape.Volume),
+            "actual_volume": float(shape.Volume),
+            "unexpected_material_volume": unexpected_material_volume,
+            "missing_material_volume": missing_material_volume,
+            "passed": unexpected_material_volume <= VOLUME_TOLERANCE_MM3 and missing_material_volume <= VOLUME_TOLERANCE_MM3,
+        }
     actual_holes = []
     actual_outer_cylinders = []
     for cylinder in geometry_signature["surfaces"]["cylindrical"]:
@@ -549,12 +616,16 @@ try:
         "holes": actual_holes,
         "outer_cylinders": actual_outer_cylinders,
         "rectangular_pockets": pocket_brep,
+        "ordered_rectangular_brep": rectangular_brep,
     }
     # verification_snapshot_complete
 
     issues = []
     def add_issue(feature_id, feature_type, check, expected, actual, message):
         issues.append({"feature_id": feature_id, "feature_type": feature_type, "check": check, "expected": expected, "actual": actual, "message": message})
+
+    if rectangular_brep is not None and not rectangular_brep["passed"]:
+        add_issue(None, "rectangular_addition", "ordered_rectangular_brep", {"unexpected_material_volume": 0.0, "missing_material_volume": 0.0}, rectangular_brep, "The final BREP differs from the independently reconstructed ordered rectangular feature chain.")
 
     solid_passed = actual_snapshot["solid_count"] == 1
     if not solid_passed:
@@ -641,6 +712,20 @@ try:
                 add_issue(feature_id, feature_type, "axis_material_length", None if measured is None else measured["expected_axis_material_length"], None if measured is None else measured["axis_material_length"], "Material remaining along the pocket cut axis does not match the resolved pocket union.")
             if not entry["passed"] and void_passed and axis_passed:
                 add_issue(feature_id, feature_type, "rectangular_pocket_feature", {"closed": True, "fully_constrained": True, "degrees_of_freedom": 0, "material_removed": True, "semantic_face": feature_plan["face"]}, entry, "The rectangular pocket feature or semantic binding postconditions were not preserved.")
+        elif feature_type == "rectangular_addition":
+            expected_added_volume = float(feature_plan["width"]) * float(feature_plan["height"]) * float(feature_plan["length"])
+            actual_added_volume = float(feature_result.get("result_volume", 0.0)) - float(feature_result.get("source_volume", 0.0))
+            entry["sketch_closed"] = bool(feature_result.get("sketch_closed"))
+            entry["sketch_fully_constrained"] = bool(feature_result.get("sketch_fully_constrained"))
+            entry["sketch_degrees_of_freedom"] = feature_result.get("sketch_dof")
+            entry["material_added"] = actual_added_volume > VOLUME_TOLERANCE_MM3
+            entry["added_volume"] = {"expected": expected_added_volume, "actual": actual_added_volume, "passed": abs(actual_added_volume - expected_added_volume) <= VOLUME_TOLERANCE_MM3}
+            entry["semantic_face"] = {"expected": feature_plan["face"], "actual": feature_result.get("face"), "passed": feature_result.get("face") == feature_plan["face"]}
+            entry["one_sided"] = {"expected": True, "actual": feature_result.get("side_mode"), "passed": feature_result.get("side_mode") in ("oneside", "legacy_midplane_default")}
+            entry["ordered_brep"] = rectangular_brep
+            entry["passed"] = entry["sketch_closed"] and entry["sketch_fully_constrained"] and entry["sketch_degrees_of_freedom"] == 0 and entry["material_added"] and entry["added_volume"]["passed"] and entry["semantic_face"]["passed"] and entry["one_sided"]["passed"] and rectangular_brep is not None and rectangular_brep["passed"]
+            if not entry["passed"]:
+                add_issue(feature_id, feature_type, "rectangular_addition_feature", {"closed": True, "fully_constrained": True, "degrees_of_freedom": 0, "material_added": True, "added_volume": expected_added_volume, "semantic_face": feature_plan["face"], "one_sided": True, "ordered_brep": True}, entry, "The rectangular addition feature or its independent BREP postconditions were not preserved.")
         elif feature_type == "hole_pattern":
             expected_centers = [{"x": float(center["x"]), "y": float(center["y"])} for center in feature_plan["centers"]]
             expected_radius = float(feature_plan["diameter"]) / 2.0
@@ -714,7 +799,7 @@ try:
         "body_tip_correct": body_tip_passed,
         "tolerances": {"linear_mm": LINEAR_TOLERANCE_MM, "volume_mm3": VOLUME_TOLERANCE_MM3},
     }
-    if pocket_boxes:
+    if pocket_boxes and not addition_features:
         expected_pocket_volume = union_box_volume(pocket_boxes)
         expected_final_volume = width * height * length - expected_pocket_volume
         pocket_volume_passed = abs(float(geometry_signature["volume"]) - expected_final_volume) <= VOLUME_TOLERANCE_MM3
@@ -722,6 +807,8 @@ try:
         verification["rectangular_pockets"] = pocket_brep
         if not pocket_volume_passed:
             add_issue(None, "rectangular_pocket", "volume", expected_final_volume, geometry_signature["volume"], "The final analytic BREP volume does not equal the base volume minus the union of resolved rectangular pocket volumes.")
+    if rectangular_brep is not None:
+        verification["ordered_rectangular_brep"] = rectangular_brep
     verification["featureChainComplete"] = feature_order_passed
     verification["recomputeErrors"] = actual_snapshot["recompute_errors"]
     verification["expectedHoleCount"] = sum(len(item["centers"]) for item in expected_holes)

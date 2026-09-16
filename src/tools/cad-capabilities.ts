@@ -39,6 +39,10 @@ const CONSTRUCTION_METADATA: Record<string, { description: string; constraints: 
     description: 'Subtract a rectangular pocket from a supported semantic face of the current solid.',
     constraints: ['target and after must identify the current feature tip.', 'The pocket must fit the supported semantic face and remove material.', 'The resulting model must remain one valid solid.'],
   },
+  rectangular_addition: {
+    description: 'Add a rectangular extrusion outward from a supported semantic face of the current solid.',
+    constraints: ['target and after must identify the current feature tip.', 'The complete footprint must be supported by existing material.', 'The operation must add positive material while preserving exactly one valid solid.'],
+  },
   hole_pattern: {
     description: 'Cut one semantic group of circular through-holes using an edge offset, explicit centers, or a rectangular grid.',
     constraints: ['The base must be supported by the current feature chain.', 'Hole centers and diameters must remain valid and non-overlapping.', 'Named groups remain independent semantic features.'],

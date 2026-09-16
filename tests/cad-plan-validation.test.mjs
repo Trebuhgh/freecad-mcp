@@ -39,6 +39,16 @@ function rectangularPocketPlan(face = 'top', overrides = {}) {
   };
 }
 
+function rectangularAdditionPlan(face = 'top', overrides = {}) {
+  return {
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 20 },
+      { id: 'addition', type: 'rectangular_addition', after: 'base', target: 'base', face, width: 20, height: 10, position: { x: 5, y: 5 }, length: 4, ...overrides },
+    ],
+  };
+}
+
 const esp32PocketPlan = {
   unit: 'mm',
   features: [
@@ -64,12 +74,16 @@ test('cad_validate_plan schema presents Simple Intent first and isolates compati
   assert.equal(simple.properties.segments.minItems, 1);
   assert.equal(feature.title, 'Advanced Feature Plan (compatibility)');
   assert.deepEqual(feature.required, ['features']);
-  assert.equal(feature.properties.features.items.oneOf.length, 7);
+  assert.equal(feature.properties.features.items.oneOf.length, 8);
   const segmentedProfile = feature.properties.features.items.oneOf.find((candidate) => candidate.title === 'Mixed line/arc profile pad feature');
   assert.equal(segmentedProfile.properties.segments.minItems, 1);
   const rectangularPocket = feature.properties.features.items.oneOf.find((candidate) => candidate.properties.type.const === 'rectangular_pocket');
   assert.deepEqual(rectangularPocket.required, ['type', 'face', 'width', 'height', 'depth', 'position', 'after', 'target']);
   assert.equal(Object.hasOwn(rectangularPocket.properties, 'operation'), false);
+  const rectangularAddition = feature.properties.features.items.oneOf.find((candidate) => candidate.properties.type.const === 'rectangular_addition');
+  assert.deepEqual(rectangularAddition.required, ['type', 'face', 'width', 'height', 'length', 'position', 'after', 'target']);
+  assert.equal(Object.hasOwn(rectangularAddition.properties, 'depth'), false);
+  assert.equal(Object.hasOwn(rectangularAddition.properties, 'operation'), false);
   assert.equal(legacy.title, 'Legacy Plan (compatibility)');
   assert.deepEqual(legacy.required, ['base']);
   assert.match(tool.description, /Only include features explicitly requested by the user/);
@@ -265,6 +279,98 @@ for (const [field, value] of [['width', 0], ['height', 0], ['depth', 0]]) {
     assert.ok(result.issues.some((issue) => issue.path === `features.1.${field}`), JSON.stringify(result));
   });
 }
+
+for (const [face, expectedBox] of [
+  ['top', { min_x: 5, max_x: 25, min_y: 5, max_y: 15, min_z: 20, max_z: 24 }],
+  ['front', { min_x: 5, max_x: 25, min_y: -4, max_y: 0, min_z: 5, max_z: 15 }],
+  ['back', { min_x: 5, max_x: 25, min_y: 60, max_y: 64, min_z: 5, max_z: 15 }],
+  ['left', { min_x: -4, max_x: 0, min_y: 5, max_y: 25, min_z: 5, max_z: 15 }],
+  ['right', { min_x: 100, max_x: 104, min_y: 5, max_y: 25, min_z: 5, max_z: 15 }],
+]) {
+  test(`rectangular_addition resolves deterministic outward ${face} semantic coordinates`, async () => {
+    const { result, bridge } = await validate(rectangularAdditionPlan(face));
+    assert.equal(result.status, 'valid', JSON.stringify(result));
+    assert.equal(result.can_execute, true);
+    assert.equal(bridge.calls, 0);
+    assert.deepEqual(result.resolved_plan.features[1].box, expectedBox);
+  });
+}
+
+test('rectangular_addition validates dimensions, placement, dependencies, and full material support', async () => {
+  for (const [field, value] of [['width', 0], ['height', -1], ['length', 0]]) {
+    const { result } = await validate(rectangularAdditionPlan('top', { [field]: value }));
+    assert.equal(result.can_execute, false);
+    assert.ok(result.issues.some((issue) => issue.path === `features.1.${field}`), JSON.stringify(result));
+  }
+  const outside = await validate(rectangularAdditionPlan('top', { position: { x: 90, y: 5 }, width: 20 }));
+  assert.ok(outside.result.issues.some((issue) => issue.code === 'ADDITION_OUTSIDE_FACE'));
+  const staleTarget = await validate(rectangularAdditionPlan('top', { after: 'base', target: 'not_base' }));
+  assert.ok(staleTarget.result.issues.some((issue) => issue.code === 'ADDITION_DEPENDENCY_MISMATCH' || issue.code === 'INVALID_FEATURE_REFERENCE'), JSON.stringify(staleTarget.result));
+
+  const overCavity = await validate({
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 20 },
+      { id: 'cavity', type: 'rectangular_pocket', after: 'base', target: 'base', face: 'top', width: 40, height: 20, position: { x: 30, y: 20 }, depth: 5 },
+      { id: 'addition', type: 'rectangular_addition', after: 'cavity', target: 'cavity', face: 'top', width: 50, height: 30, position: { x: 25, y: 15 }, length: 3 },
+    ],
+  });
+  assert.equal(overCavity.result.can_execute, false);
+  assert.ok(overCavity.result.issues.some((issue) => issue.code === 'ADDITION_FOOTPRINT_NOT_FULLY_SUPPORTED'), JSON.stringify(overCavity.result));
+});
+
+test('rectangular_addition rejects non-finite values, pocket-only fields, stale tips, and edge/point-only support', async () => {
+  for (const overrides of [
+    { width: Number.POSITIVE_INFINITY },
+    { height: Number.NaN },
+    { length: Number.NEGATIVE_INFINITY },
+    { position: { x: Number.NaN, y: 5 } },
+    { position: { x: 5, y: Number.POSITIVE_INFINITY } },
+  ]) {
+    const { result } = await validate(rectangularAdditionPlan('top', overrides));
+    assert.equal(result.can_execute, false);
+  }
+  for (const [field, value] of [['depth', 4], ['operation', 'through_all']]) {
+    const { result } = await validate(rectangularAdditionPlan('top', { [field]: value }));
+    assert.equal(result.can_execute, false);
+    assert.ok(result.issues.some((issue) => issue.code === 'UNKNOWN_RECTANGULAR_ADDITION_FIELD' && issue.path === `features.1.${field}`), JSON.stringify(result));
+  }
+  const staleTip = await validate({
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { id: 'first', type: 'rectangular_addition', after: 'base', target: 'base', face: 'top', width: 20, height: 20, position: { x: 20, y: 20 }, length: 2 },
+      { id: 'second', type: 'rectangular_addition', after: 'base', target: 'base', face: 'top', width: 10, height: 10, position: { x: 5, y: 5 }, length: 2 },
+    ],
+  });
+  assert.ok(staleTip.result.issues.some((issue) => issue.code === 'ADDITION_TARGET_NOT_CURRENT_TIP'), JSON.stringify(staleTip.result));
+
+  for (const position of [{ x: 40, y: 20 }, { x: 40, y: 40 }]) {
+    const contact = await validate({
+      unit: 'mm',
+      features: [
+        { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+        { id: 'tower', type: 'rectangular_addition', after: 'base', target: 'base', face: 'top', width: 20, height: 20, position: { x: 20, y: 20 }, length: 2 },
+        { id: 'contact', type: 'rectangular_addition', after: 'tower', target: 'tower', face: 'top', width: 10, height: 10, position, length: 2 },
+      ],
+    });
+    assert.equal(contact.result.can_execute, false);
+    assert.ok(contact.result.issues.some((issue) => issue.code === 'ADDITION_FOOTPRINT_NOT_FULLY_SUPPORTED'), JSON.stringify(contact.result));
+  }
+});
+
+test('multiple rectangular additions preserve current-tip coordinates and a single ordered chain', async () => {
+  const { result } = await validate({
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { id: 'top_block', type: 'rectangular_addition', after: 'base', target: 'base', face: 'top', width: 40, height: 20, position: { x: 30, y: 20 }, length: 2 },
+      { id: 'right_block', type: 'rectangular_addition', after: 'top_block', target: 'top_block', face: 'right', width: 20, height: 5, position: { x: 20, y: 2 }, length: 3 },
+    ],
+  });
+  assert.equal(result.status, 'valid', JSON.stringify(result));
+  assert.deepEqual(result.resolved_plan.features[2].box, { min_x: 100, max_x: 103, min_y: 20, max_y: 40, min_z: 2, max_z: 7 });
+});
 
 test('rectangular_pocket rejects outside, excessive depth, missing target, and invalid ordering', async () => {
   const outside = await validate(rectangularPocketPlan('top', { position: { x: 90, y: 5 }, width: 20 }));

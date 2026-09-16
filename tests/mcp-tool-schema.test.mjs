@@ -29,14 +29,14 @@ async function withMcpClient(callback) {
   }
 }
 
-test('live MCP tools/list exports explicit feature schemas for rectangular_pocket', async () => {
+test('live MCP tools/list exports explicit feature schemas for rectangular pockets and additions', async () => {
   await withMcpClient(async (client) => {
     const listed = await client.listTools();
     const tool = listed.tools.find((candidate) => candidate.name === 'cad_validate_plan');
     assert.ok(tool, 'cad_validate_plan missing from live MCP tools/list response');
     const advanced = tool.inputSchema.properties.plan.oneOf.find((candidate) => candidate.title === 'Advanced Feature Plan (compatibility)');
     const featureSchemas = advanced.properties.features.items.oneOf;
-    assert.equal(featureSchemas.length, 7);
+    assert.equal(featureSchemas.length, 8);
     const pocket = featureSchemas.find((candidate) => candidate.properties.type.const === 'rectangular_pocket');
     assert.ok(pocket, 'rectangular_pocket branch missing from live MCP schema');
     assert.deepEqual(Object.keys(pocket.properties), ['id', 'type', 'face', 'width', 'height', 'depth', 'position', 'after', 'target']);
@@ -44,6 +44,13 @@ test('live MCP tools/list exports explicit feature schemas for rectangular_pocke
     assert.deepEqual(pocket.properties.position.required, ['x', 'y']);
     assert.equal(pocket.additionalProperties, false);
     assert.equal(Object.hasOwn(pocket.properties, 'operation'), false);
+    const addition = featureSchemas.find((candidate) => candidate.properties.type.const === 'rectangular_addition');
+    assert.ok(addition, 'rectangular_addition branch missing from live MCP schema');
+    assert.deepEqual(Object.keys(addition.properties), ['id', 'type', 'face', 'width', 'height', 'length', 'position', 'after', 'target']);
+    assert.deepEqual(addition.required, ['type', 'face', 'width', 'height', 'length', 'position', 'after', 'target']);
+    assert.equal(addition.additionalProperties, false);
+    assert.equal(Object.hasOwn(addition.properties, 'depth'), false);
+    assert.equal(Object.hasOwn(addition.properties, 'operation'), false);
     const holes = featureSchemas.find((candidate) => candidate.properties.type.const === 'hole_pattern');
     assert.ok(Object.hasOwn(holes.properties, 'operation'));
   });

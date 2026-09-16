@@ -14,7 +14,7 @@ import { CadEditValidationGate } from '../dist/tools/cad-edit.js';
 import { handleHighLevelCadTool } from '../dist/tools/high-level-cad.js';
 import { getRegisteredTools } from '../dist/tool-registry.js';
 
-const expectedFeatureTypes = ['rectangular_pad', 'profile_pad', 'rectangular_pocket', 'hole_pattern', 'fillet', 'chamfer'];
+const expectedFeatureTypes = ['rectangular_pad', 'profile_pad', 'rectangular_pocket', 'rectangular_addition', 'hole_pattern', 'fillet', 'chamfer'];
 
 function payload(result) {
   return JSON.parse(result.content[0].text);
@@ -54,6 +54,18 @@ test('rectangular_pocket parameters and faces are derived exactly from its publi
   assert.deepEqual(manifestPocket.optional_parameters, ['id']);
   assert.deepEqual(manifestPocket.parameters.find((parameter) => parameter.name === 'face').allowed_values, ['top', 'front', 'back', 'left', 'right']);
   assert.equal(manifestPocket.parameters.some((parameter) => parameter.name === 'operation'), false);
+});
+
+test('rectangular_addition is schema-derived with semantic faces and no edit capability', () => {
+  const manifest = getCadCapabilities();
+  const addition = manifest.construction_features.rectangular_addition.variants[0];
+  const schema = CAD_CONSTRUCTION_FEATURE_SCHEMAS.find((candidate) => candidate.properties.type.const === 'rectangular_addition');
+  assert.ok(schema);
+  assert.deepEqual(addition.required_parameters, schema.required);
+  assert.deepEqual(addition.optional_parameters, ['id']);
+  assert.deepEqual(addition.parameters.find((parameter) => parameter.name === 'face').allowed_values, ['top', 'front', 'back', 'left', 'right']);
+  assert.equal(addition.parameters.some((parameter) => parameter.name === 'depth' || parameter.name === 'operation'), false);
+  assert.equal(Object.hasOwn(manifest.editing.features, 'rectangular_addition'), false);
 });
 
 test('edit capabilities describe the exact implemented parameter cases', () => {

@@ -955,3 +955,190 @@ _mcp_result["result"] = _execution_result`);
   ]);
   assert.deepEqual(validation.resolved_plan.features.map((feature) => feature.id), model.features.map((feature) => feature.id));
 });
+
+for (const [face, expectedBounds] of [
+  ['top', { x: 100, y: 60, z: 24 }],
+  ['front', { x: 100, y: 64, z: 20 }],
+  ['back', { x: 100, y: 64, z: 20 }],
+  ['left', { x: 104, y: 60, z: 20 }],
+  ['right', { x: 104, y: 60, z: 20 }],
+]) {
+  test(`cad_execute_plan creates and independently verifies a real outward ${face} rectangular addition`, async () => {
+    const planned = {
+      unit: 'mm',
+      features: [
+        { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 20 },
+        { id: 'block', type: 'rectangular_addition', after: 'base', target: 'base', face, width: 20, height: 10, position: { x: 5, y: 5 }, length: 4 },
+      ],
+    };
+    const { bridge } = await validateAndCapture(planned, `RectangularAddition_${face}`);
+    assert.doesNotMatch(bridge.commands[0], /Face\d+|Edge\d+/);
+    const execution = executeFreeCad(bridge.commands[0]);
+    assert.equal(execution.ok, true, execution.traceback);
+    const result = execution.result;
+    assert.equal(result.success, true, JSON.stringify(result, null, 2));
+    assert.equal(result.status, 'verified');
+    assert.equal(result.solidCount, 1);
+    assert.deepEqual(result.geometry_signature.bounding_box, expectedBounds);
+    assert.equal(result.features[1].object_type, 'PartDesign::Pad');
+    assert.equal(result.features[1].sketch_dof, 0);
+    assert.equal(result.features[1].side_mode === 'oneside' || result.features[1].side_mode === 'legacy_midplane_default', true);
+    assert.equal(result.verification.features[1].passed, true, JSON.stringify(result.verification.features[1]));
+    assert.equal(result.verification.ordered_rectangular_brep.passed, true);
+    assert.equal(result.verification.ordered_rectangular_brep.unexpected_material_volume <= 1e-7, true);
+    assert.equal(result.verification.ordered_rectangular_brep.missing_material_volume <= 1e-7, true);
+    assert.deepEqual(result.verification.recomputeErrors, []);
+    assert.equal(result.verification.bodyTip, 'PlanFeature_1');
+  });
+}
+
+test('real lid inner block E2E remains one managed body with exact volume and discovery metadata after reload', async () => {
+  const lidPlan = {
+    unit: 'mm',
+    features: [
+      { id: 'lid', type: 'rectangular_pad', width: 59.95, height: 32.97, length: 2 },
+      { id: 'lid_inner_block', type: 'rectangular_addition', after: 'lid', target: 'lid', face: 'top', width: 55.4, height: 28.4, position: { x: 2.275, y: 2.285 }, length: 2 },
+    ],
+  };
+  const { bridge } = await validateAndCapture(lidPlan, 'LidInnerBlock');
+  const discoveryBridge = new CapturingBridge();
+  await handleHighLevelCadTool('cad_list_managed_models', {}, discoveryBridge, new CadPlanValidationGate());
+  const execution = executeFreeCad(`${bridge.commands[0]}
+import os
+import tempfile
+_execution_result = _mcp_result["result"]
+_fd, _path = tempfile.mkstemp(suffix=".FCStd")
+os.close(_fd)
+doc.saveAs(_path)
+FreeCAD.closeDocument(doc.Name)
+_reloaded = FreeCAD.openDocument(_path)
+_reloaded.recompute()
+${discoveryBridge.commands[0]}
+_execution_result["discovery"] = _mcp_result["result"]
+FreeCAD.closeDocument(_reloaded.Name)
+os.remove(_path)
+_mcp_result["result"] = _execution_result`);
+  assert.equal(execution.ok, true, execution.traceback);
+  const result = execution.result;
+  assert.equal(result.success, true, JSON.stringify(result, null, 2));
+  assert.deepEqual(result.executed_steps, ['lid', 'lid_inner_block']);
+  assert.equal(result.geometry_signature.solid_count, 1);
+  assert.equal(result.geometry_signature.shape_valid, true);
+  assert.ok(Math.abs(result.geometry_signature.bounding_box.x - 59.95) <= 1e-6);
+  assert.ok(Math.abs(result.geometry_signature.bounding_box.y - 32.97) <= 1e-6);
+  assert.ok(Math.abs(result.geometry_signature.bounding_box.z - 4) <= 1e-6);
+  assert.ok(Math.abs(result.geometry_signature.volume - (59.95 * 32.97 * 2 + 55.4 * 28.4 * 2)) <= 1e-6);
+  assert.equal(result.verification.ordered_rectangular_brep.passed, true);
+  assert.deepEqual(result.discovery.issues, []);
+  assert.deepEqual(result.discovery.models[0].features, [
+    { id: 'lid', type: 'rectangular_pad', parameters: { width: 59.95, height: 32.97, length: 2 } },
+    { id: 'lid_inner_block', type: 'rectangular_addition', parameters: { face: 'top', width: 55.4, height: 28.4, position: { x: 2.275, y: 2.285 }, length: 2, target: 'lid' } },
+  ]);
+});
+
+test('ordered rectangular pocket then supported addition executes in one verified feature chain', async () => {
+  const planned = {
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 20 },
+      { id: 'cavity', type: 'rectangular_pocket', after: 'base', target: 'base', face: 'top', width: 40, height: 20, position: { x: 30, y: 20 }, depth: 5 },
+      { id: 'supported_block', type: 'rectangular_addition', after: 'cavity', target: 'cavity', face: 'top', width: 20, height: 10, position: { x: 5, y: 5 }, length: 3 },
+    ],
+  };
+  const { bridge } = await validateAndCapture(planned, 'PocketThenAddition');
+  const execution = executeFreeCad(bridge.commands[0]);
+  assert.equal(execution.ok, true, execution.traceback);
+  const result = execution.result;
+  assert.equal(result.success, true, JSON.stringify(result, null, 2));
+  assert.deepEqual(result.executed_steps, ['base', 'cavity', 'supported_block']);
+  assert.equal(result.solidCount, 1);
+  assert.deepEqual(result.geometry_signature.bounding_box, { x: 100, y: 60, z: 23 });
+  assert.ok(Math.abs(result.geometry_signature.volume - 116600) <= 1e-6);
+  assert.equal(result.verification.ordered_rectangular_brep.passed, true);
+  assert.equal(result.verification.features[1].passed, true);
+  assert.equal(result.verification.features[2].passed, true);
+  assert.equal(result.verification.bodyTip, 'PlanFeature_2');
+  assert.deepEqual(result.verification.recomputeErrors, []);
+});
+
+test('multiple rectangular additions execute sequentially from the current target tip', async () => {
+  const planned = {
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { id: 'tower', type: 'rectangular_addition', after: 'base', target: 'base', face: 'top', width: 20, height: 20, position: { x: 20, y: 20 }, length: 2 },
+      { id: 'tower_cap', type: 'rectangular_addition', after: 'tower', target: 'tower', face: 'top', width: 10, height: 10, position: { x: 25, y: 25 }, length: 2 },
+    ],
+  };
+  const { bridge } = await validateAndCapture(planned, 'MultipleAdditions');
+  const execution = executeFreeCad(bridge.commands[0]);
+  assert.equal(execution.ok, true, execution.traceback);
+  assert.equal(execution.result.success, true, JSON.stringify(execution.result, null, 2));
+  assert.deepEqual(execution.result.executed_steps, ['base', 'tower', 'tower_cap']);
+  assert.deepEqual(execution.result.geometry_signature.bounding_box, { x: 100, y: 60, z: 14 });
+  assert.equal(execution.result.verification.ordered_rectangular_brep.passed, true);
+  assert.equal(execution.result.verification.features.every((feature) => feature.passed), true);
+  assert.equal(execution.result.verification.bodyTip, 'PlanFeature_2');
+});
+
+test('rectangular addition symmetric-difference BREP verification rejects volume-neutral tampering', async () => {
+  const planned = {
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { id: 'block', type: 'rectangular_addition', after: 'base', target: 'base', face: 'top', width: 20, height: 10, position: { x: 5, y: 5 }, length: 4 },
+    ],
+  };
+  const { bridge } = await validateAndCapture(planned, 'AdditionTamper');
+  const mutation = 'shape = shape.cut(Part.makeBox(1.0, 1.0, 1.0, FreeCAD.Vector(5.0, 5.0, 13.0))).fuse(Part.makeBox(1.0, 1.0, 1.0, FreeCAD.Vector(30.0, 30.0, 10.0)))';
+  const execution = executeFreeCad(mutateInspectedShape(bridge.commands[0], mutation), true);
+  assert.equal(execution.ok, true, execution.traceback);
+  assert.equal(execution.result.success, false);
+  assert.equal(execution.result.status, 'verification_failed');
+  assert.ok(execution.result.issues.some((issue) => issue.check === 'ordered_rectangular_brep'), JSON.stringify(execution.result.issues));
+  assert.equal(execution.openDocuments.includes('AdditionTamper'), false);
+  assert.equal(execution.result.managed_model, undefined);
+});
+
+test('rectangular addition discovery rejects damaged constraint names, placement, and target bindings', async () => {
+  const planned = {
+    unit: 'mm',
+    features: [
+      { id: 'base', type: 'rectangular_pad', width: 100, height: 60, length: 10 },
+      { id: 'block', type: 'rectangular_addition', after: 'base', target: 'base', face: 'top', width: 20, height: 10, position: { x: 5, y: 5 }, length: 4 },
+    ],
+  };
+  const discoveryBridge = new CapturingBridge();
+  await handleHighLevelCadTool('cad_list_managed_models', {}, discoveryBridge, new CadPlanValidationGate());
+  const cases = [
+    ['constraint', `
+_sketch = doc.getObject("PlanSketch_1")
+_width_index = next(index for index, constraint in enumerate(_sketch.Constraints) if constraint.Name == "width")
+_sketch.renameConstraint(_width_index, "damaged_width")
+doc.recompute()`],
+    ['placement', `
+_sketch = doc.getObject("PlanSketch_1")
+_placement = _sketch.Placement
+_placement.Base = _placement.Base.add(FreeCAD.Vector(0, 0, 1))
+_sketch.Placement = _placement
+doc.recompute()`],
+    ['target', `
+_metadata = doc.getObject("ManagedModelMetadata")
+_bindings = json.loads(_metadata.FeatureBindingsJson)
+_bindings["block"]["target_feature_id"] = "wrong_target"
+_metadata.FeatureBindingsJson = json.dumps(_bindings, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+doc.recompute()`],
+  ];
+  for (const [name, mutation] of cases) {
+    const { bridge } = await validateAndCapture(planned, `AdditionDiscoveryDamage_${name}`);
+    const execution = executeFreeCad(`${bridge.commands[0]}
+_execution_result = _mcp_result["result"]
+${mutation}
+${discoveryBridge.commands[0]}
+_execution_result["discovery"] = _mcp_result["result"]
+_mcp_result["result"] = _execution_result`);
+    assert.equal(execution.ok, true, execution.traceback);
+    assert.equal(execution.result.discovery.models.length, 0);
+    assert.ok(execution.result.discovery.issues.some((issue) => ['FEATURE_BINDING_INVALID', 'FEATURE_BINDING_MISSING'].includes(issue.code)), JSON.stringify(execution.result.discovery));
+  }
+});
